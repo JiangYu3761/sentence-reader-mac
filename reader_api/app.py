@@ -11,6 +11,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,11 +22,20 @@ from uuid import uuid4
 from xml.etree import ElementTree as ET
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from reader_api import db
-from reader_api.mobile_workspace import router as mobile_workspace_router
+from reader_api.mobile_workspace import (
+    EDGE_TTS_VOICE,
+    MAC_VOICE_PIPELINE_ID,
+    MAC_VOICE_PIPELINE_SCHEMA,
+    call_hermes_runtime,
+    edge_tts_path,
+    extract_json_object,
+    mac_voice_pipeline_transcribe,
+    router as mobile_workspace_router,
+)
 
 
 app = FastAPI(title="Sentence Reader API", version="2.0.0")
@@ -39,6 +49,15 @@ DEFAULT_HERMES_COGNITIVE_OS_DIR = Path(
     )
 )
 
+LOOKUP_TTS_DIR = Path(
+    os.getenv(
+        "SENTENCE_READER_LOOKUP_TTS_DIR",
+        str(Path.home() / "Library" / "Application Support" / "Click" / "ReaderTTS"),
+    )
+)
+VOICE_NOTE_PENDING_TEXT = "语音转写中..."
+VOICE_NOTE_FAILED_TEXT = "语音已保存，转写失败，可稍后重试。"
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
@@ -51,6 +70,38 @@ def stable_id(prefix: str, *parts: Any) -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+NOTE_SPOKEN_PUNCTUATION = [
+    ("新的一行", "\n"),
+    ("另起一行", "\n"),
+    ("换行", "\n"),
+    ("句号", "。"),
+    ("逗号", "，"),
+    ("顿号", "、"),
+    ("问号", "？"),
+    ("感叹号", "！"),
+    ("叹号", "！"),
+    ("冒号", "："),
+    ("分号", "；"),
+    ("省略号", "……"),
+]
+NOTE_CLOSING_PUNCTUATION = set("。！？!?.…；;：:，,、）)]】》」』”’\"'")
+
+
+def normalize_note_text(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    for spoken, mark in NOTE_SPOKEN_PUNCTUATION:
+        text = text.replace(spoken, mark)
+    text = re.sub(r"\s+([，。！？；：、,.!?;:])", r"\1", text)
+    text = re.sub(r"([，。！？；：、,.!?;:])\s+", r"\1", text)
+    text = re.sub(r"([。！？!?]){2,}", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text or text[-1] in NOTE_CLOSING_PUNCTUATION:
+        return text
+    return text + ("." if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text) else "。")
 
 
 class BookCreate(BaseModel):
@@ -99,6 +150,10 @@ class AnnotationPatch(BaseModel):
     note_text: Optional[str] = None
     color: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
+
+
+class AnnotationCleanRequest(BaseModel):
+    apply: bool = True
 
 
 class ExportCreate(BaseModel):
@@ -254,6 +309,18 @@ class LookupEventCreate(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
+class LookupCorrectionCreate(BaseModel):
+    word: str
+    meaning_zh: str
+    sentence_id: Optional[str] = None
+    sentence: Optional[str] = None
+
+
+class LookupTTSCreate(BaseModel):
+    text: str
+    voice: Optional[str] = None
+
+
 def jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -279,6 +346,67 @@ def default_hermes_sync_dir() -> Path:
 
 def default_cognitive_ops_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "SentenceReader" / "CognitiveOps"
+
+
+def lookup_tts_dir() -> Path:
+    LOOKUP_TTS_DIR.mkdir(parents=True, exist_ok=True)
+    return LOOKUP_TTS_DIR
+
+
+def clean_lookup_tts_text(text: str) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    return value[:300]
+
+
+POS_ZH_MAP = {
+    "n": "名词",
+    "noun": "名词",
+    "v": "动词",
+    "verb": "动词",
+    "adj": "形容词",
+    "a": "形容词",
+    "adjective": "形容词",
+    "adv": "副词",
+    "adverb": "副词",
+    "proper noun": "专有名词",
+    "proper_noun": "专有名词",
+    "noun or verb": "名词或动词",
+    "noun_or_verb": "名词或动词",
+    "adjective or noun": "形容词或名词",
+    "adjective_or_noun": "形容词或名词",
+    "prep": "介词",
+    "preposition": "介词",
+    "conj": "连词",
+    "conjunction": "连词",
+    "pron": "代词",
+    "pronoun": "代词",
+    "num": "数词",
+    "number": "数词",
+    "numeral": "数词",
+    "interj": "感叹词",
+    "interjection": "感叹词",
+    "article": "冠词",
+    "art": "冠词",
+}
+
+
+def lookup_part_of_speech_zh(part_of_speech: str) -> str:
+    key = re.sub(r"[_\s]+", " ", str(part_of_speech or "").replace(".", " ").strip().lower())
+    key = re.sub(r"\s+", " ", key).strip()
+    if not key:
+        return ""
+    return POS_ZH_MAP.get(key, part_of_speech)
+
+
+def lookup_popup_speak_text_zh(term: str, part_of_speech: str, meaning_zh: str) -> str:
+    meaning = str(meaning_zh or "").strip()
+    if not meaning:
+        return ""
+    pos_zh = lookup_part_of_speech_zh(part_of_speech)
+    pieces = [piece for piece in (pos_zh, meaning) if piece]
+    body = "，".join(pieces) if pieces else meaning
+    word = clean_vocab_word(term)
+    return f"{body}。英文，{word}。" if word else f"{body}。"
 
 
 def local_name(tag: str) -> str:
@@ -757,25 +885,31 @@ def lan_reader_html() -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sentence Reader LAN</title>
   <style>
-    :root { color-scheme: dark; --bg:#050505; --panel:#141414; --text:#f4f4f4; --muted:#aaa; --line:#2b2b2b; --blue:#62a8ff; --red:rgba(255,59,48,.62); --lan-page-width:100vw; --lan-toolbar-height:42px; --lan-page-gap:36px; --reader-font-size:20px; --reader-line-height:1.82; --reader-side-pad:18px; --reader-bottom-pad:18px; }
+    :root { color-scheme: dark; --bg:#050505; --panel:#141414; --text:#f4f4f4; --muted:#aaa; --line:#2b2b2b; --blue:#62a8ff; --red:rgba(255,59,48,.62); --lan-page-width:100vw; --lan-toolbar-height:42px; --lan-page-gap:36px; --reader-font-size:20px; --reader-line-height:1.62; --reader-side-pad:14px; --reader-bottom-pad:28px; }
     * { box-sizing: border-box; }
     html, body { margin:0; width:100%; height:100%; background:var(--bg); color:var(--text); font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif; overflow:hidden; }
     body { position:fixed; inset:0; min-height:100dvh; }
     button { background:#222; color:var(--text); border:1px solid #3a3a3a; border-radius:7px; padding:6px 8px; font-size:13px; cursor:pointer; white-space:nowrap; }
     button:disabled { opacity:.45; cursor:default; }
     #toolbar { position:fixed; z-index:20; top:0; left:0; right:0; min-height:var(--lan-toolbar-height); display:flex; gap:6px; align-items:center; justify-content:space-between; padding:4px max(8px, env(safe-area-inset-right)) 4px max(8px, env(safe-area-inset-left)); border-bottom:1px solid rgba(255,255,255,.08); background:rgba(5,5,5,.78); backdrop-filter:blur(16px); }
+    #toolbarMode { flex:1 1 auto; min-width:0; display:flex; align-items:center; }
     #toolbarActions { display:flex; gap:4px; align-items:center; min-width:0; }
     #toolbarActions button { min-width:34px; min-height:30px; }
-    #prev, #next { width:32px; padding-left:0; padding-right:0; font-size:19px; line-height:1; }
     #status { color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 2px; min-width:52px; text-align:right; font-size:12px; }
     #readerWrap { position:fixed; left:0; right:0; top:var(--lan-toolbar-height); bottom:0; overflow:hidden; touch-action:pan-y; background:var(--bg); }
-    #reader { height:100%; max-width:none; margin:0; padding:12px max(var(--reader-side-pad), env(safe-area-inset-right)) var(--reader-bottom-pad) max(var(--reader-side-pad), env(safe-area-inset-left)); font-size:var(--reader-font-size); line-height:var(--reader-line-height); column-width:calc(var(--lan-page-width) - max(calc(var(--reader-side-pad) * 2), env(safe-area-inset-left) + env(safe-area-inset-right) + calc(var(--reader-side-pad) * 2))); column-gap:var(--lan-page-gap); column-fill:auto; transform:translate3d(0,0,0); will-change:transform; transition:transform 220ms ease; overflow:visible; }
+    #reader { height:100%; max-width:none; margin:0; padding:8px max(var(--reader-side-pad), env(safe-area-inset-right)) var(--reader-bottom-pad) max(var(--reader-side-pad), env(safe-area-inset-left)); font-size:var(--reader-font-size); line-height:var(--reader-line-height); column-width:calc(var(--lan-page-width) - max(calc(var(--reader-side-pad) * 2), env(safe-area-inset-left) + env(safe-area-inset-right) + calc(var(--reader-side-pad) * 2))); column-gap:var(--lan-page-gap); column-fill:auto; orphans:1; widows:1; transform:translate3d(0,0,0); will-change:transform; transition:transform 220ms ease; overflow:visible; }
+    #reader, #reader * { box-sizing:border-box; max-width:100%; overflow-wrap:anywhere; word-break:break-word; }
+    #reader p, #reader li, #reader blockquote, #reader div, #reader section, #reader article { min-width:0; }
+    #reader table { width:100%; max-width:100%; table-layout:fixed; border-collapse:collapse; }
+    #reader td, #reader th { width:auto; max-width:100%; min-width:0; overflow-wrap:anywhere; word-break:break-word; }
+    #reader pre, #reader code { white-space:pre-wrap; overflow-wrap:anywhere; }
+    #reader div.right, #reader #main1 { display:block; float:none; width:auto; min-width:0; max-width:100%; text-align:left; break-inside:auto; }
     #reader img, #reader svg { max-width:100%; max-height:calc(100dvh - var(--lan-toolbar-height) - 40px); height:auto; display:block; margin:14px auto; object-fit:contain; break-inside:avoid; }
     #reader a { color:#9fc8ff; }
-    #reader p, #reader li, #reader blockquote { break-inside:auto; }
-    #reader p { margin:0 0 .82em; }
-    #reader h1, #reader h2, #reader h3, #reader h4, #reader h5, #reader h6 { margin:0 0 .72em; line-height:1.32; }
-    #reader ul, #reader ol { margin:0 0 .82em; padding-left:1.45em; }
+    #reader p, #reader li, #reader blockquote { break-inside:auto; -webkit-column-break-inside:auto; page-break-inside:auto; orphans:1; widows:1; }
+    #reader p { margin:0 0 .48em; }
+    #reader h1, #reader h2, #reader h3, #reader h4, #reader h5, #reader h6 { margin:0 0 .5em; line-height:1.22; }
+    #reader ul, #reader ol { margin:0 0 .48em; padding-left:1.28em; }
     .sr-sentence { border-radius:4px; }
     .sr-sentence.sr-focused { background:rgba(64,156,255,.30); box-shadow:0 0 0 1px rgba(124,190,255,.45) inset; }
     .sr-sentence.sr-red { background:var(--red); color:#fff; }
@@ -786,25 +920,50 @@ def lan_reader_html() -> str:
     body.drawer-open #scrim { opacity:1; pointer-events:auto; }
     #drawerHeader { flex:0 0 auto; display:flex; gap:8px; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid var(--line); }
     #drawerHeader strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    #books, #chapters { padding:8px; overflow:auto; }
-    #books { flex:0 0 auto; max-height:30vh; border-bottom:1px solid var(--line); }
-    #chapters { flex:1 1 auto; }
+    #chapters { flex:1 1 auto; padding:8px; overflow:auto; }
     #chapters .toc-row { white-space:normal; line-height:1.35; padding-left:var(--toc-indent, 8px); }
     #chapters .toc-row[data-level="0"] { font-weight:650; }
     #chapters .toc-row[data-level]:not([data-level="0"]) { color:#ddd; }
-    #sentenceBar { position:fixed; z-index:32; left:max(16px, env(safe-area-inset-left)); right:max(16px, env(safe-area-inset-right)); bottom:max(8px, env(safe-area-inset-bottom)); display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:4px; padding:6px; border:1px solid rgba(255,255,255,.13); border-radius:999px; background:rgba(15,15,15,.90); backdrop-filter:blur(18px); box-shadow:0 14px 38px rgba(0,0,0,.42); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; }
-    #sentenceBar.show { opacity:1; transform:translate3d(0,0,0); pointer-events:auto; }
-    #sentenceBar button { min-height:34px; border-radius:999px; font-size:13px; padding:4px 6px; }
-    #noteToast { position:fixed; z-index:31; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); bottom:calc(max(52px, env(safe-area-inset-bottom) + 52px)); max-height:30vh; overflow:auto; padding:10px 12px; border:1px solid rgba(96,165,250,.62); border-radius:11px; background:rgba(18,28,42,.94); color:#fff; box-shadow:0 16px 40px rgba(0,0,0,.42); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; font-size:15px; line-height:1.58; }
+    #sentenceBar { display:none; width:min(560px, 100%); grid-template-columns:repeat(5,minmax(0,1fr)); gap:4px; }
+    body.sentence-mode #toolbarActions { display:none; }
+    body.sentence-mode #sentenceBar.show { display:grid; }
+    body.note-editor-mode #sentenceBar.show { display:none; }
+    #sentenceBar button { min-height:30px; border-radius:7px; font-size:13px; padding:4px 6px; }
+    #readingStats { display:none; }
+    #noteToast { position:fixed; z-index:31; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); bottom:calc(max(20px, env(safe-area-inset-bottom) + 20px)); max-height:30vh; overflow:auto; padding:10px 12px; border:1px solid rgba(96,165,250,.62); border-radius:11px; background:rgba(18,28,42,.94); color:#fff; box-shadow:0 16px 40px rgba(0,0,0,.42); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; font-size:15px; line-height:1.58; }
     #noteToast.show { opacity:1; transform:translate3d(0,0,0); pointer-events:auto; }
     #noteToast strong { display:block; margin-bottom:4px; color:#9fc8ff; font-size:13px; }
-    #lookupCard { position:fixed; z-index:50; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); bottom:calc(max(58px, env(safe-area-inset-bottom) + 58px)); max-height:42vh; overflow:auto; padding:12px; border:1px solid rgba(215,168,79,.55); border-radius:12px; background:rgba(22,22,17,.96); color:#fff; box-shadow:0 18px 48px rgba(0,0,0,.48); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; }
+    #voiceToast { position:fixed; z-index:34; left:max(14px, env(safe-area-inset-left)); right:max(14px, env(safe-area-inset-right)); bottom:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom) + 20px); max-height:30vh; overflow:auto; padding:12px 14px; border:1px solid rgba(240,211,107,.48); border-radius:14px; background:rgba(13,13,11,.96); color:#f6f0e8; box-shadow:0 16px 44px rgba(0,0,0,.48); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; font-size:15px; line-height:1.48; }
+    #voiceToast.show { opacity:1; transform:translate3d(0,0,0); pointer-events:auto; }
+    #voiceToast.success { border-color:rgba(76,175,80,.62); }
+    #voiceToast.error { border-color:rgba(255,95,86,.72); }
+    #voiceToast.recording { border-color:rgba(255,183,77,.72); }
+    .voice-toast-head { display:flex; align-items:center; gap:8px; font-weight:850; font-size:16px; }
+    .voice-dot { width:10px; height:10px; border-radius:999px; background:#f0d36b; flex:0 0 auto; }
+    #voiceToast.recording .voice-dot { background:#ff5f56; animation:voicePulse 1s ease-in-out infinite; }
+    .voice-toast-body { margin-top:6px; color:#d9d0bd; overflow-wrap:anywhere; word-break:break-word; }
+    .voice-toast-actions { display:flex; gap:8px; margin-top:10px; }
+    .voice-toast-actions button { min-height:38px; border-radius:10px; padding:8px 14px; font-size:15px; font-weight:800; }
+    @keyframes voicePulse { 0%,100% { transform:scale(.86); opacity:.62; } 50% { transform:scale(1.18); opacity:1; } }
+    #noteEditor { position:fixed; z-index:46; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); top:calc(var(--lan-toolbar-height) + max(12px, env(safe-area-inset-top))); bottom:auto; max-height:min(64vh, 460px); display:none; grid-template-rows:auto auto minmax(128px, 1fr) auto auto; gap:9px; padding:13px; border:1px solid rgba(96,165,250,.58); border-radius:14px; background:rgba(15,18,23,.97); color:#f4f1e8; box-shadow:0 18px 56px rgba(0,0,0,.50); }
+    #noteEditor.show { display:grid; }
+    #noteEditorSource { max-height:76px; overflow:auto; padding:8px 10px; border-radius:10px; background:rgba(255,255,255,.055); color:#d8d3c6; font-size:14px; line-height:1.45; }
+    #noteEditorText { width:100%; min-height:128px; max-height:24vh; resize:vertical; border:1px solid rgba(255,255,255,.16); border-radius:11px; background:rgba(0,0,0,.22); color:#fff; padding:10px 11px; font-size:16px; line-height:1.55; outline:none; }
+    #noteEditorText:focus { border-color:rgba(96,165,250,.82); box-shadow:0 0 0 2px rgba(96,165,250,.18); }
+    #noteEditorStatus { min-height:18px; color:#aaa18f; font-size:13px; line-height:1.35; }
+    .note-editor-actions { display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:8px; }
+    .note-editor-actions button { min-height:40px; border-radius:10px; font-size:15px; font-weight:820; }
+    #lookupCard { position:fixed; z-index:50; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); bottom:calc(max(24px, env(safe-area-inset-bottom) + 24px)); max-height:42vh; overflow:auto; padding:12px; border:1px solid rgba(215,168,79,.55); border-radius:12px; background:rgba(22,22,17,.96); color:#fff; box-shadow:0 18px 48px rgba(0,0,0,.48); opacity:0; transform:translate3d(0,14px,0); pointer-events:none; transition:opacity 160ms ease, transform 160ms ease; }
     #lookupCard.show { opacity:1; transform:translate3d(0,0,0); pointer-events:auto; }
     #lookupCard h3 { margin:0 0 4px; font-size:22px; line-height:1.2; }
     #lookupCard .meaning { color:#f2c36d; font-weight:800; margin-bottom:7px; }
     #lookupCard .lookup-text { color:#e9e2cf; line-height:1.55; margin:5px 0; font-size:14px; }
     #lookupCard .lookup-zh { color:#cfc7ad; }
     #lookupCard .lookup-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+    #lookupCard .lookup-correction { margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,.12); }
+    #lookupCard textarea { width:100%; box-sizing:border-box; min-height:78px; resize:vertical; border:1px solid rgba(215,168,79,.46); border-radius:10px; background:rgba(255,255,255,.08); color:#fff; padding:10px; font:inherit; line-height:1.45; }
+    #lookupCard textarea::placeholder { color:rgba(255,255,255,.42); }
+    #lookupCard .lookup-correction-actions { display:flex; gap:8px; margin-top:8px; }
     #settingsSheet { position:fixed; z-index:45; left:max(12px, env(safe-area-inset-left)); right:max(12px, env(safe-area-inset-right)); bottom:max(12px, env(safe-area-inset-bottom)); border:1px solid var(--line); border-radius:14px; background:rgba(20,20,20,.96); box-shadow:0 18px 54px rgba(0,0,0,.50); padding:14px; display:none; }
     #settingsSheet.show { display:block; }
     #settingsSheet label { display:grid; gap:6px; margin:10px 0; color:var(--muted); font-size:13px; }
@@ -815,55 +974,88 @@ def lan_reader_html() -> str:
     @media (min-width: 900px) {
       #reader { padding-left:calc((100vw - 820px) / 2); padding-right:calc((100vw - 820px) / 2); column-width:min(820px, calc(var(--lan-page-width) - 48px)); }
     }
-    @media (max-width: 760px) {
-      :root { --lan-toolbar-height:38px; --lan-page-gap:34px; --reader-bottom-pad:max(14px, env(safe-area-inset-bottom) + 10px); }
-      :root { --reader-font-size:19px; --reader-line-height:1.78; }
+    body.reader-large-font #reader { padding-left:max(var(--reader-side-pad), env(safe-area-inset-left)); padding-right:max(var(--reader-side-pad), env(safe-area-inset-right)); column-width:calc(var(--lan-page-width) - max(calc(var(--reader-side-pad) * 2), env(safe-area-inset-left) + env(safe-area-inset-right) + calc(var(--reader-side-pad) * 2))); }
+    @media (max-width: 1024px) {
+      :root { --lan-toolbar-height:52px; --reader-bottom-pad:max(8px, env(safe-area-inset-bottom) + 4px); }
+      #toolbar { top:auto; bottom:0; min-height:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom)); padding:5px max(10px, env(safe-area-inset-right)) max(5px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left)); border-top:1px solid rgba(255,255,255,.10); border-bottom:0; }
+      #readerWrap { top:0; bottom:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom)); }
       #reader { padding-top:8px; }
-      #toolbarActions { gap:3px; }
-      #toolbarActions button { min-width:30px; min-height:28px; padding:4px 6px; font-size:12px; }
-      #prev, #next { width:28px; font-size:18px; }
-      #status { font-size:11px; }
+      #reader img, #reader svg { max-height:calc(100dvh - var(--lan-toolbar-height) - env(safe-area-inset-bottom) - 24px); }
+      #toolbarActions { gap:6px; }
+      #toolbarActions button { min-width:48px; min-height:42px; padding:8px 10px; border-radius:10px; font-size:16px; font-weight:750; }
+      #sentenceBar { gap:6px; }
+      #sentenceBar button { min-height:42px; border-radius:10px; padding:8px 9px; font-size:15px; font-weight:750; }
+      #status { font-size:16px; font-weight:800; text-align:right; min-width:46px; color:#f4f4f4; }
+      #noteToast { bottom:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom) + 24px); }
+      #voiceToast { bottom:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom) + 24px); }
+      #noteEditor { top:calc(max(12px, env(safe-area-inset-top)) + 12px); bottom:auto; max-height:62vh; }
+      #noteEditorText { min-height:150px; font-size:17px; }
+      #lookupCard { bottom:calc(var(--lan-toolbar-height) + env(safe-area-inset-bottom) + 28px); }
+      #reader p { margin-bottom:.34em; }
+    }
+    @media (max-width: 760px) {
+      :root { --lan-toolbar-height:52px; --lan-page-gap:34px; --reader-bottom-pad:max(8px, env(safe-area-inset-bottom) + 4px); }
+      :root { --reader-font-size:19px; --reader-line-height:1.56; }
+      #reader { padding-top:6px; }
+      #toolbarActions { gap:4px; }
+      #toolbarActions button { min-width:42px; min-height:42px; padding:7px 8px; border-radius:10px; font-size:15px; font-weight:760; }
+      #sentenceBar { gap:4px; }
+      #sentenceBar button { min-width:0; min-height:42px; padding:7px 6px; border-radius:10px; font-size:15px; font-weight:760; }
+      #status { font-size:16px; min-width:44px; }
     }
   </style>
 </head>
 <body>
   <div id="scrim"></div>
   <aside id="drawer">
-    <div id="drawerHeader"><strong>Sentence Reader LAN</strong><button id="closeDrawer">收起</button></div>
-    <div id="books"></div>
+    <div id="drawerHeader"><strong id="drawerTitle">目录</strong><button id="closeDrawer">收起</button></div>
     <div id="chapters"></div>
   </aside>
   <header id="toolbar">
-    <div id="toolbarActions">
-      <button id="libraryHome">书库</button>
-      <button id="tocToggle">目录</button>
-      <button id="vocabHome">单词</button>
-      <button id="fontSettings">Aa</button>
-      <button id="prev" aria-label="上一页" title="上一页">‹</button>
-      <button id="next" aria-label="下一页" title="下一页">›</button>
+    <div id="toolbarMode">
+      <div id="toolbarActions">
+        <button id="libraryHome">书库</button>
+        <button id="tocToggle">目录</button>
+        <button id="vocabHome">单词</button>
+        <button id="fontSettings">Aa</button>
+      </div>
+      <div id="sentenceBar" aria-hidden="true">
+        <button id="barRed">红标</button>
+        <button id="barNote">笔记</button>
+        <button id="barVoice">语音</button>
+        <button id="barCopy">复制</button>
+        <button id="barCancel">取消</button>
+      </div>
     </div>
     <div id="status">正在加载...</div>
   </header>
   <input id="audioFile" type="file" accept="audio/*" capture="microphone" style="display:none">
   <main id="readerWrap"><article id="reader"></article></main>
+  <div id="readingStats"></div>
   <div id="noteToast"></div>
+  <div id="voiceToast" aria-live="polite"></div>
+  <section id="noteEditor" aria-hidden="true">
+    <div class="setting-row"><strong id="noteEditorTitle">句子备注</strong><button id="noteEditorClose" type="button">关闭</button></div>
+    <div id="noteEditorSource"></div>
+    <textarea id="noteEditorText" placeholder="输入文字备注，或点语音把转写插入这里。"></textarea>
+    <div id="noteEditorStatus"></div>
+    <div class="note-editor-actions">
+      <button id="noteEditorVoice" type="button">语音</button>
+      <button id="noteEditorClean" type="button">整理</button>
+      <button id="noteEditorSave" type="button">保存</button>
+      <button id="noteEditorCancel" type="button">取消</button>
+    </div>
+  </section>
   <div id="lookupCard"></div>
-  <div id="sentenceBar" aria-hidden="true">
-    <button id="barRed">红标</button>
-    <button id="barNote">笔记</button>
-    <button id="barVoice">语音</button>
-    <button id="barCopy">复制</button>
-    <button id="barCancel">取消</button>
-  </div>
   <section id="settingsSheet" aria-hidden="true">
     <div class="setting-row"><strong>阅读设置</strong><button id="closeSettings">关闭</button></div>
     <label>字体大小 <input id="fontSize" type="range" min="16" max="30" step="1"></label>
-    <label>行距 <input id="lineHeight" type="range" min="1.45" max="2.2" step="0.05"></label>
-    <label>页边距 <input id="sidePadding" type="range" min="12" max="44" step="2"></label>
+    <label>行距 <input id="lineHeight" type="range" min="1.2" max="2.05" step="0.05"></label>
+    <label>页边距 <input id="sidePadding" type="range" min="4" max="40" step="2"></label>
   </section>
   <script>
     const initialBookID = new URLSearchParams(window.location.search).get('book_id');
-    const state = { books: [], book: null, manifest: null, chapterIndex: 0, annotations: [], focused: null, redIDs: new Map(), noteByIndex: new Map(), saveTimer: 0, noteTimer: 0, sentenceTapTimer: 0, pageIndex: 0, totalPages: 1, pageTurnLockUntil: 0, pendingPageTurnDirection: 0, pendingPageTurnTimer: 0, wheelGestureDirection: 0, wheelGestureDistance: 0, wheelGestureConsumed: false, lastWheelEventAt: 0, wheelInertiaLockUntil: 0, touchStartX: 0, touchStartY: 0, touchStartTime: 0, touchSentence: null, longPressTimer: 0, longPressTriggered: false, recognition: null, mediaRecorder: null, voiceChunks: [], voiceStartedAt: 0, voiceStream: null, lookup: null };
+    const state = { books: [], book: null, manifest: null, chapterIndex: 0, annotations: [], focused: null, redIDs: new Map(), noteByIndex: new Map(), saveTimer: 0, noteTimer: 0, sentenceTapTimer: 0, voiceToastTimer: 0, noteEditorAnnotationID: '', noteEditorAudioNoteID: '', pendingAudioPolls: new Map(), pageIndex: 0, totalPages: 1, pageTurnLockUntil: 0, pendingPageTurnDirection: 0, pendingPageTurnTimer: 0, wheelGestureDirection: 0, wheelGestureDistance: 0, wheelGestureConsumed: false, lastWheelEventAt: 0, wheelInertiaLockUntil: 0, touchStartX: 0, touchStartY: 0, touchStartTime: 0, touchSentence: null, longPressTimer: 0, longPressTriggered: false, recognition: null, mediaRecorder: null, nativeReaderAudioRecording: false, voiceChunks: [], voiceStartedAt: 0, voiceStream: null, lookup: null };
     // Keep the physical wheel gesture boundary separate from page animation:
     // one swipe triggers one page, while the next clear swipe may arrive before the animation ends.
     const pageTurnCooldownMs = 120;
@@ -872,10 +1064,27 @@ def lan_reader_html() -> str:
     const wheelPageTurnThreshold = 96;
     const wheelDominanceRatio = 1.25;
     const $ = (id) => document.getElementById(id);
+    const voiceNotePendingText = '语音转写中...';
+    const voiceNoteFailedText = '语音已保存，转写失败，可稍后重试。';
     function status(text) { $('status').textContent = text; }
     function openDrawer() { document.body.classList.add('drawer-open'); }
     function closeDrawer() { document.body.classList.remove('drawer-open'); }
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+    const noteSpokenPunctuation = [['新的一行','\n'],['另起一行','\n'],['换行','\n'],['句号','。'],['逗号','，'],['顿号','、'],['问号','？'],['感叹号','！'],['叹号','！'],['冒号','：'],['分号','；'],['省略号','……']];
+    const noteClosingPunctuation = `。！？!?.…；;：:，,、）)]】》」』”’"'`;
+    function normalizeNoteText(value) {
+      let text = String(value ?? '').trim();
+      if (!text) return '';
+      noteSpokenPunctuation.forEach(([spoken, mark]) => { text = text.split(spoken).join(mark); });
+      text = text
+        .replace(/\s+([，。！？；：、,.!?;:])/g, '$1')
+        .replace(/([，。！？；：、,.!?;:])\s+/g, '$1')
+        .replace(/([。！？!?]){2,}/g, '$1')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      if (!text || noteClosingPunctuation.includes(text[text.length - 1])) return text;
+      return text + (/[A-Za-z]/.test(text) && !/[\u4e00-\u9fff]/.test(text) ? '.' : '。');
+    }
     async function json(url, options) {
       const response = await fetch(url, options);
       if (!response.ok) throw new Error(await response.text());
@@ -887,11 +1096,16 @@ def lan_reader_html() -> str:
       return Math.max(0, Math.min(1, state.pageIndex / denominator));
     }
     function updatePaginationStatus() {
-      const chapter = state.manifest && state.manifest.chapters ? state.manifest.chapters[state.chapterIndex] : null;
-      const title = chapter ? (chapter.title || chapter.locator || '') : '';
-      status(`${title} · ${state.pageIndex + 1}/${state.totalPages}`);
-      $('prev').disabled = state.chapterIndex <= 0 && state.pageIndex <= 0;
-      $('next').disabled = state.manifest ? (state.chapterIndex >= state.manifest.chapters.length - 1 && state.pageIndex >= state.totalPages - 1) : true;
+      status(`${state.pageIndex + 1}/${state.totalPages}`);
+      updateReadingStats();
+      const prevButton = $('prev');
+      const nextButton = $('next');
+      if (prevButton) prevButton.disabled = state.chapterIndex <= 0 && state.pageIndex <= 0;
+      if (nextButton) nextButton.disabled = state.manifest ? (state.chapterIndex >= state.manifest.chapters.length - 1 && state.pageIndex >= state.totalPages - 1) : true;
+    }
+    function updateReadingStats() {
+      const stats = $('readingStats');
+      if (stats) stats.textContent = '';
     }
     function applyPage(animated = true) {
       const reader = $('reader');
@@ -1072,11 +1286,13 @@ def lan_reader_html() -> str:
     }
     function showSentenceBar() {
       const bar = $('sentenceBar');
+      document.body.classList.add('sentence-mode');
       bar.classList.add('show');
       bar.setAttribute('aria-hidden', 'false');
     }
     function hideSentenceBar() {
       const bar = $('sentenceBar');
+      document.body.classList.remove('sentence-mode');
       bar.classList.remove('show');
       bar.setAttribute('aria-hidden', 'true');
     }
@@ -1103,6 +1319,135 @@ def lan_reader_html() -> str:
       toast.classList.add('show');
       state.noteTimer = setTimeout(() => toast.classList.remove('show'), 9000);
     }
+    function noteEditorOpen() {
+      return $('noteEditor').classList.contains('show');
+    }
+    function setNoteEditorStatus(text) {
+      $('noteEditorStatus').textContent = text || '';
+    }
+    function closeNoteEditor() {
+      const editor = $('noteEditor');
+      editor.classList.remove('show');
+      editor.setAttribute('aria-hidden', 'true');
+      document.body.classList.remove('note-editor-mode');
+      setNoteEditorStatus('');
+      state.noteEditorAnnotationID = '';
+      state.noteEditorAudioNoteID = '';
+    }
+    function appendNoteEditorText(text) {
+      const value = normalizeNoteText(text);
+      if (!value) return;
+      const textarea = $('noteEditorText');
+      const current = String(textarea.value || '').trim();
+      textarea.value = current ? `${current}\n${value}` : value;
+      textarea.focus();
+      textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
+      setNoteEditorStatus('语音已转写到备注框，检查后点保存。');
+    }
+    function replacePendingNoteText(text) {
+      const value = normalizeNoteText(text);
+      if (!value) return;
+      const textarea = $('noteEditorText');
+      const current = String(textarea.value || '').trim();
+      if (!current || current === voiceNotePendingText) {
+        textarea.value = value;
+      } else if (current.includes(voiceNotePendingText)) {
+        textarea.value = normalizeNoteText(current.split(voiceNotePendingText).join(value));
+      } else if (!current.includes(value)) {
+        textarea.value = normalizeNoteText(`${current}\n${value}`);
+      }
+      textarea.focus();
+      textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
+      setNoteEditorStatus('后台转写已完成，已补到备注框。');
+    }
+    function addPendingNoteText() {
+      const textarea = $('noteEditorText');
+      const current = String(textarea.value || '').trim();
+      if (!current) textarea.value = voiceNotePendingText;
+      else if (!current.includes(voiceNotePendingText)) textarea.value = normalizeNoteText(`${current}\n${voiceNotePendingText}`);
+      setNoteEditorStatus('语音已保存，后台正在转写。你可以先退出。');
+    }
+    function openNoteEditor(options = {}) {
+      const node = state.focused;
+      if (!node || !state.book || !state.manifest) {
+        status('先点一句话');
+        return false;
+      }
+      const existing = state.noteByIndex.get(node.dataset.srIndex || '');
+      $('noteEditorSource').textContent = String(node.textContent || '').trim();
+      $('noteEditorText').value = existing ? (existing.note_text || '') : '';
+      state.noteEditorAnnotationID = existing ? (existing.id || '') : '';
+      state.noteEditorAudioNoteID = existing && existing.metadata && existing.metadata.voice_note ? (existing.metadata.voice_note.audio_note_id || '') : '';
+      setNoteEditorStatus(existing ? '已载入原备注，可继续修改。' : '输入文字备注，或点语音插入转写。');
+      hideNoteToast();
+      hideLookupCard();
+      closeSettingsSheet();
+      const editor = $('noteEditor');
+      document.body.classList.add('note-editor-mode');
+      editor.classList.add('show');
+      editor.setAttribute('aria-hidden', 'false');
+      if (options.focusText !== false) $('noteEditorText').focus();
+      status('正在编辑备注');
+      return true;
+    }
+    async function linkAudioNoteToAnnotation(audioNoteID, annotation) {
+      if (!audioNoteID || !annotation || !annotation.id) return;
+      try {
+        await json(`/audio-notes/${audioNoteID}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ annotation_id: annotation.id })
+        });
+      } catch (error) {}
+    }
+    async function ensureNoteEditorAnnotation() {
+      const note = normalizeNoteText($('noteEditorText').value);
+      if (!note) return null;
+      const annotation = await saveNoteText(note);
+      state.noteEditorAnnotationID = annotation && annotation.id ? annotation.id : state.noteEditorAnnotationID;
+      return annotation;
+    }
+    async function saveNoteEditor() {
+      const note = normalizeNoteText($('noteEditorText').value);
+      if (!note) {
+        setNoteEditorStatus('备注为空，未保存。');
+        status('备注为空');
+        return;
+      }
+      setNoteEditorStatus('正在保存...');
+      const annotation = await saveNoteText(note);
+      state.noteEditorAnnotationID = annotation && annotation.id ? annotation.id : state.noteEditorAnnotationID;
+      await linkAudioNoteToAnnotation(state.noteEditorAudioNoteID, annotation);
+      setNoteEditorStatus('已保存。');
+      closeNoteEditor();
+    }
+    async function cleanNoteEditorText() {
+      const note = normalizeNoteText($('noteEditorText').value);
+      if (!note) {
+        setNoteEditorStatus('备注为空，没法整理。');
+        return;
+      }
+      setNoteEditorStatus('正在让 Hermes / Qwen 整理...');
+      let annotationID = state.noteEditorAnnotationID;
+      if (!annotationID) {
+        const annotation = await ensureNoteEditorAnnotation();
+        annotationID = annotation && annotation.id;
+      }
+      if (!annotationID) {
+        setNoteEditorStatus('保存备注失败，暂时不能整理。');
+        return;
+      }
+      const payload = await json(`/annotations/${annotationID}/clean`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apply: true })
+      });
+      $('noteEditorText').value = payload.cleaned_text || note;
+      state.noteEditorAnnotationID = annotationID;
+      await refreshAnnotations();
+      setNoteEditorStatus('已整理并保存。');
+      status('备注已整理');
+    }
     function hideLookupCard() {
       const card = $('lookupCard');
       card.classList.remove('show');
@@ -1117,6 +1462,27 @@ def lan_reader_html() -> str:
       utterance.lang = lang;
       utterance.rate = .92;
       window.speechSynthesis.speak(utterance);
+    }
+    async function speakLookupMeaning(text) {
+      const value = String(text || '').trim();
+      if (!value) return;
+      try {
+        const response = await fetch('/lookup/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: value })
+        });
+        const payload = await response.json();
+        if (payload.ok && payload.audio_url) {
+          window.speechSynthesis?.cancel();
+          const audio = new Audio(payload.audio_url);
+          await audio.play();
+          return;
+        }
+      } catch (error) {
+        // Browser speech synthesis is the local fallback when edge-tts is unavailable.
+      }
+      speak(value, 'zh-CN');
     }
     function wordFromSelection() {
       const selection = window.getSelection && window.getSelection();
@@ -1196,45 +1562,68 @@ def lan_reader_html() -> str:
     async function updateVocabMeaning() {
       const current = state.lookup;
       const item = current && current.item;
-      if (!item || !state.book) return;
-      const next = window.prompt(`${current.word} 的本句义`, item.context_meaning_zh || '');
-      if (next === null) return;
+      if (!current || !state.book) return;
+      const input = $('lookupMeaningInput');
+      const next = input ? input.value : '';
       const value = next.trim();
       if (!value) return;
-      const updated = await json(`/books/${state.book.id}/vocab/${item.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ context_meaning_zh: value })
-      });
-      renderLookupCard({ ...current.payload, item: updated }, current.word, current.sentence);
+      const updated = item && item.id
+        ? await json(`/books/${state.book.id}/vocab/${item.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ context_meaning_zh: value })
+          })
+        : await json(`/books/${state.book.id}/lookup-corrections`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              word: current.word,
+              meaning_zh: value,
+              sentence: current.sentence || '',
+              sentence_id: current.sentenceIndex || ''
+            })
+          });
+      renderLookupCard({ ...current.payload, found: true, item: updated }, current.word, current.sentence, current.sentenceIndex);
       status('已保存本书释义');
     }
-    function renderLookupCard(payload, word, sentence) {
+    function renderLookupCard(payload, word, sentence, sentenceIndex = '') {
       const item = payload.item || {};
       const meaning = item.context_meaning_zh || '看本句中文';
       const en = item.representative_sentence_en || sentence || '';
       const zh = item.representative_sentence_zh || '';
       const metadata = item.metadata || {};
+      const partOfSpeechZh = metadata.part_of_speech_zh || item.part_of_speech_zh || '';
+      const partOfSpeech = metadata.part_of_speech || item.part_of_speech || '';
+      const popupSpeakText = metadata.popup_speak_text_zh || item.popup_speak_text_zh || [partOfSpeechZh, meaning].filter(Boolean).join('，') || meaning;
       const reviewable = item.reviewable !== false && !!item.id;
-      state.lookup = { payload, item, word, sentence };
+      state.lookup = { payload, item, word, sentence, sentenceIndex };
       const sourceTitle = item.meaning_source === 'lifestudy_domain_glossary'
         ? '生命读经词库'
-        : (item.meaning_source === 'user_glossary' ? '用户修正' : (item.meaning_source === 'dictionary_fallback' ? '词典短释' : ''));
+        : (item.meaning_source === 'user_glossary' ? '用户修正' : (item.meaning_source === 'dictionary_fallback' ? '词典短释' : (item.meaning_source === 'online_lookup' ? '在线查询' : '')));
       const source = sourceTitle ? `<span class="pill">${esc(sourceTitle)}</span>` : '';
+      const posLine = partOfSpeechZh ? `<span class="pill">${esc(partOfSpeechZh)}</span>` : (partOfSpeech ? `<span class="pill">${esc(partOfSpeech)}</span>` : '');
       const sourcePage = metadata.source_page ? `第 ${esc(metadata.source_page)} 页` : '';
       const sourceVolume = metadata.volume ? esc(metadata.volume) : '';
       const sourceMeta = [sourceVolume, sourcePage].filter(Boolean).join(' · ');
       const sourceLine = sourceMeta ? `<div class="lookup-text lookup-zh">出处：${sourceMeta}</div>` : '';
       const reviewActions = reviewable
-        ? '<button id="lookupEditMeaning">修正</button><button id="lookupReview">复习</button><button id="lookupKnown">掌握</button>'
+        ? '<button id="lookupReview">复习</button><button id="lookupKnown">掌握</button>'
         : '';
-      $('lookupCard').innerHTML = `<h3>${esc(word)}</h3><div class="meaning">${esc(meaning)}</div><div>${source}</div>${sourceLine}<div class="lookup-text">${esc(en)}</div><div class="lookup-text lookup-zh">${esc(zh)}</div><div class="lookup-actions"><button id="lookupSpeakWord">读词</button><button id="lookupSpeakSentence">读句</button><button id="lookupCopy">复制</button>${reviewActions}<button id="lookupClose">关闭</button></div>`;
+      const correction = `<div id="lookupCorrection" class="lookup-correction" hidden><textarea id="lookupMeaningInput" placeholder="填写或修正这个词在当前书里的中文意思">${esc(item.context_meaning_zh || '')}</textarea><div class="lookup-correction-actions"><button id="lookupSaveMeaning">保存释义</button><button id="lookupCancelMeaning">取消</button></div></div>`;
+      $('lookupCard').innerHTML = `<h3>${esc(word)}</h3><div class="meaning">${esc(meaning)}</div><div>${source}${posLine}</div>${sourceLine}<div class="lookup-text">${esc(en)}</div><div class="lookup-text lookup-zh">${esc(zh)}</div><div class="lookup-actions"><button id="lookupSpeakWord">读词</button><button id="lookupSpeakMeaning">读释义</button><button id="lookupSpeakSentence">读句</button><button id="lookupCopy">复制</button><button id="lookupEditMeaning">纠错</button>${reviewActions}<button id="lookupClose">关闭</button></div>${correction}`;
       $('lookupCard').classList.add('show');
       $('lookupSpeakWord').onclick = () => speak(word, 'en-US');
+      $('lookupSpeakMeaning').onclick = () => speakLookupMeaning(popupSpeakText).catch(() => speak(popupSpeakText, 'zh-CN'));
       $('lookupSpeakSentence').onclick = () => speak(en, 'en-US');
       $('lookupCopy').onclick = () => navigator.clipboard?.writeText(`${word}\\n${meaning}\\n${en}\\n${zh}`).then(() => status('已复制查词卡片')).catch(() => status('复制失败'));
+      $('lookupEditMeaning').onclick = () => {
+        const panel = $('lookupCorrection');
+        panel.hidden = false;
+        $('lookupMeaningInput')?.focus();
+      };
+      $('lookupSaveMeaning').onclick = () => updateVocabMeaning().catch((error) => status(`保存失败：${error.message}`));
+      $('lookupCancelMeaning').onclick = () => { $('lookupCorrection').hidden = true; };
       if (reviewable) {
-        $('lookupEditMeaning').onclick = () => updateVocabMeaning().catch((error) => status(`保存失败：${error.message}`));
         $('lookupReview').onclick = () => updateVocabStatus('reviewing').catch((error) => status(`保存失败：${error.message}`));
         $('lookupKnown').onclick = () => updateVocabStatus('known').catch((error) => status(`保存失败：${error.message}`));
       }
@@ -1242,18 +1631,56 @@ def lan_reader_html() -> str:
     }
     async function showLookup(word, sentence, sentenceIndex) {
       if (!state.book || !word) return false;
-      const payload = await json(`/books/${state.book.id}/lookup?word=${encodeURIComponent(word)}&sentence_id=${encodeURIComponent(sentenceIndex || '')}`);
+      status(`正在查词：${word}`);
+      const params = new URLSearchParams({ word, sentence_id: sentenceIndex || '', sentence: sentence || '' });
+      const payload = await json(`/books/${state.book.id}/lookup?${params.toString()}`);
       await json(`/books/${state.book.id}/lookup-events`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ surface: word, lemma: payload.item?.lemma || '', event_kind: 'lookup', context: { sentence, sentenceIndex } })
       }).catch(() => null);
-      renderLookupCard(payload, word, sentence);
+      renderLookupCard(payload, word, sentence, sentenceIndex);
       status(payload.found ? `已查词：${word}` : `未收入单词本：${word}`);
       return true;
     }
     function setVoiceLabel(text) {
       $('barVoice').textContent = text;
+    }
+    function hideVoiceToast(delay = 0) {
+      clearTimeout(state.voiceToastTimer);
+      const run = () => {
+        const toast = $('voiceToast');
+        if (!toast) return;
+        toast.className = '';
+        toast.innerHTML = '';
+        updatePaginationStatus();
+      };
+      if (delay > 0) state.voiceToastTimer = window.setTimeout(run, delay);
+      else run();
+    }
+    function showVoiceToast(title, body = '', mode = 'info', options = {}) {
+      const toast = $('voiceToast');
+      if (!toast) return;
+      clearTimeout(state.voiceToastTimer);
+      const stop = options.stop ? '<div class="voice-toast-actions"><button id="voiceToastStop" type="button">停止并保存</button></div>' : '';
+      toast.className = `show ${mode}`;
+      toast.innerHTML = `<div class="voice-toast-head"><span class="voice-dot"></span><strong>${esc(title)}</strong></div>${body ? `<div class="voice-toast-body">${esc(body)}</div>` : ''}${stop}`;
+      if (options.stop && $('voiceToastStop')) {
+        $('voiceToastStop').onclick = () => {
+          if (state.nativeReaderAudioRecording && nativeReaderAudioAvailable()) {
+            try { ClickNativeAudio.stopRecording(); } catch (error) {}
+            return;
+          }
+          if (state.mediaRecorder) {
+            try { state.mediaRecorder.stop(); } catch (error) {}
+            return;
+          }
+          if (state.recognition) {
+            try { state.recognition.stop(); } catch (error) {}
+          }
+        };
+      }
+      if (options.autoHide) hideVoiceToast(options.autoHide);
     }
     async function copyFocusedSentence() {
       const node = state.focused;
@@ -1270,8 +1697,8 @@ def lan_reader_html() -> str:
       let settings = {};
       try { settings = JSON.parse(localStorage.getItem('sentenceReaderLanSettings') || '{}'); } catch (error) { settings = {}; }
       const fontSize = Number(settings.fontSize || 20);
-      const lineHeight = Number(settings.lineHeight || 1.82);
-      const sidePadding = Number(settings.sidePadding || 18);
+      const lineHeight = Number(settings.lineHeight || 1.62);
+      const sidePadding = Number(settings.sidePadding || 14);
       $('fontSize').value = String(fontSize);
       $('lineHeight').value = String(lineHeight);
       $('sidePadding').value = String(sidePadding);
@@ -1280,14 +1707,15 @@ def lan_reader_html() -> str:
     function currentReaderSettings() {
       return {
         fontSize: Number($('fontSize').value || 20),
-        lineHeight: Number($('lineHeight').value || 1.82),
-        sidePadding: Number($('sidePadding').value || 18)
+        lineHeight: Number($('lineHeight').value || 1.62),
+        sidePadding: Number($('sidePadding').value || 14)
       };
     }
     function applyReaderSettings(settings = currentReaderSettings(), persist = true) {
       document.documentElement.style.setProperty('--reader-font-size', `${settings.fontSize}px`);
       document.documentElement.style.setProperty('--reader-line-height', String(settings.lineHeight));
       document.documentElement.style.setProperty('--reader-side-pad', `${settings.sidePadding}px`);
+      document.body.classList.toggle('reader-large-font', Number(settings.fontSize) >= 24);
       if (persist) localStorage.setItem('sentenceReaderLanSettings', JSON.stringify(settings));
       requestAnimationFrame(() => layoutPages(pageRatio()));
     }
@@ -1314,18 +1742,24 @@ def lan_reader_html() -> str:
         state.longPressTimer = 0;
       }
     }
+    function showReaderLoadError(message) {
+      $('drawerTitle').textContent = '目录';
+      $('chapters').innerHTML = '';
+      $('reader').innerHTML = `<div style="padding:22px;line-height:1.65;color:#ddd"><strong>${esc(message)}</strong><br><button onclick="location.href='/library'">回到书库</button></div>`;
+      status(message);
+    }
     async function loadBooks() {
-      state.books = await json('/lan/books');
-      $('books').innerHTML = state.books.map((book, index) => `<button class="row ${index === 0 ? 'active' : ''}" data-book="${book.id}">${book.title || book.id}</button>`).join('');
-      $('books').querySelectorAll('button').forEach((button) => button.onclick = () => loadBook(button.dataset.book));
-      const preferred = state.books.find((book) => book.id === initialBookID) || state.books.find((book) => book.lan_available) || state.books[0];
-      if (preferred) await loadBook(preferred.id);
-      else status('没有可用书籍，请先在 Mac App 打开 EPUB。');
+      if (!initialBookID) {
+        showReaderLoadError('请从书库打开一本书');
+        return;
+      }
+      await loadBook(initialBookID);
     }
     async function loadBook(bookID) {
       state.book = state.books.find((book) => book.id === bookID) || { id: bookID };
-      document.querySelectorAll('#books .row').forEach((button) => button.classList.toggle('active', button.dataset.book === bookID));
       state.manifest = await json(`/lan/books/${bookID}/manifest`);
+      state.book = state.manifest.book || state.book;
+      $('drawerTitle').textContent = state.book.title || '目录';
       state.annotations = await json(`/books/${bookID}/annotations`);
       const saved = state.manifest.position;
       const savedIndex = saved && saved.locator && Number.isInteger(saved.locator.chapterIndex) ? saved.locator.chapterIndex : state.manifest.chapters.findIndex((c) => c.locator === (saved || {}).chapter_locator);
@@ -1333,10 +1767,15 @@ def lan_reader_html() -> str:
       await loadChapter(savedIndex >= 0 ? savedIndex : 0, saved ? Number(saved.page_ratio || 0) : 0);
     }
     function renderChapters() {
+      const chapterCount = Array.isArray(state.manifest.chapters) ? state.manifest.chapters.length : 0;
       const tocItems = Array.isArray(state.manifest.toc) && state.manifest.toc.length
         ? state.manifest.toc
         : state.manifest.chapters.map((chapter) => ({ title: chapter.title || chapter.locator, chapter_index: chapter.index, level: 0 }));
-      $('chapters').innerHTML = tocItems.map((entry) => {
+      const currentBookTocItems = tocItems.filter((entry) => {
+        const chapterIndex = Number(entry.chapter_index);
+        return Number.isInteger(chapterIndex) && chapterIndex >= 0 && chapterIndex < chapterCount;
+      });
+      $('chapters').innerHTML = currentBookTocItems.map((entry) => {
         const level = Math.max(0, Math.min(6, Number(entry.level || 0)));
         const chapterIndex = Number(entry.chapter_index);
         const title = entry.title || (state.manifest.chapters[chapterIndex] || {}).title || (state.manifest.chapters[chapterIndex] || {}).locator || '';
@@ -1348,6 +1787,7 @@ def lan_reader_html() -> str:
       });
     }
     async function loadChapter(index, restoreRatio = null) {
+      closeNoteEditor();
       state.chapterIndex = Math.max(0, Math.min(index, state.manifest.chapters.length - 1));
       const chapter = await json(`/lan/books/${state.book.id}/chapters/${state.chapterIndex}`);
       $('reader').innerHTML = chapter.html;
@@ -1401,6 +1841,7 @@ def lan_reader_html() -> str:
       const index = node.dataset.srIndex || '';
       const existing = state.noteByIndex.get(index);
       if (note === null) return null;
+      note = normalizeNoteText(note);
       const chapter = state.manifest.chapters[state.chapterIndex];
       let saved = null;
       if (existing) {
@@ -1429,9 +1870,7 @@ def lan_reader_html() -> str:
     async function addNote() {
       const node = state.focused;
       if (!node || !state.book || !state.manifest) return status('先点一句话');
-      const existing = state.noteByIndex.get(node.dataset.srIndex || '');
-      const note = prompt('备注', existing ? (existing.note_text || '') : '');
-      await saveNoteText(note);
+      openNoteEditor();
     }
     function preferredAudioMimeType() {
       if (!window.MediaRecorder) return '';
@@ -1448,7 +1887,8 @@ def lan_reader_html() -> str:
     }
     async function transcribeVoiceBlob(blob, durationSeconds = null) {
       if (!state.book) throw new Error('没有当前书籍');
-      status('正在上传语音到 Mac 转写...');
+      status('语音处理中');
+      showVoiceToast('正在保存语音', noteEditorOpen() ? '录音会先保存，后台转写完成后自动补到备注框。' : '录音会先保存到当前句子，后台再补文字。', 'processing');
       const audioBase64 = await blobToBase64(blob);
       return json('/lan/audio-notes/transcribe', {
         method: 'POST',
@@ -1461,32 +1901,155 @@ def lan_reader_html() -> str:
         })
       });
     }
+    function stopAudioPoll(audioNoteID) {
+      const timer = state.pendingAudioPolls.get(audioNoteID);
+      if (timer) window.clearInterval(timer);
+      state.pendingAudioPolls.delete(audioNoteID);
+    }
+    function updatePendingEditorFailure() {
+      const textarea = $('noteEditorText');
+      const current = String(textarea.value || '').trim();
+      if (!current || current === voiceNotePendingText) textarea.value = voiceNoteFailedText;
+      else if (current.includes(voiceNotePendingText)) textarea.value = normalizeNoteText(current.split(voiceNotePendingText).join(voiceNoteFailedText));
+      setNoteEditorStatus('录音已保存，但后台转写失败，可稍后重试。');
+    }
+    async function pollAudioNote(audioNoteID) {
+      if (!audioNoteID || state.pendingAudioPolls.has(audioNoteID)) return;
+      let attempts = 0;
+      const tick = async () => {
+        attempts += 1;
+        try {
+          const note = await json(`/audio-notes/${audioNoteID}`);
+          if (note.status === 'pending') {
+            if (attempts >= 90) {
+              stopAudioPoll(audioNoteID);
+              setNoteEditorStatus('语音仍在后台处理，稍后打开备注会看到结果。');
+            }
+            return;
+          }
+          stopAudioPoll(audioNoteID);
+          if (note.status === 'transcribed' && note.transcript) {
+            if (noteEditorOpen() && state.noteEditorAudioNoteID === audioNoteID) replacePendingNoteText(note.transcript);
+            await refreshAnnotations();
+            status('语音转写完成');
+            showVoiceToast('语音转写完成', '文字已补到备注里。', 'success', { autoHide: 2600 });
+            return;
+          }
+          if (note.status === 'failed') {
+            if (noteEditorOpen() && state.noteEditorAudioNoteID === audioNoteID) updatePendingEditorFailure();
+            await refreshAnnotations();
+            status('语音转写失败');
+            showVoiceToast('录音已保存，转写失败', note.error_message || '可以稍后重试。', 'error', { autoHide: 3600 });
+          }
+        } catch (error) {
+          if (attempts >= 5) {
+            stopAudioPoll(audioNoteID);
+            setNoteEditorStatus('暂时查不到语音状态，录音已在 Mac 端保存。');
+          }
+        }
+      };
+      const timer = window.setInterval(tick, 2000);
+      state.pendingAudioPolls.set(audioNoteID, timer);
+      tick();
+    }
     async function applyVoiceTranscript(payload) {
+      const audioNoteID = payload.audio_note_id || payload.id;
+      const isPending = payload.accepted || payload.async_processing || payload.status === 'pending';
+      if (isPending) {
+        const pendingText = payload.pending_text || voiceNotePendingText;
+        if (noteEditorOpen()) {
+          addPendingNoteText();
+          state.noteEditorAudioNoteID = audioNoteID || state.noteEditorAudioNoteID;
+          const annotation = await ensureNoteEditorAnnotation();
+          await linkAudioNoteToAnnotation(audioNoteID, annotation);
+        } else {
+          const annotation = await saveNoteText(pendingText);
+          await linkAudioNoteToAnnotation(audioNoteID, annotation);
+        }
+        pollAudioNote(audioNoteID);
+        status('语音已保存，后台转写中');
+        showVoiceToast('语音已保存', '后台转写完成后会自动补到备注。', 'processing', { autoHide: 2600 });
+        return;
+      }
       const transcript = String(payload.transcript || payload.text || '').trim();
       if (!transcript) {
-        status(payload.error_message || payload.error || '语音没有识别出文字');
+        const message = payload.error_message || payload.error || '没有识别出文字。';
+        status('语音失败');
+        showVoiceToast('语音没有保存', message, 'error', { autoHide: 3600 });
+        return;
+      }
+      if (noteEditorOpen()) {
+        if (String($('noteEditorText').value || '').includes(voiceNotePendingText)) replacePendingNoteText(transcript);
+        else appendNoteEditorText(transcript);
+        state.noteEditorAudioNoteID = audioNoteID || state.noteEditorAudioNoteID;
+        status('语音已转写');
+        showVoiceToast('已转写到备注框', transcript, 'success', { autoHide: 2800 });
         return;
       }
       const annotation = await saveNoteText(transcript);
-      const audioNoteID = payload.audio_note_id || payload.id;
-      if (audioNoteID && annotation && annotation.id) {
-        try {
-          await json(`/audio-notes/${audioNoteID}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ annotation_id: annotation.id })
-          });
-        } catch (error) {}
-      }
-      status('语音备注已保存');
+      await linkAudioNoteToAnnotation(audioNoteID, annotation);
+      status('语音已保存');
+      showVoiceToast('语音备注已保存', transcript, 'success', { autoHide: 2800 });
     }
     function openAudioCaptureFallback() {
       const input = $('audioFile');
       if (!input) return false;
-      input.value = '';
-      status('请选择或录制一段音频，完成后会自动转写');
-      input.click();
-      return true;
+      try {
+        input.value = '';
+        status('系统录音');
+        showVoiceToast('系统录音已打开', noteEditorOpen() ? '录完后点确认，Mac 会转写并插入备注框。' : '录完后点确认，Mac 会转写并保存到当前句子。', 'info', { autoHide: 4200 });
+        input.click();
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
+    function nativeReaderAudioAvailable() {
+      try {
+        return Boolean(window.ClickNativeAudio && ClickNativeAudio.isAvailable && ClickNativeAudio.isAvailable() && ClickNativeAudio.startReaderNote && ClickNativeAudio.stopRecording);
+      } catch (error) {
+        return false;
+      }
+    }
+    function nativeReaderAudioPayload(rawPayload) {
+      if (!rawPayload) return {};
+      if (rawPayload.response_json) return rawPayload.response_json;
+      if (rawPayload.response_text) {
+        try { return JSON.parse(rawPayload.response_text); } catch (error) {}
+      }
+      return rawPayload;
+    }
+    window.__clickNativeReaderAudioDidStart = () => {
+      state.nativeReaderAudioRecording = true;
+      setVoiceLabel('停止');
+      status('录音中');
+      showVoiceToast('正在录音', noteEditorOpen() ? '再次点“语音”或点“停止并保存”，录音会先保存。' : '再次点“语音”或点“停止并保存”结束录音。', 'recording', { stop: true });
+    };
+    window.__clickNativeReaderAudioDidStop = () => {
+      state.nativeReaderAudioRecording = false;
+      setVoiceLabel('语音');
+      status('语音处理中');
+      showVoiceToast('正在保存语音', noteEditorOpen() ? '录音先保存，后台转写完成后自动补到备注。' : '录音先保存到当前句子，后台再补文字。', 'processing');
+    };
+    window.__clickNativeReaderAudioDidUpload = async (rawPayload) => {
+      state.nativeReaderAudioRecording = false;
+      setVoiceLabel('语音');
+      try {
+        await applyVoiceTranscript(nativeReaderAudioPayload(rawPayload));
+      } catch (error) {
+        status('语音失败');
+        showVoiceToast('语音转写失败', String(error.message || error), 'error', { autoHide: 3600 });
+      }
+    };
+    window.__clickNativeReaderAudioDidError = (payload) => {
+      state.nativeReaderAudioRecording = false;
+      setVoiceLabel('语音');
+      status('语音失败');
+      showVoiceToast('语音失败', String((payload && payload.error) || '安卓原生录音不可用'), 'error', { autoHide: 3600 });
+    };
+    function prefersSystemAudioCapture() {
+      const ua = navigator.userAgent || '';
+      return /Android|iPhone|iPad|Mobile/i.test(ua) || window.innerWidth <= 1024;
     }
     async function startMediaVoiceNote() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1507,7 +2070,8 @@ def lan_reader_html() -> str:
         if (activeStream) activeStream.getTracks().forEach((track) => track.stop());
         setVoiceLabel('语音');
         if (!chunks.length) {
-          status('没有录到音频');
+          status('没有录音');
+          showVoiceToast('没有录到音频', '请重新点语音录一次。', 'error', { autoHide: 2600 });
           return;
         }
         const type = recorder.mimeType || mimeType || chunks[0].type || 'audio/webm';
@@ -1516,26 +2080,31 @@ def lan_reader_html() -> str:
           const payload = await transcribeVoiceBlob(new Blob(chunks, { type }), duration);
           await applyVoiceTranscript(payload);
         } catch (error) {
-          status(`语音转写失败：${error.message || error}`);
+          status('语音失败');
+          showVoiceToast('语音转写失败', String(error.message || error), 'error', { autoHide: 3600 });
         }
       };
       recorder.onerror = () => {
-        status('录音失败，可改用手动备注');
+        status('录音失败');
+        showVoiceToast('录音失败', '可以改用系统录音或手动备注。', 'error', { autoHide: 3000 });
       };
       state.mediaRecorder = recorder;
       recorder.start();
       setVoiceLabel('停止');
-      status('正在录音，再点一次“语音”结束');
+      status('录音中');
+      showVoiceToast('正在录音', noteEditorOpen() ? '点“停止并保存”，录音会先保存。' : '点“停止并保存”结束录音。', 'recording', { stop: true });
     }
     function startBrowserSpeechNote() {
       const node = state.focused;
       if (!node) {
-        status('先点一句话，再按语音');
+        status('先点一句话');
+        showVoiceToast('先点一句话', '选中句子后再点语音。', 'error', { autoHide: 2600 });
         return;
       }
       const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
       if (!Recognition) {
-        status('当前浏览器不支持语音识别，已切到手动备注');
+        status('语音不可用');
+        showVoiceToast('语音不可用', '当前浏览器不支持语音识别，已切到手动备注。', 'error', { autoHide: 3200 });
         addNote();
         return;
       }
@@ -1543,6 +2112,7 @@ def lan_reader_html() -> str:
         try { state.recognition.stop(); } catch (error) {}
         state.recognition = null;
         status('语音已停止');
+        showVoiceToast('语音已停止', '正在保存识别结果。', 'processing', { autoHide: 1800 });
         return;
       }
       const recognition = new Recognition();
@@ -1551,48 +2121,81 @@ def lan_reader_html() -> str:
       recognition.continuous = false;
       state.recognition = recognition;
       setVoiceLabel('停止');
-      status('正在听写备注...');
+      status('听写中');
+      showVoiceToast('正在听写', noteEditorOpen() ? '说完后会先写入备注框。' : '说完后会保存到当前句子。', 'recording', { stop: true });
       recognition.onresult = (event) => {
         const transcript = Array.from(event.results || []).map((result) => result[0] && result[0].transcript ? result[0].transcript : '').join('').trim();
         if (transcript) {
-          saveNoteText(transcript);
+          applyVoiceTranscript({ transcript }).catch((error) => {
+            status('语音失败');
+            showVoiceToast('语音保存失败', String(error.message || error), 'error', { autoHide: 3200 });
+          });
         } else {
-          status('没有识别到文字');
+          status('没有识别');
+          showVoiceToast('没有识别到文字', '请重新录一次。', 'error', { autoHide: 2600 });
         }
       };
       recognition.onerror = () => {
-        status('语音识别失败，可改用手动备注');
+        status('语音失败');
+        showVoiceToast('语音识别失败', '可以改用系统录音或手动备注。', 'error', { autoHide: 3200 });
       };
       recognition.onend = () => {
         state.recognition = null;
         setVoiceLabel('语音');
+        hideVoiceToast(2200);
       };
       try {
         recognition.start();
       } catch (error) {
         state.recognition = null;
         setVoiceLabel('语音');
-        status('语音无法启动，可改用手动备注');
+        status('语音无法启动');
+        showVoiceToast('语音无法启动', '可以改用系统录音或手动备注。', 'error', { autoHide: 3200 });
       }
     }
     function startVoiceNote() {
       const node = state.focused;
       if (!node) {
-        status('先点一句话，再按语音');
+        status('先点一句话');
+        showVoiceToast('先点一句话', '选中句子后再点语音。', 'error', { autoHide: 2600 });
+        return;
+      }
+      if (state.nativeReaderAudioRecording) {
+        if (nativeReaderAudioAvailable()) {
+          try { ClickNativeAudio.stopRecording(); } catch (error) { window.__clickNativeReaderAudioDidError({ error: '原生录音停止失败' }); }
+        }
         return;
       }
       if (state.mediaRecorder) {
         try { state.mediaRecorder.stop(); } catch (error) {}
         return;
       }
+      if (state.recognition) {
+        try { state.recognition.stop(); } catch (error) {}
+        return;
+      }
+      if (nativeReaderAudioAvailable()) {
+        try {
+          ClickNativeAudio.startReaderNote(state.book.id);
+        } catch (error) {
+          window.__clickNativeReaderAudioDidError({ error: '原生录音启动失败' });
+        }
+        return;
+      }
       if (navigator.mediaDevices && window.MediaRecorder) {
         startMediaVoiceNote().catch((error) => {
           status(`浏览器录音不可用：${error.message || error}`);
-          if (!openAudioCaptureFallback()) startBrowserSpeechNote();
+          startBrowserSpeechNote();
         });
         return;
       }
-      if (!openAudioCaptureFallback()) startBrowserSpeechNote();
+      const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (Recognition) {
+        startBrowserSpeechNote();
+        return;
+      }
+      status('语音不可用');
+      showVoiceToast('当前环境不能直接录音', '请用新版安卓 App，或在 Mac 原生阅读器里使用语音备注。不会再自动打开文件夹。', 'error', { autoHide: 5200 });
     }
     function savePositionSoon() {
       clearTimeout(state.saveTimer);
@@ -1610,6 +2213,7 @@ def lan_reader_html() -> str:
       } catch (error) {}
     }
     $('reader').addEventListener('click', (event) => {
+      if (noteEditorOpen()) return;
       if (shouldLetSystemHandle(event)) return;
       const node = event.target.closest && event.target.closest('.sr-sentence');
       if (node) {
@@ -1628,6 +2232,7 @@ def lan_reader_html() -> str:
       clearSentenceFocus();
     });
     $('reader').addEventListener('dblclick', (event) => {
+      if (noteEditorOpen()) return;
       if (shouldLetSystemHandle(event, { respectSelection: false })) return;
       const node = event.target.closest && event.target.closest('.sr-sentence');
       if (!node) return;
@@ -1642,6 +2247,7 @@ def lan_reader_html() -> str:
       addNote();
     });
     $('reader').addEventListener('contextmenu', (event) => {
+      if (noteEditorOpen()) return;
       if (shouldLetSystemHandleContext(event)) return;
       const node = event.target.closest && event.target.closest('.sr-sentence');
       if (!node) return;
@@ -1658,15 +2264,45 @@ def lan_reader_html() -> str:
     $('scrim').onclick = closeDrawer;
     $('barRed').onclick = toggleRed;
     $('barNote').onclick = addNote;
-    $('barVoice').onclick = startVoiceNote;
+    $('barVoice').onclick = () => {
+      if (!state.focused) {
+        startVoiceNote();
+        return;
+      }
+      if (!noteEditorOpen()) openNoteEditor({ focusText: false });
+      startVoiceNote();
+    };
     $('barCopy').onclick = copyFocusedSentence;
     $('barCancel').onclick = clearSentenceFocus;
-    $('prev').onclick = () => turnPage(-1);
-    $('next').onclick = () => turnPage(1);
+    $('noteEditorClose').onclick = closeNoteEditor;
+    $('noteEditorCancel').onclick = closeNoteEditor;
+    $('noteEditorVoice').onclick = startVoiceNote;
+    $('noteEditorClean').onclick = () => cleanNoteEditorText().catch((error) => {
+      setNoteEditorStatus(`整理失败：${error.message || error}`);
+      status('备注整理失败');
+    });
+    $('noteEditorSave').onclick = () => saveNoteEditor().catch((error) => {
+      setNoteEditorStatus(`保存失败：${error.message || error}`);
+      status('备注保存失败');
+    });
+    $('noteEditorText').addEventListener('keydown', (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        event.preventDefault();
+        saveNoteEditor().catch((error) => {
+          setNoteEditorStatus(`保存失败：${error.message || error}`);
+          status('备注保存失败');
+        });
+      }
+    });
+    const prevButton = $('prev');
+    const nextButton = $('next');
+    if (prevButton) prevButton.onclick = () => turnPage(-1);
+    if (nextButton) nextButton.onclick = () => turnPage(1);
     ['fontSize', 'lineHeight', 'sidePadding'].forEach((id) => {
       $(id).addEventListener('input', () => applyReaderSettings());
     });
     $('readerWrap').addEventListener('touchstart', (event) => {
+      if (noteEditorOpen()) return;
       if (shouldLetSystemHandle(event)) return;
       const touch = event.changedTouches && event.changedTouches[0];
       if (!touch) return;
@@ -1685,6 +2321,7 @@ def lan_reader_html() -> str:
       }
     }, { passive: true });
     $('readerWrap').addEventListener('touchmove', (event) => {
+      if (noteEditorOpen()) return;
       const touch = event.changedTouches && event.changedTouches[0];
       if (!touch) return;
       const deltaX = touch.clientX - state.touchStartX;
@@ -1694,6 +2331,7 @@ def lan_reader_html() -> str:
       }
     }, { passive: true });
     $('readerWrap').addEventListener('touchend', (event) => {
+      if (noteEditorOpen()) return;
       const touch = event.changedTouches && event.changedTouches[0];
       if (!touch) return;
       clearLongPressTimer();
@@ -1713,6 +2351,7 @@ def lan_reader_html() -> str:
       state.touchSentence = null;
     }, { passive: false });
     $('readerWrap').addEventListener('wheel', (event) => {
+      if (noteEditorOpen()) return;
       if (shouldLetSystemHandle(event)) return;
       const handled = handleHorizontalWheel(event);
       if (handled) {
@@ -1724,14 +2363,24 @@ def lan_reader_html() -> str:
       const file = event.target.files && event.target.files[0];
       if (!file) return;
       try {
+        showVoiceToast('正在处理语音', noteEditorOpen() ? 'Mac 正在转写并插入备注框。' : 'Mac 正在转写并保存到当前句子。', 'processing');
         const payload = await transcribeVoiceBlob(file, null);
         await applyVoiceTranscript(payload);
       } catch (error) {
-        status(`语音转写失败：${error.message || error}`);
+        status('语音失败');
+        showVoiceToast('语音转写失败', String(error.message || error), 'error', { autoHide: 3600 });
+      } finally {
+        event.target.value = '';
       }
     });
     window.addEventListener('keydown', (event) => {
       if (event.defaultPrevented) return;
+      if (event.key === 'Escape' && noteEditorOpen()) {
+        event.preventDefault();
+        closeNoteEditor();
+        status('已关闭备注编辑');
+        return;
+      }
       if (shouldLetSystemHandle(event)) return;
       const key = String(event.key || '').toLowerCase();
       if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
@@ -1765,6 +2414,11 @@ def lan_reader_html() -> str:
       }
       if (event.key === 'Escape') {
         event.preventDefault();
+        if (noteEditorOpen()) {
+          closeNoteEditor();
+          status('已关闭备注编辑');
+          return;
+        }
         if ($('settingsSheet').classList.contains('show')) {
           closeSettingsSheet();
           return;
@@ -2249,12 +2903,35 @@ def find_domain_glossary_entry(conn: Any, book_id: str, lookup_terms: list[str],
     if not row:
         return None
     entry = dict(row)
+    raw_metadata = jsonable(entry.get("metadata") or {})
+    if not isinstance(raw_metadata, dict):
+        raw_metadata = {}
+    part_of_speech = str(raw_metadata.get("part_of_speech") or "")
+    meaning_zh = entry.get("meaning_zh") or ""
+    part_of_speech_zh = str(raw_metadata.get("part_of_speech_zh") or lookup_part_of_speech_zh(part_of_speech))
+    popup_speak_text_zh = str(
+        raw_metadata.get("popup_speak_text_zh")
+        or lookup_popup_speak_text_zh(entry.get("term") or "", part_of_speech, meaning_zh)
+    )
+    metadata = {
+        **raw_metadata,
+        "source": "reader.domain_glossary_entries",
+        "domain": entry.get("domain") or "",
+        "volume": entry.get("volume") or "",
+        "source_title": entry.get("source_title") or "",
+        "source_page": entry.get("source_page"),
+        "quality_grade": entry.get("quality_grade") or "",
+        "reviewable": False,
+    }
     return {
         "id": "",
         "book_id": book_id,
         "surface": entry.get("term") or "",
         "lemma": entry.get("lemma") or entry.get("term") or "",
-        "context_meaning_zh": entry.get("meaning_zh") or "",
+        "context_meaning_zh": meaning_zh,
+        "part_of_speech": part_of_speech,
+        "part_of_speech_zh": part_of_speech_zh,
+        "popup_speak_text_zh": popup_speak_text_zh,
         "meaning_source": "lifestudy_domain_glossary",
         "alignment_status": "confirmed_context_meaning" if entry.get("quality_grade") == "A" else "paraphrased_context_meaning",
         "alignment_reason": f"Life-study domain glossary {entry.get('quality_grade')} grade; confidence={entry.get('confidence')}",
@@ -2265,19 +2942,11 @@ def find_domain_glossary_entry(conn: Any, book_id: str, lookup_terms: list[str],
         "score": entry.get("score") or 0,
         "status": "candidate",
         "user_note": "",
-        "metadata": {
-            "source": "reader.domain_glossary_entries",
-            "domain": entry.get("domain") or "",
-            "volume": entry.get("volume") or "",
-            "source_title": entry.get("source_title") or "",
-            "source_page": entry.get("source_page"),
-            "quality_grade": entry.get("quality_grade") or "",
-            "reviewable": False,
-        },
+        "metadata": metadata,
         "reviewable": False,
         "glossary": {
             "term": entry.get("term") or "",
-            "meaning_zh": entry.get("meaning_zh") or "",
+            "meaning_zh": meaning_zh,
             "source": "lifestudy_domain_glossary",
             "confidence": entry.get("confidence"),
         },
@@ -2319,6 +2988,10 @@ def ensure_dictionary_vocab_item(conn: Any, book_id: str, clean_word: str, dicti
     if not surface:
         surface = lemma
     vocab_id = stable_id("vocab", book_id, lemma, surface)
+    part_of_speech = str(dictionary.get("part_of_speech") or "")
+    definition_zh = str(dictionary.get("definition_zh") or "")
+    part_of_speech_zh = lookup_part_of_speech_zh(part_of_speech)
+    popup_speak_text_zh = lookup_popup_speak_text_zh(lemma or surface, part_of_speech, definition_zh)
     lexeme = conn.execute(
         """
         INSERT INTO reader.lexemes (
@@ -2337,9 +3010,9 @@ def ensure_dictionary_vocab_item(conn: Any, book_id: str, clean_word: str, dicti
             stable_id("lex", "en", lemma, surface),
             lemma,
             surface,
-            dictionary.get("part_of_speech"),
+            part_of_speech,
             dictionary.get("phonetic"),
-            dictionary.get("definition_zh") or "",
+            definition_zh,
             dictionary.get("source") or "dictionary",
         ),
     ).fetchone()
@@ -2388,11 +3061,239 @@ def ensure_dictionary_vocab_item(conn: Any, book_id: str, clean_word: str, dicti
                         "lemma": dictionary.get("lemma") or "",
                         "source": dictionary.get("source") or "",
                     },
+                    "part_of_speech": part_of_speech,
+                    "part_of_speech_zh": part_of_speech_zh,
+                    "popup_speak_text_zh": popup_speak_text_zh,
                 }
             ),
         ),
     ).fetchone()
     return str((vocab or {}).get("id") or vocab_id)
+
+
+def query_online_word_meaning(clean_word: str, sentence: Optional[str]) -> Optional[dict[str, Any]]:
+    word = clean_vocab_word(clean_word)
+    if not word:
+        return None
+    context_sentence = str(sentence or "").strip()
+    prompt = f"""
+你是 Reader 英文查词助手。请只为用户点击的英文词生成一个适合阅读弹窗的短中文义项。
+要求：
+- 只返回 JSON，不要 Markdown。
+- 中文义项必须短，适合单击查词弹窗。
+- 如果句子上下文足够，请优先给出该句中的意思；如果不足，请给出最常见且保守的中文义。
+- 不要编造生命读经专门术语；不确定时 confidence 降低。
+- part_of_speech 使用英文全称，如 noun / verb / adjective / adverb / proper noun。
+
+英文词：{word}
+当前句子：{context_sentence}
+
+JSON 字段：
+{{
+  "lemma": "{word}",
+  "part_of_speech": "noun",
+  "part_of_speech_zh": "名词",
+  "meaning_zh": "中文短义",
+  "definition_en": "short English definition",
+  "confidence": 0.7
+}}
+"""
+    try:
+        response = call_hermes_runtime(prompt, session_id=None, timeout_seconds=90)
+        if response.get("status") != "success":
+            return None
+        data = extract_json_object(str(response.get("reply") or "{}"))
+    except Exception:
+        return None
+    meaning_zh = str(data.get("meaning_zh") or "").strip()
+    if not meaning_zh:
+        return None
+    lemma = clean_vocab_word(str(data.get("lemma") or word)) or word
+    part_of_speech = str(data.get("part_of_speech") or "").strip().lower()
+    part_of_speech_zh = str(data.get("part_of_speech_zh") or "").strip() or lookup_part_of_speech_zh(part_of_speech)
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    return {
+        "lemma": lemma,
+        "part_of_speech": part_of_speech,
+        "part_of_speech_zh": part_of_speech_zh,
+        "meaning_zh": meaning_zh[:120],
+        "definition_en": str(data.get("definition_en") or "").strip()[:240],
+        "confidence": max(0.0, min(1.0, confidence)),
+        "provider": "hermes_qwen_online_lookup",
+    }
+
+
+def ensure_online_vocab_item(
+    conn: Any,
+    book_id: str,
+    clean_word: str,
+    sentence: Optional[str],
+    online_result: dict[str, Any],
+) -> str:
+    surface = clean_vocab_word(clean_word)
+    lemma = clean_vocab_word(str(online_result.get("lemma") or surface)) or surface
+    if not surface:
+        surface = lemma
+    meaning_zh = str(online_result.get("meaning_zh") or "").strip()
+    part_of_speech = str(online_result.get("part_of_speech") or "").strip()
+    part_of_speech_zh = str(online_result.get("part_of_speech_zh") or "").strip() or lookup_part_of_speech_zh(part_of_speech)
+    popup_speak_text_zh = lookup_popup_speak_text_zh(lemma or surface, part_of_speech, meaning_zh)
+    lexeme = conn.execute(
+        """
+        INSERT INTO reader.lexemes (
+            id, lemma, surface, language, part_of_speech, phonetic, short_definition, source, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, 'en', %s, NULL, %s, 'online_lookup', now(), now())
+        ON CONFLICT (language, lemma, surface) DO UPDATE
+        SET part_of_speech = COALESCE(NULLIF(EXCLUDED.part_of_speech, ''), reader.lexemes.part_of_speech),
+            short_definition = COALESCE(NULLIF(EXCLUDED.short_definition, ''), reader.lexemes.short_definition),
+            updated_at = now()
+        RETURNING id
+        """,
+        (stable_id("lex", "en", lemma, surface), lemma, surface, part_of_speech, meaning_zh),
+    ).fetchone()
+    lexeme_id = str((lexeme or {}).get("id") or stable_id("lex", "en", lemma, surface))
+    vocab_id = stable_id("vocab", book_id, lemma, surface)
+    metadata = {
+        "source": "hermes_qwen_online_lookup",
+        "online_lookup": True,
+        "provider": online_result.get("provider") or "hermes_qwen_online_lookup",
+        "part_of_speech": part_of_speech,
+        "part_of_speech_zh": part_of_speech_zh,
+        "popup_speak_text_zh": popup_speak_text_zh,
+        "definition_en": online_result.get("definition_en") or "",
+        "confidence": online_result.get("confidence"),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    row = conn.execute(
+        """
+        INSERT INTO reader.book_vocab_items (
+            id, book_id, lexeme_id, surface, lemma, context_meaning, meaning_source,
+            alignment_status, alignment_reason, representative_sentence_en, representative_sentence_zh,
+            occurrence_count, chapter_count, score, status, metadata, created_at, updated_at
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, 'online_lookup',
+            'online_lookup', 'Hermes/Qwen online lookup fallback; user correction can override.',
+            %s, NULL, 0, 0, %s, 'candidate', %s, now(), now()
+        )
+        ON CONFLICT (book_id, lemma, surface) DO UPDATE
+        SET lexeme_id = EXCLUDED.lexeme_id,
+            context_meaning = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN EXCLUDED.context_meaning
+                ELSE reader.book_vocab_items.context_meaning
+            END,
+            meaning_source = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN 'online_lookup'
+                ELSE reader.book_vocab_items.meaning_source
+            END,
+            alignment_status = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN 'online_lookup'
+                ELSE reader.book_vocab_items.alignment_status
+            END,
+            alignment_reason = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN EXCLUDED.alignment_reason
+                ELSE reader.book_vocab_items.alignment_reason
+            END,
+            representative_sentence_en = COALESCE(NULLIF(reader.book_vocab_items.representative_sentence_en, ''), EXCLUDED.representative_sentence_en),
+            metadata = COALESCE(reader.book_vocab_items.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+            updated_at = now()
+        RETURNING id
+        """,
+        (
+            vocab_id,
+            book_id,
+            lexeme_id,
+            surface,
+            lemma,
+            meaning_zh,
+            str(sentence or "").strip() or None,
+            float(online_result.get("confidence") or 0.5),
+            db.jsonb(metadata),
+        ),
+    ).fetchone()
+    return str((row or {}).get("id") or vocab_id)
+
+
+def ensure_manual_correction_vocab_item(
+    conn: Any,
+    book_id: str,
+    word: str,
+    meaning_zh: str,
+    sentence: Optional[str],
+) -> str:
+    surface = clean_vocab_word(word)
+    lemma = surface
+    if not surface:
+        raise HTTPException(status_code=400, detail="word is required")
+    part_of_speech = ""
+    popup_speak_text_zh = lookup_popup_speak_text_zh(surface, part_of_speech, meaning_zh)
+    lexeme = conn.execute(
+        """
+        INSERT INTO reader.lexemes (
+            id, lemma, surface, language, part_of_speech, phonetic, short_definition, source, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, 'en', NULL, NULL, %s, 'user_glossary', now(), now())
+        ON CONFLICT (language, lemma, surface) DO UPDATE
+        SET short_definition = COALESCE(NULLIF(EXCLUDED.short_definition, ''), reader.lexemes.short_definition),
+            source = 'user_glossary',
+            updated_at = now()
+        RETURNING id
+        """,
+        (stable_id("lex", "en", lemma, surface), lemma, surface, meaning_zh),
+    ).fetchone()
+    lexeme_id = str((lexeme or {}).get("id") or stable_id("lex", "en", lemma, surface))
+    vocab_id = stable_id("vocab", book_id, lemma, surface)
+    row = conn.execute(
+        """
+        INSERT INTO reader.book_vocab_items (
+            id, book_id, lexeme_id, surface, lemma, context_meaning, meaning_source,
+            alignment_status, alignment_reason, representative_sentence_en, representative_sentence_zh,
+            occurrence_count, chapter_count, score, status, metadata, created_at, updated_at
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, 'user_glossary',
+            'confirmed_context_meaning', '用户手动填写的释义，优先于在线查询和自动抽取。',
+            %s, NULL, 0, 0, 1, 'candidate', %s, now(), now()
+        )
+        ON CONFLICT (book_id, lemma, surface) DO UPDATE
+        SET lexeme_id = EXCLUDED.lexeme_id,
+            context_meaning = EXCLUDED.context_meaning,
+            meaning_source = 'user_glossary',
+            alignment_status = 'confirmed_context_meaning',
+            alignment_reason = EXCLUDED.alignment_reason,
+            representative_sentence_en = COALESCE(NULLIF(EXCLUDED.representative_sentence_en, ''), reader.book_vocab_items.representative_sentence_en),
+            metadata = COALESCE(reader.book_vocab_items.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+            updated_at = now()
+        RETURNING id
+        """,
+        (
+            vocab_id,
+            book_id,
+            lexeme_id,
+            surface,
+            lemma,
+            meaning_zh,
+            str(sentence or "").strip() or None,
+            db.jsonb(
+                {
+                    "source": "manual_lookup_correction",
+                    "part_of_speech": part_of_speech,
+                    "part_of_speech_zh": "",
+                    "popup_speak_text_zh": popup_speak_text_zh,
+                    "corrected_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+        ),
+    ).fetchone()
+    return str((row or {}).get("id") or vocab_id)
 
 
 def vocab_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2406,12 +3307,25 @@ def vocab_row(row: dict[str, Any]) -> dict[str, Any]:
         meaning_source = "user_glossary" if row.get("glossary_source") == "user" else "book_glossary"
     elif use_dictionary:
         meaning_source = "dictionary_fallback"
+    metadata = jsonable(row.get("metadata") or {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    part_of_speech = str(metadata.get("part_of_speech") or row.get("dictionary_part_of_speech") or "")
+    context_meaning_zh = glossary_meaning or raw_context_meaning or (dictionary_meaning if use_dictionary else "")
+    part_of_speech_zh = str(metadata.get("part_of_speech_zh") or lookup_part_of_speech_zh(part_of_speech))
+    popup_speak_text_zh = str(
+        metadata.get("popup_speak_text_zh")
+        or lookup_popup_speak_text_zh(row.get("lemma") or row.get("surface") or "", part_of_speech, context_meaning_zh)
+    )
     return {
         "id": row.get("id"),
         "book_id": row.get("book_id"),
         "surface": row.get("surface"),
         "lemma": row.get("lemma"),
-        "context_meaning_zh": glossary_meaning or raw_context_meaning or (dictionary_meaning if use_dictionary else ""),
+        "context_meaning_zh": context_meaning_zh,
+        "part_of_speech": part_of_speech,
+        "part_of_speech_zh": part_of_speech_zh,
+        "popup_speak_text_zh": popup_speak_text_zh,
         "meaning_source": meaning_source,
         "alignment_status": row.get("alignment_status") or "unknown",
         "alignment_reason": row.get("alignment_reason") or "",
@@ -2422,7 +3336,7 @@ def vocab_row(row: dict[str, Any]) -> dict[str, Any]:
         "score": row.get("score") or 0,
         "status": row.get("status") or "candidate",
         "user_note": row.get("user_note") or "",
-        "metadata": jsonable(row.get("metadata") or {}),
+        "metadata": metadata,
         "glossary": {
             "term": row.get("glossary_term") or "",
             "meaning_zh": glossary_meaning,
@@ -2572,7 +3486,12 @@ def list_book_vocabulary(
     }
 
 
-def lookup_book_word(book_id: str, word: str, sentence_id: Optional[str]) -> dict[str, Any]:
+def lookup_book_word(
+    book_id: str,
+    word: str,
+    sentence_id: Optional[str],
+    sentence_text: Optional[str] = None,
+) -> dict[str, Any]:
     book_with_latest_file(book_id)
     clean_word = clean_vocab_word(word)
     lookup_terms = vocab_lookup_terms(word)
@@ -2618,6 +3537,11 @@ def lookup_book_word(book_id: str, word: str, sentence_id: Optional[str]) -> dic
             if dictionary:
                 vocab_id = ensure_dictionary_vocab_item(conn, book_id, clean_word, dictionary)
                 item = selected_vocab_row(conn, book_id, vocab_id)
+            else:
+                online = query_online_word_meaning(clean_word, sentence_text)
+                if online:
+                    vocab_id = ensure_online_vocab_item(conn, book_id, clean_word, sentence_text, online)
+                    item = selected_vocab_row(conn, book_id, vocab_id)
         occurrence_rows = []
         item_payload = None
         if item:
@@ -2752,6 +3676,14 @@ def selected_vocab_row(conn: Any, book_id: str, item_id: str) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="vocab item not found")
     return vocab_row(dict(row))
+
+
+def safe_lookup_sentence_id(conn: Any, sentence_id: Optional[str]) -> Optional[str]:
+    value = str(sentence_id or "").strip()
+    if not value:
+        return None
+    row = conn.execute("SELECT 1 FROM reader.sentences WHERE id = %s", (value,)).fetchone()
+    return value if row else None
 
 
 def reviewed_vocab_row(conn: Any, book_id: str, item_id: str) -> dict[str, Any]:
@@ -3754,6 +4686,157 @@ def decode_audio_base64(value: str) -> bytes:
     return data
 
 
+def note_text_with_transcript(current: str, transcript: str) -> str:
+    current_text = str(current or "").strip()
+    transcript_text = normalize_note_text(transcript)
+    if not transcript_text:
+        return current_text
+    if not current_text or current_text == VOICE_NOTE_PENDING_TEXT:
+        return transcript_text
+    if VOICE_NOTE_PENDING_TEXT in current_text:
+        return normalize_note_text(current_text.replace(VOICE_NOTE_PENDING_TEXT, transcript_text))
+    if transcript_text in current_text:
+        return current_text
+    return normalize_note_text(f"{current_text}\n{transcript_text}")
+
+
+def note_text_with_failure(current: str) -> str:
+    current_text = str(current or "").strip()
+    if not current_text or current_text == VOICE_NOTE_PENDING_TEXT:
+        return VOICE_NOTE_FAILED_TEXT
+    if VOICE_NOTE_PENDING_TEXT in current_text:
+        return normalize_note_text(current_text.replace(VOICE_NOTE_PENDING_TEXT, VOICE_NOTE_FAILED_TEXT))
+    return current_text
+
+
+def apply_audio_note_to_annotation(conn: Any, audio_row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    annotation_id = str(audio_row.get("annotation_id") or "").strip()
+    if not annotation_id:
+        return None
+    annotation = conn.execute("SELECT * FROM reader.annotations WHERE id = %s", (annotation_id,)).fetchone()
+    if not annotation:
+        return None
+    metadata = annotation.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = dict(metadata)
+    voice_note = metadata.get("voice_note") or {}
+    if not isinstance(voice_note, dict):
+        voice_note = {}
+    transcript = normalize_note_text(str(audio_row.get("transcript") or ""))
+    status_value = str(audio_row.get("status") or "pending")
+    voice_note.update(
+        {
+            "audio_note_id": audio_row.get("id"),
+            "status": status_value,
+            "provider": audio_row.get("provider") or "",
+            "audio_hash": audio_row.get("audio_hash") or "",
+            "updated_at": now_iso(),
+        }
+    )
+    if transcript:
+        voice_note["raw_transcript"] = transcript
+    error_message = str(audio_row.get("error_message") or "").strip()
+    if error_message:
+        voice_note["error_message"] = error_message
+    metadata["voice_note"] = voice_note
+
+    current_note = str(annotation.get("note_text") or "")
+    if status_value == "transcribed" and transcript:
+        next_note = note_text_with_transcript(current_note, transcript)
+    elif status_value == "failed":
+        next_note = note_text_with_failure(current_note)
+    else:
+        next_note = current_note.strip() or VOICE_NOTE_PENDING_TEXT
+
+    row = conn.execute(
+        """
+        UPDATE reader.annotations
+        SET note_text = %s,
+            metadata = %s,
+            updated_at = now()
+        WHERE id = %s
+        RETURNING *
+        """,
+        (next_note, db.jsonb(metadata), annotation_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def lan_audio_raw_result(
+    *,
+    mime_type: str,
+    audio_byte_count: int,
+    pipeline_result: Optional[dict[str, Any]] = None,
+    async_processing: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "mime_type": mime_type,
+        "audio_bytes": audio_byte_count,
+        "async_processing": async_processing,
+        "voice_pipeline": {
+            "schema": MAC_VOICE_PIPELINE_SCHEMA,
+            "pipeline": MAC_VOICE_PIPELINE_ID,
+            "mac_side_processing": True,
+            "app_role": "capture_upload_only",
+            "purpose": "reader_lan_audio_note",
+        },
+    }
+    if pipeline_result is not None:
+        result["voice_pipeline_result"] = pipeline_result
+    return result
+
+
+def run_lan_audio_note_transcription(audio_note_id: str, audio_path: Path, mime_type: str, audio_byte_count: int) -> None:
+    try:
+        pipeline_result = mac_voice_pipeline_transcribe(audio_path, purpose="reader_lan_audio_note", timeout=90.0)
+    except Exception as exc:  # noqa: BLE001 - preserve the already saved audio note.
+        pipeline_result = {"ok": False, "error": str(exc), "status": "failed"}
+    transcript: Optional[str] = None
+    status_value = "failed"
+    error_message: Optional[str] = None
+    if pipeline_result.get("ok"):
+        transcript = normalize_note_text(str(pipeline_result.get("transcript") or ""))
+        if transcript:
+            status_value = "transcribed"
+        else:
+            error_message = "Mac voice pipeline returned an empty transcript"
+    else:
+        error_message = str(pipeline_result.get("error") or "Mac voice pipeline failed")
+    raw_result = lan_audio_raw_result(
+        mime_type=mime_type,
+        audio_byte_count=audio_byte_count,
+        pipeline_result=pipeline_result,
+        async_processing=True,
+    )
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            UPDATE reader.audio_notes
+            SET transcript = %s,
+                raw_result = %s,
+                status = %s,
+                error_message = %s,
+                updated_at = now()
+            WHERE id = %s
+            RETURNING *
+            """,
+            (transcript, db.jsonb(raw_result), status_value, error_message, audio_note_id),
+        ).fetchone()
+        if row:
+            apply_audio_note_to_annotation(conn, dict(row))
+
+
+def start_lan_audio_note_transcription(audio_note_id: str, audio_path: Path, mime_type: str, audio_byte_count: int) -> None:
+    thread = threading.Thread(
+        target=run_lan_audio_note_transcription,
+        args=(audio_note_id, audio_path, mime_type, audio_byte_count),
+        daemon=True,
+        name=f"lan-audio-note-{audio_note_id}",
+    )
+    thread.start()
+
+
 def funasr_server_json(path: str, payload: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> dict[str, Any]:
     url = f"http://127.0.0.1:18081{path}"
     if payload is None:
@@ -4712,6 +5795,8 @@ def library_page_html_v2() -> str:
     .manifest-item strong { display:block; font-size:15px; line-height:1.25; color:var(--text); }
     .manifest-item span { display:block; margin-top:4px; color:var(--muted); font-size:12px; line-height:1.35; }
     .cover-frame { position:relative; width:100%; aspect-ratio:3/4; border-radius:8px; overflow:hidden; background:#171914; border:1px solid rgba(255,255,255,.09); box-shadow:0 22px 58px rgba(0,0,0,.48); }
+    .cover-frame[data-open-book] { cursor:pointer; }
+    .cover-frame[data-open-book]:focus { outline:2px solid rgba(228,180,83,.65); outline-offset:3px; }
     .cover-frame img { width:100%; height:100%; object-fit:cover; display:block; }
     .cover-frame.hero-cover { align-self:center; min-height:300px; }
     .cover-frame.hero-cover::after { content:""; position:absolute; inset:0; background:linear-gradient(180deg,rgba(0,0,0,.02) 25%,rgba(0,0,0,.42) 100%); pointer-events:none; }
@@ -4805,7 +5890,6 @@ def library_page_html_v2() -> str:
       <div class="brand"><strong>Click</strong></div>
       <nav class="nav" id="nav"></nav>
       <div class="side-action">
-        <button class="primary" id="sideImport">导入 EPUB</button>
         <button class="subtle" data-view-jump="settings">状态与设置</button>
       </div>
     </aside>
@@ -4844,7 +5928,6 @@ def library_page_html_v2() -> str:
             <option value="搁置">搁置</option>
           </select>
           <button class="subtle" id="manageToggle">管理</button>
-          <button class="primary" id="libraryImport">导入</button>
         </div>
         <div id="batchbar" class="batchbar"><span id="batchCount">管理模式 · 已选择 0 本</span><span><button class="subtle" id="selectAllCurrent">全选当前</button> <button class="subtle" id="batchClear">清空选择</button> <button class="subtle" id="batchExit">退出管理</button> <button class="subtle" id="batchFavorite">批量收藏</button> <button class="subtle" id="batchOrganize">批量分类</button> <button class="subtle" id="batchExport">批量导出</button> <button class="danger" id="batchHide">移出书库</button></span></div>
         <section id="bookGrid" class="book-grid"></section>
@@ -4977,9 +6060,12 @@ def library_page_html_v2() -> str:
       }
       if (book.actions?.continue_reading_url) window.location.href = book.actions.continue_reading_url;
     }
-    function cover(book, cls='', showPhrases=false) {
+    function cover(book, cls='', showPhrases=false, openable=false) {
       const phrases = showPhrases ? '<div class="cover-phrases"><span>逐句读懂</span><span>语境查词</span><span>复习沉淀</span></div>' : '';
-      return `<div class="cover-frame ${cls}"><img src="${esc(book.cover?.url || '')}" alt="${esc(book.title || '书籍封面')}" loading="lazy">${phrases}</div>`;
+      const openAttrs = openable
+        ? ` data-open-book="${esc(book.id)}" role="button" tabindex="0" aria-label="打开 ${esc(book.title || book.id)}"`
+        : '';
+      return `<div class="cover-frame ${cls}"${openAttrs}><img src="${esc(book.cover?.url || '')}" alt="${esc(book.title || '书籍封面')}" loading="lazy">${phrases}</div>`;
     }
     function bookCard(book) {
       const checked = state.selectedIds.has(book.id) ? 'checked' : '';
@@ -5043,6 +6129,19 @@ def library_page_html_v2() -> str:
         syncBookSelection(box.dataset.select);
       });
     }
+    function bindOpenBookTargets(root = document) {
+      root.querySelectorAll('[data-open-book]').forEach((target) => {
+        target.onclick = (event) => {
+          event.stopPropagation();
+          openBook(byId(target.dataset.openBook));
+        };
+        target.onkeydown = (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          openBook(byId(target.dataset.openBook));
+        };
+      });
+    }
     async function updateBookOrganization(book, payload, message = '已更新') {
       if (!book?.id) return;
       await api(`/api/library/books/${book.id}/organization`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
@@ -5085,9 +6184,10 @@ def library_page_html_v2() -> str:
         $('continueHero').innerHTML = `<div class="empty"><h2>先导入一本 EPUB</h2><p>导入后会复制到内部书库，原文件可以删除。</p><button class="primary" id="emptyImport">导入 EPUB</button></div>`;
         $('emptyImport').onclick = () => $('fileInput').click();
       } else {
-        $('continueHero').innerHTML = `${cover(current, 'hero-cover', true)}<div class="hero-copy"><div class="eyebrow">Continue Reading</div><div class="hero-title">${esc(current.title || current.id)}</div><div class="hero-meta">${esc(current.author || '未知作者')} · ${esc(chapterText(current))} · ${progressText(current)}</div><div class="progress"><i style="width:${current.progress?.percent || 0}%"></i></div><div class="hero-manifest"><div class="manifest-item"><strong>逐句读懂</strong><span>英文原句和中文证据一起看。</span></div><div class="manifest-item"><strong>语境查词</strong><span>先看本句义，再看词典短释。</span></div><div class="manifest-item"><strong>复习沉淀</strong><span>查过的词进入主动学习。</span></div></div><div class="hero-actions"><button class="primary" id="heroContinue">继续阅读</button><button class="subtle" id="heroDetail">查看详情</button><button class="ghost" data-view-jump="notes">整理笔记</button></div></div>`;
+        $('continueHero').innerHTML = `${cover(current, 'hero-cover', true, true)}<div class="hero-copy"><div class="eyebrow">Continue Reading</div><div class="hero-title">${esc(current.title || current.id)}</div><div class="hero-meta">${esc(current.author || '未知作者')} · ${esc(chapterText(current))} · ${progressText(current)}</div><div class="progress"><i style="width:${current.progress?.percent || 0}%"></i></div><div class="hero-manifest"><div class="manifest-item"><strong>逐句读懂</strong><span>英文原句和中文证据一起看。</span></div><div class="manifest-item"><strong>语境查词</strong><span>先看本句义，再看词典短释。</span></div><div class="manifest-item"><strong>复习沉淀</strong><span>查过的词进入主动学习。</span></div></div><div class="hero-actions"><button class="primary" id="heroContinue">继续阅读</button><button class="subtle" id="heroDetail">查看详情</button><button class="ghost" data-view-jump="notes">整理笔记</button></div></div>`;
         $('heroContinue').onclick = () => openBook(current);
         $('heroDetail').onclick = () => openDrawer(current);
+        bindOpenBookTargets($('continueHero'));
       }
       const recent = (state.dashboard?.recent_books || state.books).slice(0, 6);
       $('recentRail').innerHTML = recent.length ? recent.map(bookCard).join('') : `<div class="empty">还没有最近阅读。</div>`;
@@ -5329,7 +6429,7 @@ def library_page_html_v2() -> str:
     $('sort').onchange = (event) => { state.sort = event.target.value; render(); };
     $('stateFilter').onchange = (event) => { state.stateFilter = event.target.value; render(); };
     $('refresh').onclick = () => loadDashboard().catch((error) => { state.error = error.message; render(); });
-    ['topImport','sideImport','libraryImport'].forEach((id) => $(id).onclick = () => $('fileInput').click());
+    ['topImport'].forEach((id) => $(id).onclick = () => $('fileInput').click());
     $('manageToggle').onclick = () => {
       state.manageMode = !state.manageMode;
       if (!state.manageMode) state.selectedIds.clear();
@@ -5994,23 +7094,9 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
     audio_path = audio_dir / f"{audio_note_id}{lan_audio_extension(payload.mime_type)}"
     audio_path.write_bytes(audio_data)
 
-    provider = "funasr_lan"
-    transcript: Optional[str] = None
-    raw_result: dict[str, Any] = {"mime_type": payload.mime_type, "audio_bytes": len(audio_data)}
-    status = "failed"
-    error_message: Optional[str] = None
-    try:
-        health = funasr_server_json("/health", timeout=1.5)
-        if not health.get("ok"):
-            raise RuntimeError("FunASR warm service is not healthy")
-        raw_result = funasr_server_json("/transcribe", {"audio": str(audio_path)}, timeout=90.0)
-        transcript = str(raw_result.get("text") or "").strip()
-        if transcript:
-            status = "transcribed"
-        else:
-            error_message = "FunASR did not return text"
-    except Exception as exc:  # noqa: BLE001 - API returns a visible voice failure reason.
-        error_message = str(exc)
+    provider = "mac_voice_pipeline"
+    raw_result = lan_audio_raw_result(mime_type=payload.mime_type, audio_byte_count=len(audio_data), async_processing=True)
+    status_value = "pending"
 
     with db.connect() as conn:
         conn.execute(
@@ -6030,21 +7116,32 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
                 audio_hash,
                 payload.duration_seconds,
                 provider,
-                transcript,
+                None,
                 db.jsonb(raw_result),
-                status,
-                error_message,
+                status_value,
+                None,
             ),
         ).fetchone()
+    start_lan_audio_note_transcription(audio_note_id, audio_path, payload.mime_type, len(audio_data))
     return {
-        "ok": status == "transcribed",
+        "ok": True,
+        "accepted": True,
         "schema": "sentence_reader.lan_audio_transcription.v1",
         "audio_note_id": audio_note_id,
-        "status": status,
+        "status": status_value,
         "provider": provider,
-        "transcript": transcript or "",
+        "voice_pipeline": {
+            "schema": MAC_VOICE_PIPELINE_SCHEMA,
+            "pipeline": MAC_VOICE_PIPELINE_ID,
+            "mac_side_processing": True,
+            "app_role": "capture_upload_only",
+            "purpose": "reader_lan_audio_note",
+        },
+        "transcript": "",
         "audio_hash": audio_hash,
-        "error_message": error_message,
+        "error_message": "",
+        "async_processing": True,
+        "pending_text": VOICE_NOTE_PENDING_TEXT,
     }
 
 
@@ -6250,8 +7347,13 @@ def get_book_vocab(
 
 
 @app.get("/books/{book_id}/lookup")
-def get_book_lookup(book_id: str, word: str, sentence_id: Optional[str] = None) -> dict[str, Any]:
-    return lookup_book_word(book_id, word, sentence_id)
+def get_book_lookup(
+    book_id: str,
+    word: str,
+    sentence_id: Optional[str] = None,
+    sentence: Optional[str] = None,
+) -> dict[str, Any]:
+    return lookup_book_word(book_id, word, sentence_id, sentence)
 
 
 @app.get("/books/{book_id}/glossary")
@@ -6373,6 +7475,123 @@ def patch_book_vocab_item(book_id: str, item_id: str, payload: VocabPatch) -> di
         return selected_vocab_row(conn, book_id, item_id)
 
 
+@app.post("/books/{book_id}/lookup-corrections")
+def post_lookup_correction(book_id: str, payload: LookupCorrectionCreate) -> dict[str, Any]:
+    book_with_latest_file(book_id)
+    clean_meaning = str(payload.meaning_zh or "").strip()
+    if not clean_meaning:
+        raise HTTPException(status_code=400, detail="meaning_zh is required")
+    clean_word = clean_vocab_word(payload.word)
+    lookup_terms = vocab_lookup_terms(payload.word)
+    if clean_word and clean_word not in lookup_terms:
+        lookup_terms.append(clean_word)
+    if not clean_word and not lookup_terms:
+        raise HTTPException(status_code=400, detail="word is required")
+    with db.connect() as conn:
+        current = conn.execute(
+            """
+            SELECT *
+            FROM reader.book_vocab_items
+            WHERE book_id = %s AND (
+              lower(surface) = ANY(%s::text[])
+              OR lower(coalesce(lemma, '')) = ANY(%s::text[])
+              OR regexp_replace(lower(surface), '[^a-z]', '', 'g') = %s
+              OR regexp_replace(lower(coalesce(lemma, '')), '[^a-z]', '', 'g') = %s
+            )
+            ORDER BY
+              CASE meaning_source WHEN 'user_glossary' THEN 0 ELSE 1 END,
+              score DESC,
+              occurrence_count DESC
+            LIMIT 1
+            """,
+            (book_id, lookup_terms, lookup_terms, clean_word, clean_word),
+        ).fetchone()
+        if current:
+            item_id = str(current.get("id"))
+        else:
+            item_id = ensure_manual_correction_vocab_item(
+                conn,
+                book_id,
+                clean_word or payload.word,
+                clean_meaning,
+                payload.sentence,
+            )
+        term = normalize_glossary_term(clean_word or payload.word)
+        if term:
+            conn.execute(
+                """
+                INSERT INTO reader.book_glossary (
+                    id, book_id, term, meaning_zh, source, confidence, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, 'user', 1, now(), now())
+                ON CONFLICT (book_id, term) DO UPDATE
+                SET meaning_zh = EXCLUDED.meaning_zh,
+                    source = 'user',
+                    confidence = 1,
+                    updated_at = now()
+                """,
+                (new_id("gloss"), book_id, term, clean_meaning),
+            )
+        conn.execute(
+            """
+            UPDATE reader.book_vocab_items
+            SET context_meaning = %s,
+                meaning_source = 'user_glossary',
+                alignment_status = 'confirmed_context_meaning',
+                alignment_reason = '用户手动填写的释义，优先于在线查询和自动抽取。',
+                metadata = COALESCE(metadata, '{}'::jsonb) || %s,
+                updated_at = now()
+            WHERE book_id = %s AND (
+              id = %s
+              OR lower(surface) = ANY(%s::text[])
+              OR lower(coalesce(lemma, '')) = ANY(%s::text[])
+              OR regexp_replace(lower(surface), '[^a-z]', '', 'g') = %s
+              OR regexp_replace(lower(coalesce(lemma, '')), '[^a-z]', '', 'g') = %s
+            )
+            """,
+            (
+                clean_meaning,
+                db.jsonb(
+                    {
+                        "source": "manual_lookup_correction",
+                        "popup_speak_text_zh": lookup_popup_speak_text_zh(clean_word or payload.word, "", clean_meaning),
+                        "corrected_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ),
+                book_id,
+                item_id,
+                lookup_terms,
+                lookup_terms,
+                clean_word,
+                clean_word,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reader.lookup_events (
+                id, book_id, sentence_id, surface, lemma, event_kind, context, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, 'edit_meaning', %s, now())
+            """,
+            (
+                new_id("lookup"),
+                book_id,
+                safe_lookup_sentence_id(conn, payload.sentence_id),
+                payload.word,
+                clean_word,
+                db.jsonb(
+                    {
+                        "source": "lookup_correction",
+                        "new_meaning": clean_meaning,
+                        "sentence": payload.sentence or "",
+                        "glossary_term": term,
+                    }
+                ),
+            ),
+        )
+        return selected_vocab_row(conn, book_id, item_id)
+
+
 @app.post("/books/{book_id}/vocab/{item_id}/review")
 def post_book_vocab_review(book_id: str, item_id: str, payload: VocabReviewCreate) -> dict[str, Any]:
     return review_book_vocabulary_item(book_id, item_id, payload)
@@ -6383,6 +7602,7 @@ def post_lookup_event(book_id: str, payload: LookupEventCreate) -> dict[str, Any
     book_with_latest_file(book_id)
     event_id = new_id("lookup")
     with db.connect() as conn:
+        sentence_id = safe_lookup_sentence_id(conn, payload.sentence_id)
         row = conn.execute(
             """
             INSERT INTO reader.lookup_events (
@@ -6394,7 +7614,7 @@ def post_lookup_event(book_id: str, payload: LookupEventCreate) -> dict[str, Any
             (
                 event_id,
                 book_id,
-                payload.sentence_id,
+                sentence_id,
                 payload.surface,
                 payload.lemma,
                 payload.event_kind,
@@ -6402,6 +7622,79 @@ def post_lookup_event(book_id: str, payload: LookupEventCreate) -> dict[str, Any
             ),
         ).fetchone()
     return jsonable(dict(row))
+
+
+@app.post("/lookup/tts")
+def post_lookup_tts(payload: LookupTTSCreate) -> dict[str, Any]:
+    text = clean_lookup_tts_text(payload.text)
+    if not text:
+        raise HTTPException(status_code=422, detail="text is required")
+    voice = clean_lookup_tts_text(payload.voice or EDGE_TTS_VOICE) or EDGE_TTS_VOICE
+    command = edge_tts_path()
+    if not command:
+        return {
+            "ok": False,
+            "engine": "browser_speech_synthesis",
+            "voice": voice,
+            "audio_url": "",
+            "text": text,
+        }
+    audio_id = stable_id("lookup_tts", voice, text)
+    audio_path = lookup_tts_dir() / f"{audio_id}.mp3"
+    if not audio_path.exists():
+        proc = subprocess.run(
+            [command, "--voice", voice, "--text", text, "--write-media", str(audio_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=45,
+        )
+        if proc.returncode != 0 or not audio_path.exists():
+            detail = (proc.stderr or proc.stdout or "edge-tts failed").strip()
+            return {
+                "ok": False,
+                "engine": "browser_speech_synthesis",
+                "voice": voice,
+                "audio_url": "",
+                "text": text,
+                "error": detail[:240],
+            }
+    return {
+        "ok": True,
+        "engine": "edge-tts",
+        "voice": voice,
+        "audio_url": f"/lookup/tts/{audio_id}.mp3",
+        "text": text,
+    }
+
+
+@app.post("/lookup/tts/status")
+def post_lookup_tts_status(payload: LookupTTSCreate) -> dict[str, Any]:
+    text = clean_lookup_tts_text(payload.text)
+    if not text:
+        raise HTTPException(status_code=422, detail="text is required")
+    voice = clean_lookup_tts_text(payload.voice or EDGE_TTS_VOICE) or EDGE_TTS_VOICE
+    audio_id = stable_id("lookup_tts", voice, text)
+    audio_path = lookup_tts_dir() / f"{audio_id}.mp3"
+    cached = audio_path.exists()
+    return {
+        "ok": True,
+        "engine": "edge-tts",
+        "voice": voice,
+        "audio_url": f"/lookup/tts/{audio_id}.mp3" if cached else "",
+        "text": text,
+        "cached": cached,
+    }
+
+
+@app.get("/lookup/tts/{audio_id}.mp3")
+def get_lookup_tts(audio_id: str) -> FileResponse:
+    if not re.fullmatch(r"lookup_tts_[0-9a-f]{24}", audio_id or ""):
+        raise HTTPException(status_code=404, detail="audio not found")
+    audio_path = lookup_tts_dir() / f"{audio_id}.mp3"
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="audio not found")
+    return FileResponse(audio_path, media_type="audio/mpeg")
 
 
 @app.post("/books/{book_id}/export")
@@ -6692,6 +7985,63 @@ def patch_annotation(annotation_id: str, payload: AnnotationPatch) -> dict[str, 
     return dict(row)
 
 
+@app.post("/annotations/{annotation_id}/clean")
+def clean_annotation_note(annotation_id: str, payload: Optional[AnnotationCleanRequest] = None) -> dict[str, Any]:
+    payload = payload or AnnotationCleanRequest()
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM reader.annotations WHERE id = %s", (annotation_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="annotation not found")
+    original_note = str(row.get("note_text") or "").strip()
+    if not original_note:
+        raise HTTPException(status_code=422, detail="annotation note is empty")
+    prompt = f"""
+你是 Reader 语音备注整理器，通过 Hermes 调用 Qwen。请只整理用户口述备注，不要扩写事实，不要添加原文没有的信息。
+任务：
+1. 删除明显口头语和填充词，例如“呃”“啊”“那个”“就是”。
+2. 补齐中文标点，必要时分段。
+3. 保留用户原意、关键词和判断。
+4. 只返回 JSON：{{"cleaned_text":"整理后的中文备注"}}
+
+原始备注：
+{original_note}
+""".strip()
+    try:
+        response = call_hermes_runtime(prompt, session_id=f"reader_annotation_clean_{annotation_id}", timeout_seconds=120)
+        reply = str(response.get("reply") or response.get("text") or response.get("message") or "")
+        parsed = extract_json_object(reply)
+        cleaned_text = normalize_note_text(str(parsed.get("cleaned_text") or parsed.get("text") or ""))
+    except Exception as exc:  # noqa: BLE001 - surface Hermes/Qwen cleanup failures to the editor.
+        raise HTTPException(status_code=502, detail=f"Hermes Qwen cleanup failed: {exc}") from exc
+    if not cleaned_text:
+        raise HTTPException(status_code=502, detail="Hermes Qwen cleanup returned empty text")
+
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = dict(metadata)
+    metadata["ai_cleanup"] = {
+        "provider": "hermes_qwen",
+        "status": "cleaned",
+        "cleaned_at": now_iso(),
+        "raw_note_text": original_note,
+        "applied": bool(payload.apply),
+    }
+    with db.connect() as conn:
+        updated = conn.execute(
+            """
+            UPDATE reader.annotations
+            SET note_text = CASE WHEN %s THEN %s ELSE note_text END,
+                metadata = %s,
+                updated_at = now()
+            WHERE id = %s
+            RETURNING *
+            """,
+            (bool(payload.apply), cleaned_text, db.jsonb(metadata), annotation_id),
+        ).fetchone()
+    return {"ok": True, "cleaned_text": cleaned_text, "annotation": dict(updated)}
+
+
 @app.delete("/annotations/{annotation_id}")
 def delete_annotation(annotation_id: str) -> dict[str, Any]:
     with db.connect() as conn:
@@ -6729,6 +8079,17 @@ def create_audio_note(payload: AudioNoteCreate) -> dict[str, Any]:
                 payload.error_message,
             ),
         ).fetchone()
+        if row:
+            apply_audio_note_to_annotation(conn, dict(row))
+    return dict(row)
+
+
+@app.get("/audio-notes/{audio_note_id}")
+def get_audio_note(audio_note_id: str) -> dict[str, Any]:
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM reader.audio_notes WHERE id = %s", (audio_note_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="audio note not found")
     return dict(row)
 
 
@@ -6764,6 +8125,8 @@ def patch_audio_note(audio_note_id: str, payload: AudioNotePatch) -> dict[str, A
                 audio_note_id,
             ),
         ).fetchone()
+        if row:
+            apply_audio_note_to_annotation(conn, dict(row))
     if not row:
         raise HTTPException(status_code=404, detail="audio note not found")
     return dict(row)

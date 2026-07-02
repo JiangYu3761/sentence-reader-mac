@@ -27,9 +27,41 @@ RECORDING_SCHEMA = "local.recordings.audio_asset.v1"
 LEGACY_RECORDING_SCHEMA = "click.knowledge_inbox.recording.v1"
 HERMES_CHAT_SCHEMA = "click.hermes_mobile.voice_message.v1"
 MOBILE_ACCESS_SCHEMA = "click.mobile_access.v1"
+MAC_VOICE_PIPELINE_SCHEMA = "click.mac_voice_pipeline.v1"
+MAC_VOICE_PIPELINE_ID = "mac.local_audio.funasr.v1"
 EDGE_TTS_VOICE = "zh-CN-YunjianNeural"
 HERMES_RUNTIME_BASE_URL = os.getenv("CLICK_HERMES_RUNTIME_BASE_URL", "http://127.0.0.1:8765")
 FUNASR_BASE_URL = os.getenv("CLICK_FUNASR_BASE_URL", "http://127.0.0.1:18081")
+NOTE_SPOKEN_PUNCTUATION = [
+    ("新的一行", "\n"),
+    ("另起一行", "\n"),
+    ("换行", "\n"),
+    ("句号", "。"),
+    ("逗号", "，"),
+    ("顿号", "、"),
+    ("问号", "？"),
+    ("感叹号", "！"),
+    ("叹号", "！"),
+    ("冒号", "："),
+    ("分号", "；"),
+    ("省略号", "……"),
+]
+NOTE_CLOSING_PUNCTUATION = set("。！？!?…；;：:，,、）)]】》」』”’\"'")
+
+
+def normalize_note_text(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+    for spoken, mark in NOTE_SPOKEN_PUNCTUATION:
+        text = text.replace(spoken, mark)
+    text = re.sub(r"\s+([，。！？；：、,.!?;:])", r"\1", text)
+    text = re.sub(r"([，。！？；：、,.!?;:])\s+", r"\1", text)
+    text = re.sub(r"([。！？!?]){2,}", r"\1", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text or text[-1] in NOTE_CLOSING_PUNCTUATION:
+        return text
+    return text + ("." if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text) else "。")
 
 
 class RecordingCreate(BaseModel):
@@ -264,6 +296,11 @@ def issue_access_token() -> str:
     return uuid4().hex + uuid4().hex
 
 
+def mobile_access_requires_approval() -> bool:
+    value = os.getenv("CLICK_MOBILE_REQUIRE_APPROVAL", "").strip().lower()
+    return value in {"1", "true", "yes", "on", "strict"}
+
+
 def device_access_record(device_id: Optional[str]) -> Optional[dict[str, Any]]:
     normalized = normalize_device_id(device_id)
     if not normalized:
@@ -304,6 +341,8 @@ def is_authorized_device(device_id: str, access_token: str = "") -> bool:
 
 
 def require_mobile_access(request: Request, *, device_id: Optional[str] = None, access_token: Optional[str] = None) -> None:
+    if not mobile_access_requires_approval():
+        return
     resolved_device_id, resolved_access_token = request_device_identity(request, device_id, access_token)
     if not resolved_device_id:
         return
@@ -323,6 +362,21 @@ def require_mobile_access(request: Request, *, device_id: Optional[str] = None, 
 
 def access_status_payload(device_id: str, access_token: str = "") -> dict[str, Any]:
     normalized = normalize_device_id(device_id)
+    if normalized and not mobile_access_requires_approval():
+        return {
+            "ok": True,
+            "schema": MOBILE_ACCESS_SCHEMA,
+            "device_id": normalized,
+            "status": "local_lan_allowed",
+            "authorized": True,
+            "pending": False,
+            "device_name": "",
+            "token_required": False,
+            "paths": {
+                "allowed_devices": str(allowed_devices_path()),
+                "pending_devices": str(pending_devices_path()),
+            },
+        }
     allowed = device_access_record(normalized)
     pending = pending_device_record(normalized)
     authorized = bool(normalized and is_authorized_device(normalized, access_token))
@@ -563,15 +617,60 @@ def call_json(url: str, payload: Optional[dict[str, Any]] = None, timeout: float
         return json.loads(response.read().decode("utf-8"))
 
 
+def prepare_audio_for_funasr(audio_path: Path) -> Path:
+    suffix = audio_path.suffix.lower()
+    if suffix in {".wav", ".wave"}:
+        return audio_path
+    if suffix not in {".m4a", ".mp4", ".aac", ".caf"}:
+        return audio_path
+    afconvert = shutil.which("afconvert") or "/usr/bin/afconvert"
+    if not Path(afconvert).exists():
+        return audio_path
+    wav_path = audio_path.with_suffix(".funasr.wav")
+    command = [afconvert, str(audio_path), str(wav_path), "-f", "WAVE", "-d", "LEI16@16000"]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    if completed.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size <= 44:
+        raise RuntimeError((completed.stderr or completed.stdout or "afconvert failed").strip())
+    return wav_path
+
+
+def mac_voice_pipeline_transcribe(audio_path: Path, *, purpose: str, timeout: float = 120.0) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "schema": MAC_VOICE_PIPELINE_SCHEMA,
+        "pipeline": MAC_VOICE_PIPELINE_ID,
+        "mac_side_processing": True,
+        "app_role": "capture_upload_only",
+        "purpose": purpose,
+        "asr_engine": "funasr-local",
+        "funasr_base_url": FUNASR_BASE_URL,
+        "audio_path": str(audio_path),
+        "ok": False,
+        "status": "failed",
+        "transcript": "",
+        "raw_result": {},
+        "error": "",
+    }
+    try:
+        health = call_json(f"{FUNASR_BASE_URL}/health", timeout=2.0)
+        if not health.get("ok"):
+            raise RuntimeError("FunASR is not healthy")
+        prepared_audio_path = prepare_audio_for_funasr(audio_path)
+        result["prepared_audio_path"] = str(prepared_audio_path)
+        raw = call_json(f"{FUNASR_BASE_URL}/transcribe", {"audio": str(prepared_audio_path)}, timeout=timeout)
+        text = normalize_note_text(str(raw.get("text") or ""))
+        if not text:
+            raise RuntimeError("FunASR did not return text")
+        result.update(ok=True, status="transcribed", transcript=text, raw_result=raw)
+    except Exception as exc:  # noqa: BLE001 - voice callers preserve audio even when ASR fails.
+        result["error"] = str(exc)
+    return result
+
+
 def transcribe_audio(audio_path: Path) -> str:
-    health = call_json(f"{FUNASR_BASE_URL}/health", timeout=2.0)
-    if not health.get("ok"):
-        raise RuntimeError("FunASR is not healthy")
-    result = call_json(f"{FUNASR_BASE_URL}/transcribe", {"audio": str(audio_path)}, timeout=120.0)
-    text = str(result.get("text") or "").strip()
-    if not text:
-        raise RuntimeError("FunASR did not return text")
-    return text
+    result = mac_voice_pipeline_transcribe(audio_path, purpose="legacy_transcribe_audio")
+    if not result["ok"]:
+        raise RuntimeError(result["error"] or "Mac voice pipeline failed")
+    return str(result["transcript"])
 
 
 def call_hermes_runtime(prompt: str, *, session_id: Optional[str] = None, timeout_seconds: int = 45) -> dict[str, Any]:
@@ -730,6 +829,12 @@ def write_recording_files(record: dict[str, Any], metadata: dict[str, Any]) -> N
             "asr": record["asr_engine"],
             "naming": record["naming_engine"],
         },
+        "voice_pipeline": {
+            "schema": MAC_VOICE_PIPELINE_SCHEMA,
+            "pipeline": MAC_VOICE_PIPELINE_ID,
+            "mac_side_processing": True,
+            "app_role": "capture_upload_only",
+        },
         "storage": {
             "canonical_root": str(recordings_dir()),
             "legacy_roots": [str(legacy_recordings_dir())],
@@ -792,7 +897,10 @@ def create_recording(payload: RecordingCreate) -> dict[str, Any]:
 
     transcript = ""
     try:
-        transcript = transcribe_audio(audio_path)
+        pipeline_result = mac_voice_pipeline_transcribe(audio_path, purpose="durable_recording_asset")
+        if not pipeline_result["ok"]:
+            raise RuntimeError(pipeline_result["error"] or "Mac voice pipeline failed")
+        transcript = normalize_note_text(str(pipeline_result["transcript"]))
         record["status"] = "transcribed"
         record["updated_at"] = now_iso()
         record.update(recording_status_fields(record["status"]))
@@ -920,23 +1028,39 @@ def recording_list_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>Click 录音</title>
+  <title>录音</title>
   <style>
     :root{color-scheme:dark;background:#050505;color:#f6f0e8;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif}
     body{margin:0;background:#050505;min-height:100vh}
     main{max-width:860px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 22px) 18px 32px}
     header{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-bottom:18px}
     h1{font-size:26px;margin:0} p{color:#aaa18f;line-height:1.5}
-    .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:18px 0}
+    .actions{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0 12px}
+    .actions .wide{grid-column:1/-1}
     button,a.button{border:0;border-radius:10px;padding:15px 16px;background:#f0d36b;color:#15120a;font-weight:800;font-size:16px;text-decoration:none;text-align:center}
     button.secondary,a.secondary{background:#24231e;color:#f6f0e8}
     button.danger{background:#9b3d32;color:white}
+    button:disabled{opacity:.46}
+    .record-action{min-height:96px;border-radius:16px;padding:18px;display:grid;place-items:center;box-shadow:0 10px 28px rgba(0,0,0,.26)}
+    .record-action .button-title{font-size:24px;line-height:1.08}
+    .record-action.secondary{border:1px solid #343024}
+    .record-action.danger{min-height:72px;text-align:center;align-content:center}
+    .record-action.danger .button-title{font-size:20px}
+    #state{margin:0 0 18px;padding:10px 12px;border-radius:12px;background:#12110d;border:1px solid #292720;color:#d8cfbd;font-size:14px}
+    .record-panel{display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:center;margin:0 0 14px;padding:16px;border:1px solid #3a3020;border-radius:16px;background:#11100c}
+    .record-panel[hidden]{display:none}
+    .record-dot{width:18px;height:18px;border-radius:50%;background:#9b3d32;box-shadow:0 0 0 8px rgba(155,61,50,.18)}
+    .record-panel[data-active="true"] .record-dot{animation:pulse 1.1s ease-in-out infinite}
+    .record-title{font-size:21px;font-weight:900}.record-timer{font-size:32px;font-weight:900;letter-spacing:.02em;margin-top:4px}
+    .record-help{margin-top:4px;color:#aaa18f;font-size:14px;line-height:1.4}
+    @keyframes pulse{0%,100%{transform:scale(.92);opacity:.72}50%{transform:scale(1.08);opacity:1}}
     .card{border:1px solid #292720;background:#11110e;border-radius:12px;padding:14px;margin:12px 0}
     .meta{font-size:13px;color:#8f8878}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#222015;color:#e4d48a;font-size:12px}
     .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.row button{font-size:13px;padding:8px 10px}.row input{min-width:150px}
     input,select{border:1px solid #343024;background:#15140f;color:#f6f0e8;border-radius:8px;padding:8px}
     details{margin-top:10px;color:#cfc5ad}pre{white-space:pre-wrap;overflow:auto;background:#080806;border:1px solid #242116;border-radius:8px;padding:10px}
     audio{width:100%;margin-top:10px}.empty{border:1px dashed #3a362a;border-radius:12px;padding:26px;text-align:center;color:#aaa18f}
+    @media (max-width:620px){main{padding-left:14px;padding-right:14px}.actions{grid-template-columns:1fr}.actions .wide{grid-column:auto}button,a.button{min-height:52px}.record-action{min-height:88px}.record-action.danger{min-height:68px}}
   </style>
 </head>
 <body>
@@ -945,16 +1069,64 @@ def recording_list_html() -> str:
     <h1>录音</h1>
     <a class="button secondary" href="/home">首页</a>
   </header>
-  <p>录音会保存到本机 Recordings 总仓库。Click、Reader、Hermes 只是来源或处理器，不拥有录音资产。这里可以编辑标题/分类、查看转写和 metadata，隐藏只从列表移开，不删除文件。</p>
   <section class="actions">
-    <button id="start">开始录音</button>
-    <button id="stop" class="danger" disabled>停止并保存</button>
+    <button id="start" class="record-action primary" type="button" aria-label="开始录音">
+      <span class="button-title">开始录音</span>
+    </button>
+    <button id="pickAudio" class="record-action secondary" type="button" aria-label="系统录音或上传音频">
+      <span class="button-title">系统录音 / 上传</span>
+    </button>
+    <button id="stop" class="record-action danger wide" type="button" disabled aria-label="停止并保存录音">
+      <span class="button-title">停止并保存</span>
+    </button>
+  </section>
+  <input id="audioFile" type="file" accept="audio/*" capture="microphone" style="display:none">
+  <section id="recordPanel" class="record-panel" hidden data-active="false" aria-live="polite">
+    <span class="record-dot" aria-hidden="true"></span>
+    <div>
+      <div id="recordTitle" class="record-title">准备录音</div>
+      <div id="recordTimer" class="record-timer">00:00</div>
+      <div id="recordHelp" class="record-help">点“开始录音”后会先请求麦克风权限；如系统不允许，请点“系统录音 / 上传”。</div>
+    </div>
   </section>
   <p id="state">准备就绪</p>
   <section id="list"></section>
 </main>
 <script>
-let recorder=null, chunks=[], startedAt=0, mimeType='audio/m4a';
+let recorder=null, chunks=[], startedAt=0, mimeType='audio/m4a', activeStream=null, timerID=0, nativeRecording=false;
+const startButton=document.getElementById('start');
+const stopButton=document.getElementById('stop');
+const pickAudioButton=document.getElementById('pickAudio');
+const audioFileInput=document.getElementById('audioFile');
+const stateEl=document.getElementById('state');
+const recordPanel=document.getElementById('recordPanel');
+const recordTitle=document.getElementById('recordTitle');
+const recordTimer=document.getElementById('recordTimer');
+const recordHelp=document.getElementById('recordHelp');
+function setState(text){stateEl.textContent=text;}
+function formatDuration(ms){
+  const total=Math.max(0,Math.floor(ms/1000));
+  const minutes=String(Math.floor(total/60)).padStart(2,'0');
+  const seconds=String(total%60).padStart(2,'0');
+  return `${minutes}:${seconds}`;
+}
+function showRecordPanel(title, help, active){
+  recordPanel.hidden=false;
+  recordPanel.dataset.active=active?'true':'false';
+  recordTitle.textContent=title;
+  recordHelp.textContent=help||'';
+}
+function hideRecordPanelSoon(){
+  window.setTimeout(()=>{ if(!recorder || recorder.state==='inactive') recordPanel.hidden=true; }, 1800);
+}
+function startTimer(){
+  if(timerID) window.clearInterval(timerID);
+  recordTimer.textContent='00:00';
+  timerID=window.setInterval(()=>{ recordTimer.textContent=formatDuration(Date.now()-startedAt); }, 350);
+}
+function stopTimer(){
+  if(timerID){ window.clearInterval(timerID); timerID=0; }
+}
 function pickMime(){
   const types=['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/ogg'];
   for (const t of types){ if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t; }
@@ -963,6 +1135,95 @@ function pickMime(){
 function asDataUrl(blob){
   return new Promise((resolve,reject)=>{ const r=new FileReader(); r.onload=()=>resolve(r.result); r.onerror=reject; r.readAsDataURL(blob); });
 }
+function stopActiveStream(){
+  if(activeStream){activeStream.getTracks().forEach(t=>t.stop()); activeStream=null;}
+}
+function recordingApiAvailable(){
+  return Boolean(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&window.MediaRecorder);
+}
+function nativeAudioAvailable(){
+  try{
+    return Boolean(window.ClickNativeAudio&&ClickNativeAudio.isAvailable&&ClickNativeAudio.isAvailable()&&ClickNativeAudio.startRecording&&ClickNativeAudio.stopRecording);
+  }catch(err){
+    return false;
+  }
+}
+function isAppleMobileCapture(){
+  const ua=navigator.userAgent||'';
+  return /iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1);
+}
+function prefersSystemAudioCapture(){
+  return isAppleMobileCapture() && !recordingApiAvailable();
+}
+function resetRecordButtons(){
+  startButton.disabled=false;
+  stopButton.disabled=true;
+}
+function promptSystemRecorder(reason){
+  resetRecordButtons();
+  stopTimer();
+  showRecordPanel('需要系统录音', '当前环境不能直接录音。请点“系统录音 / 上传”，录完后会由 Mac 保存和转写。', false);
+  setState(reason+'；请点“系统录音 / 上传音频”。');
+}
+async function uploadAudioBlob(blob, durationSeconds){
+  if(!blob||!blob.size){throw new Error('empty audio blob');}
+  setState('正在保存和转写...');
+  showRecordPanel('正在保存', 'Mac 正在保存录音并尝试转写、命名和整理。', false);
+  const audio_base64=await asDataUrl(blob);
+  const payload={
+    audio_base64,
+    mime_type:blob.type||'audio/m4a',
+    source_app:'Click',
+    source_feature:'Standalone recording'
+  };
+  if(Number.isFinite(durationSeconds)){payload.duration_seconds=durationSeconds;}
+  const res=await fetch('/v1/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data=await res.json().catch(()=>({ok:false}));
+  if(!res.ok||!data.ok){throw new Error(data.detail||data.error||'save failed');}
+  setState('已保存，正在刷新列表...');
+  await loadList();
+  setState('已保存');
+  showRecordPanel('已保存', '录音已经进入本机 Recordings 总仓库。', false);
+  hideRecordPanelSoon();
+}
+window.__clickNativeAudioDidStart=()=>{
+  nativeRecording=true;
+  startedAt=Date.now();
+  startButton.disabled=true;
+  stopButton.disabled=false;
+  setState('正在录音');
+  showRecordPanel('正在录音', 'Android App 正在原生录音。点“停止并保存”结束录音。', true);
+  startTimer();
+};
+window.__clickNativeAudioDidStop=()=>{
+  stopTimer();
+  setState('正在保存和转写...');
+  showRecordPanel('正在保存', 'Android App 已完成录音，正在上传到 Mac。', false);
+};
+window.__clickNativeAudioDidUpload=async(payload)=>{
+  nativeRecording=false;
+  stopTimer();
+  resetRecordButtons();
+  if(!payload||payload.ok!==true){
+    const message=(payload&&payload.error)||'原生录音保存失败';
+    setState(message);
+    showRecordPanel('保存失败', message, false);
+    return;
+  }
+  setState('已保存，正在刷新列表...');
+  await loadList();
+  setState('已保存');
+  showRecordPanel('已保存', '录音已经进入本机 Recordings 总仓库。', false);
+  hideRecordPanelSoon();
+};
+window.__clickNativeAudioDidError=(payload)=>{
+  nativeRecording=false;
+  stopTimer();
+  resetRecordButtons();
+  const message=(payload&&payload.error)||'原生录音失败';
+  setState(message);
+  showRecordPanel('录音失败', message, false);
+};
 async function loadList(){
   const box=document.getElementById('list');
   const res=await fetch('/v1/recordings');
@@ -998,26 +1259,81 @@ function escapeAttr(s){return escapeHtml(s).replace(/`/g,'&#96;');}
 async function saveEdit(id){const card=document.querySelector(`[data-id="${CSS.escape(id)}"]`); const title=card.querySelector('.title').value; const category=card.querySelector('.category').value; const r=await fetch('/v1/recordings/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,category,organized_status:'已整理'})}); document.getElementById('state').textContent=r.ok?'已保存编辑':'保存失败'; await loadList();}
 async function reprocess(id){const r=await fetch('/v1/recordings/'+encodeURIComponent(id)+'/reprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dry_run:true})}); const d=await r.json(); document.getElementById('state').textContent=d.ok?'已提交整理检查':'整理失败';}
 async function hideRecording(id){const r=await fetch('/v1/recordings/'+encodeURIComponent(id)+'/hide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'mobile hidden'})}); document.getElementById('state').textContent=r.ok?'已隐藏':'隐藏失败'; await loadList();}
-document.getElementById('start').onclick=async()=>{
-  const stream=await navigator.mediaDevices.getUserMedia({audio:true});
-  mimeType=pickMime();
-  recorder=new MediaRecorder(stream,mimeType?{mimeType}:undefined);
-  chunks=[]; startedAt=Date.now();
-  recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
-  recorder.onstop=async()=>{
-    document.getElementById('state').textContent='正在保存和转写...';
-    const blob=new Blob(chunks,{type:mimeType||'audio/m4a'});
-    const audio_base64=await asDataUrl(blob);
-    const res=await fetch('/v1/recordings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio_base64,mime_type:blob.type||'audio/m4a',duration_seconds:(Date.now()-startedAt)/1000})});
-    const data=await res.json();
-    document.getElementById('state').textContent=data.ok?'已保存':'保存失败';
-    await loadList();
-    stream.getTracks().forEach(t=>t.stop());
-  };
-  recorder.start();
-  document.getElementById('start').disabled=true; document.getElementById('stop').disabled=false; document.getElementById('state').textContent='正在录音';
+startButton.onclick=async()=>{
+  if(nativeAudioAvailable()){
+    nativeRecording=true;
+    startButton.disabled=true;
+    stopButton.disabled=true;
+    showRecordPanel('请求麦克风权限', 'Android App 将使用原生录音，授权后会显示计时。', false);
+    setState('正在请求麦克风权限...');
+    try{ClickNativeAudio.startRecording();}catch(err){window.__clickNativeAudioDidError({ok:false,error:'原生录音启动失败'});}
+    return;
+  }
+  if(prefersSystemAudioCapture()){
+    audioFileInput.click();
+    showRecordPanel('等待系统录音', '如果没有弹出系统录音界面，请点“系统录音 / 上传”。', false);
+    setState('打开系统录音，完成后由 Mac 端处理');
+    return;
+  }
+  if(!recordingApiAvailable()){
+    audioFileInput.click();
+    promptSystemRecorder('当前 WebView/浏览器没有开放直接录音');
+    return;
+  }
+  try{
+    showRecordPanel('请求麦克风权限', '请允许麦克风权限；授权后会立刻开始计时。', false);
+    setState('正在请求麦克风权限...');
+    activeStream=await navigator.mediaDevices.getUserMedia({audio:true});
+    mimeType=pickMime();
+    recorder=new MediaRecorder(activeStream,mimeType?{mimeType}:undefined);
+    chunks=[]; startedAt=Date.now();
+    recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
+    recorder.onerror=()=>{promptSystemRecorder('录音器异常'); stopActiveStream();};
+    recorder.onstop=async()=>{
+      try{
+        stopTimer();
+        showRecordPanel('正在结束录音', '正在生成音频文件。', false);
+        const blob=new Blob(chunks,{type:mimeType||'audio/m4a'});
+        if(!blob.size){throw new Error('no audio captured');}
+        await uploadAudioBlob(blob,(Date.now()-startedAt)/1000);
+      }catch(err){
+        promptSystemRecorder('保存失败或没有录到音频');
+      }finally{
+        stopActiveStream();
+        resetRecordButtons();
+      }
+    };
+    recorder.start();
+    startButton.disabled=true; stopButton.disabled=false; setState('正在录音');
+    showRecordPanel('正在录音', '点“停止并保存”结束录音。', true);
+    startTimer();
+  }catch(err){
+    stopActiveStream();
+    promptSystemRecorder('麦克风没有授权或当前网络环境不允许直接录音');
+  }
 };
-document.getElementById('stop').onclick=()=>{ if(recorder){ recorder.stop(); } document.getElementById('start').disabled=false; document.getElementById('stop').disabled=true; };
+stopButton.onclick=()=>{
+  if(nativeRecording&&nativeAudioAvailable()){
+    setState('正在停止录音...');
+    showRecordPanel('正在停止录音', '正在结束 Android 原生录音。', false);
+    try{ClickNativeAudio.stopRecording();}catch(err){window.__clickNativeAudioDidError({ok:false,error:'原生录音停止失败'});}
+    return;
+  }
+  if(recorder&&recorder.state!=='inactive'){ setState('正在停止录音...'); recorder.stop(); } else { resetRecordButtons(); stopTimer(); stopActiveStream(); }
+};
+pickAudioButton.onclick=()=>{ showRecordPanel('等待系统录音', '请选择已有音频，或使用系统录音完成后返回。', false); setState('打开系统录音 / 上传'); audioFileInput.click(); };
+audioFileInput.onchange=async()=>{
+  const file=audioFileInput.files&&audioFileInput.files[0];
+  if(!file)return;
+  try{
+    setState('正在上传音频...');
+    await uploadAudioBlob(file,null);
+  }catch(err){
+    setState('上传失败，请确认音频文件可读取');
+  }finally{
+    audioFileInput.value='';
+  }
+};
 loadList().catch(()=>{document.getElementById('list').innerHTML='<div class="empty">录音列表暂时不可用</div>'});
 </script>
 </body>
@@ -1032,29 +1348,32 @@ def home_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>Click</title>
+  <title>本地工作台</title>
   <style>
     :root{color-scheme:dark;background:#050505;color:#f6f0e8;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif}
     body{margin:0;min-height:100vh;background:#050505}
     main{max-width:760px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 34px) 22px 34px}
-    h1{font-size:44px;margin:0 0 8px}p{color:#aaa18f;line-height:1.5}
-    .grid{display:grid;gap:14px;margin-top:30px}
-    a{display:grid;grid-template-columns:54px 1fr;gap:16px;text-decoration:none;border-radius:16px;padding:20px;background:#14130f;border:1px solid #2f2b21;color:#f8f1dc;align-items:center}
-    a strong{display:block;font-size:24px;margin-bottom:8px}a span{color:#aaa18f}
-    a.primary{background:#f0d36b;color:#15120a}a.primary span{color:#4d421c}
+    h1{font-size:44px;margin:0 0 8px}p{color:#aaa18f;line-height:1.55;font-size:17px}
+    .grid{display:grid;gap:16px;margin-top:30px}
+    a{display:grid;grid-template-columns:60px 1fr;gap:16px;text-decoration:none;border-radius:18px;padding:22px;background:#14130f;border:1px solid #2f2b21;color:#f8f1dc;align-items:center}
+    .entry-copy{display:grid;gap:8px;min-width:0}
+    .entry-title{display:block;font-size:26px;line-height:1.08;font-weight:850;color:#f8f1dc}
+    .entry-caption{display:block;font-size:17px;line-height:1.35;color:#c8bfae;font-weight:650}
+    a.primary{background:#f0d36b;color:#15120a}a.primary .entry-title{color:#15120a}a.primary .entry-caption{color:#4d421c}
     .entry-icon{width:54px;height:54px;border-radius:14px;display:grid;place-items:center;background:#24231e}
     .primary .entry-icon{background:#15120a}.entry-icon svg{width:34px;height:34px}
-    .status{margin-top:28px;border-top:1px solid #292720;padding-top:18px;font-size:14px;color:#aaa18f}
+    .status{margin-top:28px;border-top:1px solid #292720;padding-top:18px;font-size:16px;line-height:1.45;color:#c8bfae}
+    @media (max-width:520px){main{padding-left:16px;padding-right:16px}h1{font-size:38px}a{grid-template-columns:56px 1fr;padding:20px}.entry-title{font-size:24px}.entry-caption{font-size:16px}.status{font-size:15px}}
   </style>
 </head>
 <body>
 <main>
-  <h1>Click</h1>
-  <p>本地优先阅读工作台。手机只是入口，书、录音、Hermes 处理都在 Mac 本地完成。</p>
+  <h1>本地工作台</h1>
+  <p>手机只是入口，阅读、录音、Hermes 处理都在 Mac 本地完成。Click 是这里的阅读入口。</p>
   <section class="grid">
-    <a class="primary" href="/library"><span class="entry-icon icon-reading" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M8 12h14c5 0 9 4 9 9v19H17c-5 0-9-4-9-9V12Z" fill="#f8f1dc"/><path d="M26 12h14v19c0 5-4 9-9 9h-5V12Z" fill="#d8c7a6"/><path d="M15 22h10M15 29h8M31 22h5M31 29h5" stroke="#15120a" stroke-width="2.6" stroke-linecap="round"/></svg></span><span><strong>阅读</strong><span>打开书库和现有句子级阅读器</span></span></a>
-    <a href="/recordings"><span class="entry-icon icon-recordings-local" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><rect x="19" y="8" width="10" height="20" rx="5" fill="#f6f0e8"/><path d="M13 23c0 7 4 11 11 11s11-4 11-11M24 34v6M18 40h12" stroke="#f6f0e8" stroke-width="3" stroke-linecap="round"/><path d="M8 19c2-3 2-6 0-9M40 19c-2-3-2-6 0-9" stroke="#d86b5d" stroke-width="2.5" stroke-linecap="round"/></svg></span><span><strong>录音</strong><span>保存到本机 Recordings 总仓库，并由 Hermes 处理标题和摘要</span></span></a>
-    <a href="/hermes"><span class="entry-icon icon-hermes" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7l14 8v17L24 41 10 32V15l14-8Z" fill="#e6d28b"/><path d="M17 18h14M17 24h14M21 30h6" stroke="#15120a" stroke-width="3" stroke-linecap="round"/></svg></span><span><strong>Hermes</strong><span>和 Mac 上的 Hermes 对话，支持文字和语音消息</span></span></a>
+    <a class="primary" href="/library"><span class="entry-icon icon-reading" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M8 12h14c5 0 9 4 9 9v19H17c-5 0-9-4-9-9V12Z" fill="#f8f1dc"/><path d="M26 12h14v19c0 5-4 9-9 9h-5V12Z" fill="#d8c7a6"/><path d="M15 22h10M15 29h8M31 22h5M31 29h5" stroke="#15120a" stroke-width="2.6" stroke-linecap="round"/></svg></span><span class="entry-copy"><span class="entry-title">Click 阅读</span><span class="entry-caption">打开书库和现有句子级阅读器</span></span></a>
+    <a href="/recordings"><span class="entry-icon icon-recordings-local" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><rect x="19" y="8" width="10" height="20" rx="5" fill="#f6f0e8"/><path d="M13 23c0 7 4 11 11 11s11-4 11-11M24 34v6M18 40h12" stroke="#f6f0e8" stroke-width="3" stroke-linecap="round"/><path d="M8 19c2-3 2-6 0-9M40 19c-2-3-2-6 0-9" stroke="#d86b5d" stroke-width="2.5" stroke-linecap="round"/></svg></span><span class="entry-copy"><span class="entry-title">录音</span><span class="entry-caption">保存到本机 Recordings 总仓库，并由 Hermes 处理标题和摘要</span></span></a>
+    <a href="/hermes"><span class="entry-icon icon-hermes" aria-hidden="true"><svg viewBox="0 0 48 48" fill="none"><path d="M24 7l14 8v17L24 41 10 32V15l14-8Z" fill="#e6d28b"/><path d="M17 18h14M17 24h14M21 30h6" stroke="#15120a" stroke-width="3" stroke-linecap="round"/></svg></span><span class="entry-copy"><span class="entry-title">Hermes</span><span class="entry-caption">和 Mac 上的 Hermes 对话，支持文字和语音消息</span></span></a>
   </section>
   <section class="status" id="diag">正在检查 Mac 服务...</section>
 </main>
@@ -1075,43 +1394,100 @@ def hermes_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>Click Hermes</title>
+  <title>Hermes</title>
   <style>
     :root{color-scheme:dark;background:#050505;color:#f6f0e8;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif}
-    body{margin:0;background:#050505;min-height:100vh}main{max-width:860px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 20px) 14px 24px}
+    body{margin:0;background:#050505;min-height:100vh;min-height:100dvh}main{max-width:860px;margin:0 auto;padding:calc(env(safe-area-inset-top) + 20px) 14px 24px}
     header{display:flex;justify-content:space-between;align-items:center}h1{font-size:26px;margin:0}
-    #log{display:flex;flex-direction:column;gap:10px;margin:18px 0 130px}.msg{border-radius:12px;padding:12px 14px;line-height:1.5;white-space:pre-wrap}.user{background:#24231e}.bot{background:#121a16;border:1px solid #26382c}
-    form{position:fixed;left:0;right:0;bottom:0;background:#090908;border-top:1px solid #28251c;padding:12px;display:grid;grid-template-columns:1fr auto auto;gap:8px}
-    textarea{min-height:48px;max-height:120px;border-radius:10px;border:1px solid #343024;background:#15140f;color:#f6f0e8;padding:10px;font-size:16px}
-    button,a.button{border:0;border-radius:10px;padding:0 14px;background:#f0d36b;color:#15120a;font-weight:800;text-decoration:none;display:flex;align-items:center}
+    #log{display:flex;flex-direction:column;gap:10px;margin:18px 0 calc(190px + var(--keyboard-inset,0px))}.msg{border-radius:12px;padding:12px 14px;line-height:1.5;white-space:pre-wrap}.user{background:#24231e}.bot{background:#121a16;border:1px solid #26382c}
+    #status{min-height:22px;margin:8px 0 0;color:#aaa18f;font-size:14px}
+    form{position:fixed;left:0;right:0;bottom:var(--keyboard-inset,0px);background:#090908;border-top:1px solid #28251c;padding:12px max(12px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));display:grid;grid-template-columns:1fr;gap:10px;z-index:20}
+    textarea{width:100%;min-height:68px;max-height:148px;border-radius:12px;border:1px solid #343024;background:#15140f;color:#f6f0e8;padding:12px;font-size:17px;line-height:1.42;resize:none}
+    .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    button,a.button{border:0;border-radius:12px;padding:0 16px;background:#f0d36b;color:#15120a;font-weight:800;text-decoration:none;display:flex;align-items:center;justify-content:center;min-height:52px;font-size:16px}
+    .actions button{min-height:68px;border-radius:16px;display:grid;place-items:center;box-shadow:0 10px 26px rgba(0,0,0,.24)}
+    .actions .button-title{font-size:22px;line-height:1}
     button.secondary,a.secondary{background:#24231e;color:#f6f0e8}.top{height:38px}
+    #voice[data-recording="true"]{background:#9b3d32;color:white}
+    @media (min-width: 700px){main{padding-left:22px;padding-right:22px}form{left:50%;transform:translateX(-50%);max-width:860px;border-left:1px solid #28251c;border-right:1px solid #28251c;border-radius:16px 16px 0 0}.actions{grid-template-columns:minmax(180px,1fr) minmax(180px,1fr)}}
   </style>
 </head>
 <body>
 <main>
   <header><h1>Hermes</h1><a class="button secondary top" href="/home">首页</a></header>
-  <section id="log"><div class="msg bot">可以发文字，也可以点语音。语音消息会放到 HermesMobile VoiceInbox，不会混进长期录音资产。状态会显示：录音中、上传中、转写中、Hermes 思考中、错误。语音回复优先使用 Mac 端 edge-tts。</div></section>
+  <section id="log"></section>
+  <div id="status"></div>
 </main>
 <form id="form">
-  <textarea id="text" placeholder="发给 Hermes..."></textarea>
-  <button type="button" id="voice">语音</button>
-  <button type="submit">发送</button>
+  <textarea id="text" rows="2" enterkeyhint="send" placeholder="发给 Hermes..."></textarea>
+  <input id="voiceFile" type="file" accept="audio/*" capture="microphone" style="display:none">
+  <div class="actions">
+    <button class="secondary" type="button" id="voice" data-recording="false" aria-label="录制语音消息">
+      <span class="button-title">语音</span>
+    </button>
+    <button type="submit" id="send" aria-label="发送文字消息">
+      <span class="button-title">发送</span>
+    </button>
+  </div>
 </form>
 <script>
 const log=document.getElementById('log'); let sessionId=null, recorder=null, chunks=[], startedAt=0, voiceStream=null;
 function add(kind,text,audio){const el=document.createElement('div');el.className='msg '+kind;el.textContent=text;if(audio){const p=document.createElement('audio');p.controls=true;p.src=audio;el.appendChild(document.createElement('br'));el.appendChild(p)}log.appendChild(el);window.scrollTo(0,document.body.scrollHeight)}
+function setStatus(text){document.getElementById('status').textContent=text||''}
 async function chat(message){add('user',message); const r=await fetch('/v1/runtime/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,session_id:sessionId})}); const d=await r.json(); sessionId=d.session_id||sessionId; add('bot',d.reply||d.error||'Hermes 暂时不可用');}
-document.getElementById('form').onsubmit=e=>{e.preventDefault();const t=document.getElementById('text');const v=t.value.trim(); if(v){t.value=''; chat(v).catch(err=>add('bot','发送失败：'+err));}};
+function updateKeyboardInset(){
+  const viewport=window.visualViewport;
+  const inset=viewport?Math.max(0,window.innerHeight-viewport.height-viewport.offsetTop):0;
+  document.documentElement.style.setProperty('--keyboard-inset',Math.round(inset)+'px');
+}
+if(window.visualViewport){visualViewport.addEventListener('resize',updateKeyboardInset);visualViewport.addEventListener('scroll',updateKeyboardInset);updateKeyboardInset();}
+const form=document.getElementById('form');
+const textInput=document.getElementById('text');
+form.onsubmit=e=>{e.preventDefault();const v=textInput.value.trim(); if(v){textInput.value=''; chat(v).catch(err=>add('bot','发送失败：'+err));}};
+textInput.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();form.requestSubmit();}});
+textInput.addEventListener('focus',()=>setTimeout(()=>{updateKeyboardInset();form.scrollIntoView({block:'end'});},80));
 function pickMime(){for(const t of ['audio/mp4','audio/webm;codecs=opus','audio/webm','audio/ogg']){if(window.MediaRecorder&&MediaRecorder.isTypeSupported(t))return t}return ''}
 function dataUrl(blob){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(blob)})}
-document.getElementById('voice').onclick=async()=>{
+function voiceApiAvailable(){return Boolean(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia&&window.MediaRecorder)}
+function isAppleMobileVoiceCapture(){const ua=navigator.userAgent||'';return /iPhone|iPad|iPod/i.test(ua)||(/Macintosh/i.test(ua)&&navigator.maxTouchPoints>1)}
+function prefersSystemVoiceCapture(){return isAppleMobileVoiceCapture()&&!voiceApiAvailable()}
+function setVoiceButton(recording){
   const btn=document.getElementById('voice');
-  if(recorder&&recorder.state==='recording'){recorder.stop();btn.textContent='语音';return}
-  add('bot','状态：录音中');
-  voiceStream=await navigator.mediaDevices.getUserMedia({audio:true}); const mt=pickMime(); chunks=[]; startedAt=Date.now();
-  recorder=new MediaRecorder(voiceStream,mt?{mimeType:mt}:undefined); recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
-  recorder.onstop=async()=>{const blob=new Blob(chunks,{type:mt||'audio/m4a'}); voiceStream.getTracks().forEach(t=>t.stop()); add('user','[语音消息]'); add('bot','状态：上传中 / 转写中 / Hermes 思考中'); const audio_base64=await dataUrl(blob); const r=await fetch('/v1/voice/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audio_base64,mime_type:blob.type||'audio/m4a',duration_seconds:(Date.now()-startedAt)/1000,session_id:sessionId,tts:true})}); const d=await r.json(); sessionId=d.session_id||sessionId; add('bot',(d.transcript?'转写：'+d.transcript+'\\n\\n':'')+(d.reply_text||d.error||'语音处理失败'),d.audio_url||null);};
-  recorder.start();btn.textContent='停止';
+  btn.dataset.recording=recording?'true':'false';
+  btn.querySelector('.button-title').textContent=recording?'停止':'语音';
+}
+async function uploadVoiceBlob(blob,durationSeconds){
+  if(!blob||!blob.size){throw new Error('empty voice blob')}
+  setStatus('处理中...');
+  add('user','[语音]');
+  const audio_base64=await dataUrl(blob);
+  const payload={audio_base64,mime_type:blob.type||'audio/m4a',session_id:sessionId,tts:true};
+  if(Number.isFinite(durationSeconds)){payload.duration_seconds=durationSeconds}
+  const r=await fetch('/v1/voice/message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json();
+  sessionId=d.session_id||sessionId;
+  setStatus('');
+  add('bot',(d.transcript?'转写：'+d.transcript+'\\n\\n':'')+(d.reply_text||d.error||'语音处理失败'),d.audio_url||null);
+}
+document.getElementById('voice').onclick=async()=>{
+  if(recorder&&recorder.state==='recording'){recorder.stop();setVoiceButton(false);return}
+  if(prefersSystemVoiceCapture()){document.getElementById('voiceFile').click();setStatus('打开系统录音，完成后由 Mac 端处理');return}
+  if(!voiceApiAvailable()){document.getElementById('voiceFile').click();setStatus('请选择音频');return}
+  try{
+    setStatus('正在请求麦克风权限...');
+    voiceStream=await navigator.mediaDevices.getUserMedia({audio:true}); const mt=pickMime(); chunks=[]; startedAt=Date.now();
+    recorder=new MediaRecorder(voiceStream,mt?{mimeType:mt}:undefined); recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
+    recorder.onerror=()=>{setVoiceButton(false);setStatus('录音不可用，请点语音旁边的系统文件选择或重试');};
+    recorder.onstop=async()=>{setVoiceButton(false);const blob=new Blob(chunks,{type:mt||'audio/m4a'}); if(voiceStream){voiceStream.getTracks().forEach(t=>t.stop()); voiceStream=null;} try{await uploadVoiceBlob(blob,(Date.now()-startedAt)/1000)}catch(err){setStatus('语音发送失败')}};
+    recorder.start();setVoiceButton(true);setStatus('录音中，再点一次停止并发送');
+  }catch(err){
+    setVoiceButton(false); setStatus('麦克风不可用，请重新点语音或改用系统录音/上传');
+  }
+};
+document.getElementById('voiceFile').onchange=async()=>{
+  const file=document.getElementById('voiceFile').files&&document.getElementById('voiceFile').files[0];
+  if(!file)return;
+  try{await uploadVoiceBlob(file,null)}catch(err){setStatus('语音发送失败')}finally{document.getElementById('voiceFile').value=''}
 };
 </script>
 </body>
@@ -1418,6 +1794,13 @@ def mobile_diagnostics() -> dict[str, Any]:
             "legacy_root": str(legacy_recordings_dir()),
             "legacy_read_only": True,
         },
+        "voice_pipeline": {
+            "schema": MAC_VOICE_PIPELINE_SCHEMA,
+            "pipeline": MAC_VOICE_PIPELINE_ID,
+            "mac_side_processing": True,
+            "app_role": "capture_upload_only",
+            "shared_by": ["reader_audio_note", "recording_asset", "hermes_voice_message"],
+        },
         "mobile_access": {
             "schema": MOBILE_ACCESS_SCHEMA,
             "allowed_devices": str(allowed_devices_path()),
@@ -1443,7 +1826,9 @@ def mobile_runtime_chat(request: Request, payload: HermesChatCreate = Body(...))
     if not message:
         raise HTTPException(status_code=422, detail="message is empty")
     try:
-        result = call_hermes_runtime(message, session_id=payload.session_id, timeout_seconds=120)
+        # The mobile browser may keep an old tab-local session_id.  The Hermes
+        # mobile entry must follow the shared mainline managed by the runtime.
+        result = call_hermes_runtime(message, session_id=None, timeout_seconds=120)
         return {
             "ok": result.get("status") == "success",
             "schema": "click.mobile_workspace.hermes_chat.v1",
@@ -1473,10 +1858,13 @@ def post_voice_message(request: Request, payload: HermesVoiceCreate = Body(...))
     reply = ""
     error = ""
     status = "saved"
+    pipeline_result = mac_voice_pipeline_transcribe(audio_path, purpose="hermes_voice_message")
     try:
-        transcript = transcribe_audio(audio_path)
+        if not pipeline_result["ok"]:
+            raise RuntimeError(pipeline_result["error"] or "Mac voice pipeline failed")
+        transcript = normalize_note_text(str(pipeline_result["transcript"]))
         status = "transcribed"
-        chat = call_hermes_runtime(transcript, session_id=payload.session_id, timeout_seconds=120)
+        chat = call_hermes_runtime(transcript, session_id=None, timeout_seconds=120)
         reply = str(chat.get("reply") or "")
         status = "done" if chat.get("status") == "success" else "hermes_error"
         error = str(chat.get("error") or "")
@@ -1498,6 +1886,13 @@ def post_voice_message(request: Request, payload: HermesVoiceCreate = Body(...))
         "created_at": now_iso(),
         "status": status,
         "asr_engine": "funasr-local",
+        "voice_pipeline": {
+            "schema": MAC_VOICE_PIPELINE_SCHEMA,
+            "pipeline": MAC_VOICE_PIPELINE_ID,
+            "mac_side_processing": True,
+            "app_role": "capture_upload_only",
+            "purpose": "hermes_voice_message",
+        },
         "tts_engine": "edge-tts" if audio_url else "none",
         "tts_voice": EDGE_TTS_VOICE,
         "audio_path": str(audio_path),

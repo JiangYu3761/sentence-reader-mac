@@ -16,9 +16,9 @@ def backup_dir() -> Path:
 
 def main() -> int:
     directory = backup_dir()
-    files = sorted(directory.glob("Click-Android-MobileWorkspace-debug-*.apk"), key=lambda path: path.stat().st_mtime)
+    files = sorted(directory.glob("LocalWorkspace-Android-debug-*.apk"), key=lambda path: path.stat().st_mtime)
     if not files:
-        raise AssertionError(f"missing MobileWorkspace debug APK in {directory}")
+        raise AssertionError(f"missing LocalWorkspace debug APK in {directory}")
     apk = files[-1]
     sha_file = Path(str(apk) + ".sha256")
     if not sha_file.exists():

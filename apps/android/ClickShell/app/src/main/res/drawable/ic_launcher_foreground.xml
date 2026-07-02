@@ -4,7 +4,7 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Click Focus: local app icon with reading, click, and light audio cues. -->
+    <!-- Local Workspace: app icon with reading, click, and light audio cues. -->
     <path
         android:fillColor="#1d2430"
         android:pathData="M18,18h72a10,10 0,0 1,10 10v52a10,10 0,0 1,-10 10H18a10,10 0,0 1,-10 -10V28a10,10 0,0 1,10 -10z" />

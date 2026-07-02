@@ -78,43 +78,85 @@ def main() -> int:
         "android.permission.INTERNET",
         "android.permission.RECORD_AUDIO",
         "networkSecurityConfig",
+        "enableOnBackInvokedCallback=\"true\"",
+        "windowSoftInputMode=\"adjustResize\"",
         "android:icon=\"@drawable/ic_launcher_foreground\"",
         "<adaptive-icon",
-        "Click Focus",
+        "Local Workspace",
         "ic_entry_recording_local",
         "Voice Memos-style",
         "JavaScriptEnabled",
         "setDomStorageEnabled",
         "BuildConfig.CLICK_DEFAULT_HOST",
         "buildConfigField \"String\", \"CLICK_DEFAULT_HOST\"",
-        "Click-Android-MobileWorkspace-debug-",
+        "LocalWorkspace-Android-debug-",
         "shasum -a 256",
         "KEY_DEVICE_ID",
         "KEY_ACCESS_TOKEN",
+        "KEY_RECENT_HOSTS",
+        "MAX_RECENT_HOSTS",
+        "Spinner",
+        "ArrayAdapter",
+        "pendingAudioPermissionRequest",
+        "NativeAudioBridge",
+        "ClickNativeAudio",
+        "addJavascriptInterface",
+        "MediaRecorder",
+        "AudioRecord",
+        "audio/wav",
+        "writeNativeWavRecording",
+        "writeWavHeader",
+        "startReaderNote",
+        "reader_note",
+        "startNativeAudioRecorder",
+        "stopNativeAudioRecording",
+        "uploadNativeAudio",
+        "__clickNativeAudioDidUpload",
+        "__clickNativeReaderAudioDidUpload",
+        "/lan/audio-notes/transcribe",
+        "onRequestPermissionsResult",
+        "pendingFilePathCallback",
+        "onShowFileChooser",
+        "REQUEST_FILE_CHOOSER",
+        "FileChooserParams.parseResult",
+        "rememberRecentHost",
+        "recentHostOptions",
         "withAccessParams",
     ]:
         require(combined, needle, "Android shell")
 
     for needle in [
         "首页",
-        "阅读",
+        "Click 阅读",
         "录音",
         "Hermes",
         "刷新",
         "更换地址",
         "Hermes 端口",
-        "设备 token",
+        "本地服务端口",
         "设备 ID",
         "连接你的 Mac",
+        "最近访问过的 Mac 地址",
+        "选择最近访问过的地址",
         "<mac-lan-ip>",
+        "handleBackNavigation",
+        "onBackPressed",
+        "OnBackInvokedCallback",
+        "registerOnBackInvokedCallback",
+        "edgeSwipeCandidate",
+        "setOnTouchListener",
+        "本地工作台",
     ]:
         require(activity, needle, "Android Activity")
+    forbid(activity, r"root\.addView\(back,\s*backParams\)", "Android Activity")
+    forbid(activity, r"root\.addView\(menu,\s*menuParams\)", "Android Activity")
+    require(strings, "<string name=\"app_name\">本地工作台</string>", "Android app name")
 
     require(readme, "Debug APK is a local build target", "Android README")
     require(readme, "no signed release APK is published yet", "Android README")
     require(readme, "阅读 / 录音 / Hermes", "Android README")
-    require(icon_background, "#141821", "Click Focus background")
-    require(icon_foreground, "Click Focus", "Click Focus foreground")
+    require(icon_background, "#141821", "local workspace icon background")
+    require(icon_foreground, "Local Workspace", "local workspace icon foreground")
     require(icon_recording, "Voice Memos-style", "recording entry icon")
     forbid(readme, r"APK\s+(is\s+)?(complete|done|ready|finished)", "Android README")
     forbid(readme, r"(signed|release)\s+APK\s+(is\s+)?(ready|complete|done|finished)", "Android README")

@@ -12,6 +12,7 @@ reports/
 data/external/
 output/
 docs/images/
+backups/
 
 # Local runtime and user data should never be published.
 *.sqlite

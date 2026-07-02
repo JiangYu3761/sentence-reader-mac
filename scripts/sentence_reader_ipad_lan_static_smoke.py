@@ -19,6 +19,8 @@ REQUIRED = {
         '@app.get("/lan/books/{book_id}/chapters/{chapter_index}")',
         '@app.get("/lan/books/{book_id}/asset/{asset_path:path}")',
         '@app.post("/lan/audio-notes/transcribe")',
+        '@app.get("/audio-notes/{audio_note_id}")',
+        '@app.post("/annotations/{annotation_id}/clean")',
         "epub_publication",
         "epub_rootfile_path",
         "transform_epub_html_assets",
@@ -31,6 +33,9 @@ REQUIRED = {
         "tocToggle",
         "toc_entries",
         "state.manifest.toc",
+        "showReaderLoadError",
+        "currentBookTocItems",
+        "请从书库打开一本书",
         "toc-row",
         "--toc-indent",
         "data-level",
@@ -41,8 +46,28 @@ REQUIRED = {
         "pageRatio",
         "lan_reader_paginated",
         "noteToast",
+        "voiceToast",
+        "noteEditor",
+        "noteEditorText",
+        "noteEditorVoice",
+        "noteEditorClean",
+        "noteEditorSave",
+        "showVoiceToast",
         "showNoteToast",
         "noteToastVisible",
+        "openNoteEditor",
+        "saveNoteEditor",
+        "cleanNoteEditorText",
+        "appendNoteEditorText",
+        "pollAudioNote",
+        "voiceNotePendingText",
+        "async_processing",
+        "pending_text",
+        "start_lan_audio_note_transcription",
+        "run_lan_audio_note_transcription",
+        "apply_audio_note_to_annotation",
+        "call_hermes_runtime",
+        "Hermes / Qwen",
         "sentenceBar",
         "barRed",
         "barNote",
@@ -113,6 +138,21 @@ REQUIRED = {
         "turnPage",
         "startVoiceNote",
         "/lan/audio-notes/transcribe",
+        "nativeReaderAudioAvailable",
+        "ClickNativeAudio.startReaderNote(state.book.id)",
+        "__clickNativeReaderAudioDidUpload",
+        "start_lan_audio_note_transcription",
+        "click.mac_voice_pipeline.v1",
+        "capture_upload_only",
+        '"status"] == "pending"',
+        '"async_processing"] is True',
+    ],
+}
+
+FORBIDDEN = {
+    APP: [
+        "const preferred = state.books.find((book) => book.id === initialBookID)",
+        "state.books.find((book) => book.lan_available)",
     ],
 }
 
@@ -127,8 +167,16 @@ def main() -> int:
         missing = [marker for marker in markers if marker not in text]
         if missing:
             missing_markers[str(path)] = missing
-    if missing_files or missing_markers:
-        print(f"ipad lan static FAIL missing_files={missing_files} missing_markers={missing_markers}")
+    forbidden_markers: dict[str, list[str]] = {}
+    for path, markers in FORBIDDEN.items():
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        present = [marker for marker in markers if marker in text]
+        if present:
+            forbidden_markers[str(path)] = present
+    if missing_files or missing_markers or forbidden_markers:
+        print(f"ipad lan static FAIL missing_files={missing_files} missing_markers={missing_markers} forbidden_markers={forbidden_markers}")
         return 1
     print("ipad lan static PASS")
     return 0

@@ -54,6 +54,7 @@ def main() -> int:
         COMMON_MARKERS
         + [
             "return toggleRed(sentenceFromTarget(event.target), event);",
+            "if (sentence) {\n          return toggleRedSentences([sentence], event);\n        }",
             "english-click-lookup",
             "installApplicationMenu",
             "退出 Sentence Reader",
@@ -116,6 +117,19 @@ def main() -> int:
 
     swift_text = SWIFT.read_text(encoding="utf-8")
     app_text = APP.read_text(encoding="utf-8")
+    forbidden_swift_markers = [
+        ".rightMouseDown",
+        "__sentenceReaderToggleRedAtPoint",
+        "toggleRedFromSecondaryEvent",
+        "lastSecondaryRedAt",
+        "document.addEventListener('mousedown'",
+        "document.addEventListener('auxclick'",
+    ]
+    present_forbidden = [marker for marker in forbidden_swift_markers if marker in swift_text]
+    if present_forbidden:
+        missing_markers.setdefault(str(SWIFT), []).extend(
+            [f"forbidden secondary red route: {marker}" for marker in present_forbidden]
+        )
     if not context_guard_has_sentence_priority(swift_text, "if (sentence) { return false; }"):
         missing_markers.setdefault(str(SWIFT), []).append("context guard must route sentence before selection")
     if not context_guard_has_sentence_priority(app_text, "if (node) return false;"):

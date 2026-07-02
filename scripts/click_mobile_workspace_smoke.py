@@ -38,9 +38,56 @@ def main() -> int:
         client = TestClient(app)
 
         for path, markers in {
-            "/home": ["阅读", "录音", "Hermes", "/library", "/recordings", "/hermes"],
-            "/recordings": ["Recordings 总仓库", "/v1/recordings", "MediaRecorder", "开始录音"],
-            "/hermes": ["/v1/runtime/chat", "/v1/voice/message", "VoiceInbox", "edge-tts"],
+            "/home": ["本地工作台", "Click 阅读", "录音", "Hermes", "/library", "/recordings", "/hermes", "entry-caption", "font-size:17px"],
+            "/recordings": [
+                "/v1/recordings",
+                "MediaRecorder",
+                "开始录音",
+                "系统录音 / 上传音频",
+                'capture="microphone"',
+                "recordPanel",
+                "recordTimer",
+                "正在请求麦克风权限",
+                "startTimer",
+                "nativeAudioAvailable",
+                "ClickNativeAudio.startRecording",
+                "ClickNativeAudio.stopRecording",
+                "__clickNativeAudioDidStart",
+                "__clickNativeAudioDidUpload",
+                "__clickNativeAudioDidError",
+                "Android App 正在原生录音",
+                "uploadAudioBlob",
+                "recordingApiAvailable",
+                "isAppleMobileCapture",
+                "prefersSystemAudioCapture",
+                "return isAppleMobileCapture() && !recordingApiAvailable();",
+                "打开系统录音，完成后由 Mac 端处理",
+                "record-action",
+            ],
+            "/hermes": [
+                "/v1/runtime/chat",
+                "/v1/voice/message",
+                "class=\"actions\"",
+                "min-height:68px",
+                "grid-template-columns:1fr 1fr",
+                'id="send"',
+                'id="voiceFile"',
+                'capture="microphone"',
+                'data-recording="false"',
+                "setVoiceButton",
+                "enterkeyhint=\"send\"",
+                "visualViewport",
+                "--keyboard-inset",
+                "requestSubmit",
+                "uploadVoiceBlob",
+                "voiceApiAvailable",
+                "isAppleMobileVoiceCapture",
+                "prefersSystemVoiceCapture",
+                "return isAppleMobileVoiceCapture()&&!voiceApiAvailable()",
+                "正在请求麦克风权限",
+                "录音中，再点一次停止并发送",
+                "打开系统录音，完成后由 Mac 端处理",
+            ],
         }.items():
             response = client.get(path)
             require(response.status_code == 200, f"{path} status={response.status_code}")
@@ -62,7 +109,11 @@ def main() -> int:
         access_status = client.get("/v1/mobile/access/status")
         require(access_status.status_code == 200, "access status route")
         require(access_status.json()["status"] == "local_debug", "local debug access status")
+        local_lan_status = client.get("/v1/mobile/access/status", params={"device_id": "android-smoke-device"})
+        require(local_lan_status.json()["status"] == "local_lan_allowed", "default mobile access should allow local LAN shell")
+        require(local_lan_status.json()["authorized"] is True, "default local LAN device should be authorized")
 
+        os.environ["CLICK_MOBILE_REQUIRE_APPROVAL"] = "1"
         unauthorized = client.post(
             "/v1/recordings",
             json={
@@ -112,6 +163,9 @@ def main() -> int:
             require(key in metadata, f"metadata missing {key}")
         require(metadata["storage"]["canonical_root"] == str(Path(tmp) / "Recordings"), "metadata canonical root")
         require(metadata["storage"]["legacy_read_only"] is True, "metadata legacy read-only")
+        require(metadata["voice_pipeline"]["schema"] == "click.mac_voice_pipeline.v1", "recording voice pipeline schema")
+        require(metadata["voice_pipeline"]["pipeline"] == "mac.local_audio.funasr.v1", "recording voice pipeline id")
+        require(metadata["voice_pipeline"]["app_role"] == "capture_upload_only", "recording app role")
 
         listing = client.get("/v1/recordings").json()
         require(len(listing["recordings"]) == 1, "recording listing")
@@ -149,6 +203,8 @@ def main() -> int:
         require(diag["edge_tts"]["voice"] == "zh-CN-YunjianNeural", "diagnostics edge tts voice")
         require(diag["recordings_store"]["canonical_root"] == str(Path(tmp) / "Recordings"), "diagnostics canonical root")
         require(diag["recordings_store"]["legacy_read_only"] is True, "diagnostics legacy read-only")
+        require(diag["voice_pipeline"]["schema"] == "click.mac_voice_pipeline.v1", "diagnostics voice pipeline schema")
+        require(diag["voice_pipeline"]["shared_by"] == ["reader_audio_note", "recording_asset", "hermes_voice_message"], "diagnostics shared voice pipeline")
 
         runtime_health = client.get("/v1/runtime/health")
         require(runtime_health.status_code == 200, "runtime health proxy route")
@@ -169,7 +225,10 @@ def main() -> int:
         require(voice_payload["schema"] == "click.hermes_mobile.voice_message.v1", "voice schema")
         voice_detail = client.get(f"/v1/voice/message/{voice_payload['voice_id']}")
         require(voice_detail.status_code == 200, "voice detail route")
-        require(voice_detail.json()["schema"] == "click.hermes_mobile.voice_message.v1", "voice detail schema")
+        voice_detail_payload = voice_detail.json()
+        require(voice_detail_payload["schema"] == "click.hermes_mobile.voice_message.v1", "voice detail schema")
+        require(voice_detail_payload["metadata"]["voice_pipeline"]["pipeline"] == "mac.local_audio.funasr.v1", "Hermes voice pipeline id")
+        require(voice_detail_payload["metadata"]["voice_pipeline"]["purpose"] == "hermes_voice_message", "Hermes voice pipeline purpose")
 
         revoked = client.post("/v1/mobile/access/revoke", json={"device_id": "android-smoke-device"})
         require(revoked.status_code == 200, "revoke route")

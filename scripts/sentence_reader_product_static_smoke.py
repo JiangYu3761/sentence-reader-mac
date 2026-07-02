@@ -220,7 +220,8 @@ REQUIRED = {
         "write_epub",
         "/lan/books/book_lan_smoke/manifest",
         "/lan/audio-notes/transcribe",
-        "funasr unavailable in smoke",
+        '"status"] == "pending"',
+        '"async_processing"] is True',
     ],
     PRODUCT_READINESS_SMOKE: [
         "sentence_reader.product_readiness_smoke.v1",

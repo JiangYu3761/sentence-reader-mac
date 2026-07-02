@@ -107,7 +107,7 @@ class FakeConn:
                 "duration_seconds": duration_seconds,
                 "provider": provider,
                 "transcript": transcript,
-                "raw_result": raw_result,
+                "raw_result": getattr(raw_result, "obj", raw_result),
                 "status": status,
                 "error_message": error_message,
                 "created_at": "2026-06-25T00:00:00Z",
@@ -115,6 +115,8 @@ class FakeConn:
             }
             self.audio_notes.append(row)
             return FakeCursor(row)
+        if "select * from reader.audio_notes where id = %s" in sql:
+            return FakeCursor(next((row for row in self.audio_notes if row["id"] == params[0]), None))
         raise AssertionError(f"unexpected SQL in LAN smoke: {query}")
 
 
@@ -224,6 +226,9 @@ def main() -> int:
                 "startVoiceNote",
                 "/lan/audio-notes/transcribe",
                 "audioFile",
+                "nativeReaderAudioAvailable",
+                "ClickNativeAudio.startReaderNote(state.book.id)",
+                "__clickNativeReaderAudioDidUpload",
                 "lan_reader_paginated",
                 "noteToast",
                 "sentenceBar",
@@ -240,8 +245,13 @@ def main() -> int:
                 "toc-row",
                 "--toc-indent",
                 "data-level",
+                "showReaderLoadError",
+                "请从书库打开一本书",
+                "currentBookTocItems",
             ]:
                 assert marker in page.text, marker
+            assert "state.books.find((book) => book.lan_available)" not in page.text
+            assert "|| state.books[0]" not in page.text
 
             books = client.get("/lan/books")
             assert books.status_code == 200
@@ -275,16 +285,16 @@ def main() -> int:
             assert traversal.status_code in {400, 404}
 
             original_app_support = app_module.sentence_reader_app_support_dir
-            original_funasr = app_module.funasr_server_json
+            original_start = app_module.start_lan_audio_note_transcription
 
             def app_support() -> Path:
                 return Path(tmp) / "app-support"
 
-            def unavailable_funasr(*_: Any, **__: Any) -> dict[str, Any]:
-                raise RuntimeError("funasr unavailable in smoke")
+            def noop_start(*args: Any, **kwargs: Any) -> None:
+                return None
 
             app_module.sentence_reader_app_support_dir = app_support  # type: ignore[assignment]
-            app_module.funasr_server_json = unavailable_funasr  # type: ignore[assignment]
+            app_module.start_lan_audio_note_transcription = noop_start  # type: ignore[assignment]
             try:
                 voice = client.post(
                     "/lan/audio-notes/transcribe",
@@ -297,14 +307,23 @@ def main() -> int:
                 )
             finally:
                 app_module.sentence_reader_app_support_dir = original_app_support  # type: ignore[assignment]
-                app_module.funasr_server_json = original_funasr  # type: ignore[assignment]
+                app_module.start_lan_audio_note_transcription = original_start  # type: ignore[assignment]
             assert voice.status_code == 200
             voice_json = voice.json()
             assert voice_json["schema"] == "sentence_reader.lan_audio_transcription.v1"
-            assert voice_json["status"] == "failed"
-            assert "funasr unavailable" in voice_json["error_message"]
+            assert voice_json["accepted"] is True
+            assert voice_json["async_processing"] is True
+            assert voice_json["status"] == "pending"
+            assert voice_json["provider"] == "mac_voice_pipeline"
+            assert voice_json["voice_pipeline"]["schema"] == "click.mac_voice_pipeline.v1"
+            assert voice_json["voice_pipeline"]["app_role"] == "capture_upload_only"
+            assert voice_json["pending_text"] == "语音转写中..."
+            assert voice_json["error_message"] == ""
             audio_file = Path(app_support()) / "AudioNotes" / "LAN" / f"{voice_json['audio_note_id']}.webm"
             assert audio_file.exists()
+            audio_note = client.get(f"/audio-notes/{voice_json['audio_note_id']}")
+            assert audio_note.status_code == 200
+            assert audio_note.json()["status"] == "pending"
 
     print(json.dumps({"ok": True, "smoke": "reader api ipad lan smoke PASS"}, ensure_ascii=False))
     return 0

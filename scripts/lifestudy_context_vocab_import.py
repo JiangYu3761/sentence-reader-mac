@@ -148,6 +148,13 @@ def apply_import(database_url: str, book_id: str, items: list[dict[str, Any]]) -
                 "reason": item.get("reason"),
                 "match_source": item.get("match_source"),
                 "occurrence_count": item.get("occurrence_count"),
+                "part_of_speech": item.get("part_of_speech") or "",
+                "part_of_speech_zh": item.get("part_of_speech_zh") or "",
+                "popup_speak_text_zh": item.get("popup_speak_text_zh") or "",
+                "tts_engine_preferred": item.get("tts_engine_preferred") or "",
+                "tts_voice_preferred": item.get("tts_voice_preferred") or "",
+                "single_click_popup_enabled": item.get("single_click_popup_enabled"),
+                "high_confidence_popup": item.get("high_confidence_popup"),
             }
 
             conn.execute(
@@ -182,15 +189,16 @@ def apply_import(database_url: str, book_id: str, items: list[dict[str, Any]]) -
             conn.execute(
                 """
                 INSERT INTO reader.lexemes (
-                    id, lemma, surface, language, short_definition, source, created_at, updated_at
+                    id, lemma, surface, language, part_of_speech, short_definition, source, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, 'en', %s, 'lifestudy_context', now(), now())
+                VALUES (%s, %s, %s, 'en', %s, %s, 'lifestudy_context', now(), now())
                 ON CONFLICT (language, lemma, surface) DO UPDATE
-                SET short_definition = COALESCE(NULLIF(EXCLUDED.short_definition, ''), reader.lexemes.short_definition),
+                SET part_of_speech = COALESCE(NULLIF(EXCLUDED.part_of_speech, ''), reader.lexemes.part_of_speech),
+                    short_definition = COALESCE(NULLIF(EXCLUDED.short_definition, ''), reader.lexemes.short_definition),
                     source = COALESCE(NULLIF(EXCLUDED.source, ''), reader.lexemes.source),
                     updated_at = now()
                 """,
-                (lexeme_id, lemma, term, meaning),
+                (lexeme_id, lemma, term, item.get("part_of_speech") or "", meaning),
             )
             inserted["lexemes"] += 1
 
@@ -263,6 +271,13 @@ def apply_domain_import(
                 "match_source": item.get("match_source"),
                 "alignment_confidence": item.get("alignment_confidence"),
                 "alignment_score": item.get("alignment_score"),
+                "part_of_speech": item.get("part_of_speech") or "",
+                "part_of_speech_zh": item.get("part_of_speech_zh") or "",
+                "popup_speak_text_zh": item.get("popup_speak_text_zh") or "",
+                "tts_engine_preferred": item.get("tts_engine_preferred") or "",
+                "tts_voice_preferred": item.get("tts_voice_preferred") or "",
+                "single_click_popup_enabled": item.get("single_click_popup_enabled"),
+                "high_confidence_popup": item.get("high_confidence_popup"),
             }
             conn.execute(
                 """

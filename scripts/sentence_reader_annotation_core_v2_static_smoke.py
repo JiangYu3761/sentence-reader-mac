@@ -28,7 +28,8 @@ SWIFT_MARKERS = {
     "system routing guard": "shouldLetSystemHandle",
     "context red routing guard": "shouldLetSystemHandleContext",
     "sentence event claim helper": "claimSentenceEvent",
-    "hard context red route": "return toggleRed(sentenceFromTarget(event.target), event);",
+    "single context red route": "return toggleRed(sentenceFromTarget(event.target), event);",
+    "single sentence before selection red": "if (sentence) {\n          return toggleRedSentences([sentence], event);\n        }",
     "double click note default": "double-click-note",
     "range intersection": "rangesIntersect",
     "batch red toggle": "toggleRedSentences",
@@ -59,6 +60,19 @@ def main() -> int:
             missing_markers.setdefault(str(SOURCE), []).append("semicolon must not be in sentenceBoundaryRegex")
         if "：" in text[text.find("sentenceBoundaryRegex") : text.find("sentenceBoundaryRegex") + 180]:
             missing_markers.setdefault(str(SOURCE), []).append("colon must not be in sentenceBoundaryRegex")
+        forbidden_markers = [
+            ".rightMouseDown",
+            "__sentenceReaderToggleRedAtPoint",
+            "toggleRedFromSecondaryEvent",
+            "lastSecondaryRedAt",
+            "document.addEventListener('mousedown'",
+            "document.addEventListener('auxclick'",
+        ]
+        present_forbidden = [marker for marker in forbidden_markers if marker in text]
+        if present_forbidden:
+            missing_markers.setdefault(str(SOURCE), []).extend(
+                [f"forbidden secondary red route: {marker}" for marker in present_forbidden]
+            )
 
     if PLAN.exists():
         plan_text = PLAN.read_text(encoding="utf-8")

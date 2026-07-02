@@ -46,6 +46,84 @@ private final class WindowDragView: NSView {
     }
 }
 
+private final class LookupActionTarget: NSObject {
+    private let action: () -> Void
+
+    init(action: @escaping () -> Void) {
+        self.action = action
+        super.init()
+    }
+
+    @objc func perform(_ sender: NSButton) {
+        action()
+    }
+}
+
+private final class LookupWordButton: NSButton {
+    override var acceptsFirstResponder: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+}
+
+private enum NoteTextNormalizer {
+    private static let spokenPunctuation: [(String, String)] = [
+        ("新的一行", "\n"),
+        ("另起一行", "\n"),
+        ("换行", "\n"),
+        ("句号", "。"),
+        ("逗号", "，"),
+        ("顿号", "、"),
+        ("问号", "？"),
+        ("感叹号", "！"),
+        ("叹号", "！"),
+        ("冒号", "："),
+        ("分号", "；"),
+        ("省略号", "……"),
+    ]
+
+    private static let closingPunctuation = CharacterSet(charactersIn: "。！？!?…；;：:，,、）)]】》」』”’\"'")
+
+    static func normalized(_ rawText: String) -> String {
+        var text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return text }
+
+        for (spoken, mark) in spokenPunctuation {
+            text = text.replacingOccurrences(of: spoken, with: mark)
+        }
+        text = text.replacingOccurrences(of: "\\s+([，。！？；：、,.!?;:])", with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: "([，。！？；：、,.!?;:])\\s+", with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: "([。！？!?]){2,}", with: "$1", options: .regularExpression)
+        text = text.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        return ensureSentenceEnding(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private static func ensureSentenceEnding(_ text: String) -> String {
+        guard let lastScalar = text.unicodeScalars.last,
+              !closingPunctuation.contains(lastScalar)
+        else {
+            return text
+        }
+        return isEnglishOnly(text) ? text + "." : text + "。"
+    }
+
+    private static func isEnglishOnly(_ text: String) -> Bool {
+        let hasLetter = text.unicodeScalars.contains { scalar in
+            (65...90).contains(Int(scalar.value)) || (97...122).contains(Int(scalar.value))
+        }
+        let hasCJK = text.unicodeScalars.contains { scalar in
+            (0x4E00...0x9FFF).contains(Int(scalar.value))
+        }
+        return hasLetter && !hasCJK
+    }
+}
+
 final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
     private weak var textView: NSTextView?
     private weak var statusLabel: NSTextField?
@@ -445,7 +523,7 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
     }
 
     private func finishTranscription(text: String, provider: String, displayProvider: String, audioNoteID: String?) {
-        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = NoteTextNormalizer.normalized(text)
         guard !cleaned.isEmpty else {
             failTranscription("\(displayProvider) 没有识别出文字。", audioNoteID: audioNoteID)
             return
@@ -698,8 +776,8 @@ final class ReaderAPIClient {
         return (request(method: "POST", path: "/annotations", body: body) as? [String: Any])?["id"] as? String
     }
 
-    func deleteAnnotation(annotationID: String) {
-        _ = request(method: "DELETE", path: "/annotations/\(annotationID)", body: nil)
+    func deleteAnnotation(annotationID: String) -> Bool {
+        request(method: "DELETE", path: "/annotations/\(annotationID)", body: nil) != nil
     }
 
     func updateAnnotation(annotationID: String, noteText: String?, color: String?) -> Bool {
@@ -722,6 +800,116 @@ final class ReaderAPIClient {
         }
         components.queryItems = queryItems
         return request(method: "GET", path: components.string ?? "/books/\(bookID)/lookup", body: nil) as? [String: Any]
+    }
+
+    func lookupTTS(text: String, voice: String? = nil) -> URL? {
+        let url = baseURL.appendingPathComponent("lookup/tts")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 20
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["text": text]
+        if let voice, !voice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["voice"] = voice
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var payload: [String: Any]?
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let data,
+                  !data.isEmpty
+            else {
+                return
+            }
+            payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 21)
+
+        guard payload?["ok"] as? Bool == true,
+              let audioPath = payload?["audio_url"] as? String,
+              !audioPath.isEmpty
+        else {
+            return nil
+        }
+        if let absolute = URL(string: audioPath), absolute.scheme != nil {
+            return absolute
+        }
+        let relativePath = audioPath.hasPrefix("/") ? String(audioPath.dropFirst()) : audioPath
+        return baseURL.appendingPathComponent(relativePath)
+    }
+
+    func lookupTTSData(text: String, voice: String? = nil) -> Data? {
+        guard let audioURL = lookupTTS(text: text, voice: voice) else {
+            return nil
+        }
+        return downloadLookupAudioData(from: audioURL)
+    }
+
+    func lookupCachedTTSData(text: String, voice: String? = nil) -> Data? {
+        let url = baseURL.appendingPathComponent("lookup/tts/status")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 0.35
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["text": text]
+        if let voice, !voice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            body["voice"] = voice
+        }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var payload: [String: Any]?
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let data,
+                  !data.isEmpty
+            else {
+                return
+            }
+            payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 0.45)
+
+        guard payload?["cached"] as? Bool == true,
+              let audioPath = payload?["audio_url"] as? String,
+              !audioPath.isEmpty
+        else {
+            return nil
+        }
+        if let absolute = URL(string: audioPath), absolute.scheme != nil {
+            return downloadLookupAudioData(from: absolute)
+        }
+        let relativePath = audioPath.hasPrefix("/") ? String(audioPath.dropFirst()) : audioPath
+        return downloadLookupAudioData(from: baseURL.appendingPathComponent(relativePath))
+    }
+
+    private func downloadLookupAudioData(from audioURL: URL) -> Data? {
+        var request = URLRequest(url: audioURL)
+        request.timeoutInterval = 20
+        let semaphore = DispatchSemaphore(value: 0)
+        var audioData: Data?
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let data,
+                  !data.isEmpty
+            else {
+                return
+            }
+            audioData = data
+        }
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + 21)
+        return audioData
     }
 
     func updateVocabItem(bookID: String, itemID: String, status: String) -> Bool {
@@ -1581,6 +1769,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var readerSettings = ReaderSettings.defaultSettings
     private let readerAPI = ReaderAPIClient()
     private let speechSynthesizer = AVSpeechSynthesizer()
+    private var lookupAudioPlayer: AVPlayer?
+    private var lookupAudioDataPlayer: AVAudioPlayer?
+    private var lookupSoundPlayer: NSSound?
+    private var lookupAudioProcess: Process?
+    private var lookupActionTargets: [LookupActionTarget] = []
     private let readingPositionKeyPrefix = "SentenceReader.lastReadingPosition.v1"
     private let bookLibraryKey = "SentenceReader.bookLibrary.v1"
     private let readerSettingsKey = "SentenceReader.readerSettings.v1"
@@ -1642,7 +1835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         var marginX: Int
         var theme: String
 
-        static let defaultSettings = ReaderSettings(fontSize: 18, lineHeight: 1.72, marginX: 10, theme: "dark")
+        static let defaultSettings = ReaderSettings(fontSize: 18, lineHeight: 1.58, marginX: 8, theme: "dark")
     }
 
     private struct NoteRow {
@@ -2359,8 +2552,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private func sanitizedReaderSettings(_ settings: ReaderSettings) -> ReaderSettings {
         ReaderSettings(
             fontSize: max(15, min(28, settings.fontSize)),
-            lineHeight: max(1.45, min(2.05, settings.lineHeight)),
-            marginX: max(4, min(40, settings.marginX)),
+            lineHeight: max(1.2, min(2.05, settings.lineHeight)),
+            marginX: max(2, min(40, settings.marginX)),
             theme: settings.theme == "warm" ? "warm" : "dark"
         )
     }
@@ -4430,11 +4623,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             guard response == .alertFirstButtonReturn else {
                 return
             }
-            let updated = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let updated = NoteTextNormalizer.normalized(textView.string)
+            self.statusLabel.stringValue = "正在保存笔记到 Reader API..."
             DispatchQueue.global(qos: .utility).async { [readerAPI = self.readerAPI] in
                 let ok = readerAPI.updateAnnotation(annotationID: item.id, noteText: updated, color: item.isRedHighlight ? "red" : nil)
                 DispatchQueue.main.async {
-                    self.statusLabel.stringValue = ok ? "笔记已更新" : "笔记更新失败"
+                    self.statusLabel.stringValue = ok ? "笔记已保存到 Reader API" : "笔记保存失败"
                     self.refreshNotes()
                     self.restoreAnnotationsForCurrentChapter()
                 }
@@ -4460,14 +4654,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             guard response == .alertFirstButtonReturn else {
                 return
             }
+            self.statusLabel.stringValue = "正在删除\(item.kindTitle)..."
             DispatchQueue.global(qos: .utility).async { [readerAPI = self.readerAPI] in
-                readerAPI.deleteAnnotation(annotationID: item.id)
+                let ok = readerAPI.deleteAnnotation(annotationID: item.id)
                 DispatchQueue.main.async {
-                    for sentenceIndex in self.sentenceIndexList(from: item.sentenceIndex) {
-                        self.redAnnotationIDs[self.annotationKey(chapterLocator: item.chapterLocator, sentenceIndex: sentenceIndex)] = nil
+                    if ok {
+                        for sentenceIndex in self.sentenceIndexList(from: item.sentenceIndex) {
+                            self.redAnnotationIDs[self.annotationKey(chapterLocator: item.chapterLocator, sentenceIndex: sentenceIndex)] = nil
+                        }
                     }
                     self.restoreAnnotationsForCurrentChapter()
-                    self.statusLabel.stringValue = "已删除\(item.kindTitle)"
+                    self.statusLabel.stringValue = ok ? "已删除\(item.kindTitle)" : "\(item.kindTitle)删除失败，已恢复数据库状态"
                     self.refreshNotes()
                 }
             }
@@ -4628,7 +4825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             case "red":
                 let count = payload["redCount"] as? Int ?? 0
                 self.redLabel.stringValue = "红标 \(count)"
-                self.statusLabel.stringValue = (payload["isRed"] as? Bool ?? true) ? "已整句标红" : "已取消整句标红"
+                self.statusLabel.stringValue = (payload["isRed"] as? Bool ?? true) ? "正在保存红标..." : "正在取消红标..."
                 self.persistRed(
                     sentence: text,
                     sentenceIndex: self.sentenceIndexPayload(from: payload),
@@ -4639,6 +4836,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 self.redLabel.stringValue = "红标 \(count)"
                 self.statusLabel.stringValue = text.isEmpty ? "已撤销上一步" : "已撤销：\(text)"
                 if payload["actionType"] as? String == "red" {
+                    self.statusLabel.stringValue = "正在保存撤销结果..."
                     self.persistRed(
                         sentence: text,
                         sentenceIndex: self.sentenceIndexPayload(from: payload),
@@ -4719,7 +4917,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             self.noteSpeechController?.cancel()
             self.noteSpeechController = nil
             if response == .alertFirstButtonReturn {
-                let noteText = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+                let noteText = NoteTextNormalizer.normalized(textView.string)
                 self.persistNote(sentence: sentence, sentenceIndex: sentenceIndex, noteText: noteText, audioNoteID: audioNoteID)
             }
         }
@@ -4771,11 +4969,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let displayWord = Self.lookupText(item?["surface"]).isEmpty ? word : Self.lookupText(item?["surface"])
         let meaning = Self.lookupText(item?["context_meaning_zh"])
         let meaningSource = Self.lookupText(item?["meaning_source"])
+        let metadata = item?["metadata"] as? [String: Any]
+        let rawPartOfSpeechZH = Self.lookupText(item?["part_of_speech_zh"]).isEmpty
+            ? Self.lookupText(metadata?["part_of_speech_zh"])
+            : Self.lookupText(item?["part_of_speech_zh"])
+        let rawPartOfSpeech = Self.lookupText(item?["part_of_speech"]).isEmpty
+            ? Self.lookupText(metadata?["part_of_speech"])
+            : Self.lookupText(item?["part_of_speech"])
+        let partOfSpeechTitle = Self.lookupPartOfSpeechTitle(primary: rawPartOfSpeechZH, fallback: rawPartOfSpeech)
+        let popupSpeakText = Self.lookupText(item?["popup_speak_text_zh"]).isEmpty
+            ? Self.lookupText(metadata?["popup_speak_text_zh"])
+            : Self.lookupText(item?["popup_speak_text_zh"])
         let alignmentStatus = Self.lookupText(item?["alignment_status"])
         let itemStatus = Self.lookupText(item?["status"])
         let occurrenceCount = Self.lookupText(item?["occurrence_count"])
-        let reviewable = (item?["reviewable"] as? Bool) ?? true
-        let metadata = item?["metadata"] as? [String: Any]
         let sourceTitle = Self.lookupText(metadata?["source_title"])
         let sourceVolume = Self.lookupText(metadata?["volume"])
         let sourcePage = Self.lookupText(metadata?["source_page"])
@@ -4786,47 +4993,243 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             ? Self.lookupText(item?["representative_sentence_zh"])
             : Self.lookupText(occurrence?["chinese_sentence"])
 
-        var lines: [String] = []
+        let partOfSpeechShortTitle = Self.lookupPartOfSpeechShortTitle(primary: rawPartOfSpeechZH, fallback: rawPartOfSpeech)
+        var meaningLines: [String] = []
         if item == nil {
-            lines.append("这本书的单词本暂时没有收录这个词。可以先朗读，也可以回到原句添加备注。")
+            meaningLines.append("未收录。可以先读词，或回到原句添加备注。")
         } else {
-            lines.append("中文：\(meaning.isEmpty ? "未确认短义项" : meaning)")
-            if !meaningSource.isEmpty {
-                lines.append("来源：\(Self.lookupMeaningSourceTitle(meaningSource))")
+            let compactMeaning = [partOfSpeechShortTitle, meaning.isEmpty ? "未确认释义" : meaning]
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            meaningLines.append(compactMeaning.isEmpty ? "未确认释义" : compactMeaning)
+        }
+
+        var evidenceLines: [String] = []
+        if !meaningSource.isEmpty {
+            evidenceLines.append("来源：\(Self.lookupMeaningSourceTitle(meaningSource))")
+        }
+        if !sourceTitle.isEmpty {
+            evidenceLines.append("批次：\(sourceTitle)")
+        }
+        if !sourceVolume.isEmpty || !sourcePage.isEmpty {
+            let pageText = sourcePage.isEmpty ? "" : "第 \(sourcePage) 页"
+            evidenceLines.append("出处：\([sourceVolume, pageText].filter { !$0.isEmpty }.joined(separator: " · "))")
+        }
+        if !alignmentStatus.isEmpty {
+            evidenceLines.append("对齐：\(Self.lookupAlignmentTitle(alignmentStatus))")
+        }
+        if !itemStatus.isEmpty {
+            evidenceLines.append("状态：\(Self.lookupStatusTitle(itemStatus))")
+        }
+        if !occurrenceCount.isEmpty {
+            evidenceLines.append("本书出现：\(occurrenceCount) 次")
+        }
+        if !representativeEN.isEmpty {
+            evidenceLines.append("")
+            evidenceLines.append("英文上下文：")
+            evidenceLines.append(representativeEN)
+        }
+        if !representativeZH.isEmpty {
+            evidenceLines.append("")
+            evidenceLines.append("中文证据：")
+            evidenceLines.append(representativeZH)
+        }
+        if evidenceLines.isEmpty {
+            evidenceLines.append("暂无更多证据。")
+        }
+
+        let alert = NSAlert()
+        alert.messageText = ""
+        alert.informativeText = ""
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 430, height: 172))
+        lookupActionTargets.removeAll()
+        func makeLookupActionButton(title: String, symbolName: String?, frame: NSRect, action: @escaping () -> Void) -> NSButton {
+            let target = LookupActionTarget(action: action)
+            lookupActionTargets.append(target)
+            let button = NSButton(title: title, target: target, action: #selector(LookupActionTarget.perform(_:)))
+            button.frame = frame
+            button.bezelStyle = .rounded
+            button.font = NSFont(name: "Microsoft YaHei", size: 13) ?? NSFont.systemFont(ofSize: 13, weight: .medium)
+            if let symbolName,
+               #available(macOS 11.0, *),
+               let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: title) {
+                button.image = image
+                button.imagePosition = .imageLeading
             }
-            if !sourceTitle.isEmpty {
-                lines.append("批次：\(sourceTitle)")
+            return button
+        }
+
+        let wordTarget = LookupActionTarget { [weak self] in
+            self?.statusLabel.stringValue = "已点击单词，准备朗读：\(displayWord)"
+            self?.speakEnglish(displayWord)
+        }
+        lookupActionTargets.append(wordTarget)
+        let clickableWordButton = LookupWordButton(title: displayWord, target: wordTarget, action: #selector(LookupActionTarget.perform(_:)))
+        clickableWordButton.frame = NSRect(x: 0, y: 118, width: 430, height: 52)
+        clickableWordButton.setButtonType(.momentaryPushIn)
+        clickableWordButton.bezelStyle = .rounded
+        clickableWordButton.isBordered = true
+        clickableWordButton.wantsLayer = true
+        clickableWordButton.layer?.cornerRadius = 8
+        clickableWordButton.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor
+        clickableWordButton.toolTip = "点击朗读单词"
+        if #available(macOS 11.0, *),
+           let image = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "朗读") {
+            clickableWordButton.image = image
+            clickableWordButton.imagePosition = .imageTrailing
+        }
+        clickableWordButton.font = NSFont(name: "Microsoft YaHei", size: 34) ?? NSFont.systemFont(ofSize: 34, weight: .bold)
+        clickableWordButton.alignment = .center
+        clickableWordButton.contentTintColor = NSColor.labelColor
+        accessory.addSubview(clickableWordButton)
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 48, width: 430, height: 64))
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.font = NSFont(name: "Microsoft YaHei", size: 19) ?? NSFont.systemFont(ofSize: 19, weight: .medium)
+        textView.string = meaningLines.joined(separator: "\n")
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.alignment = .center
+        textView.textContainerInset = NSSize(width: 0, height: 17)
+        textView.drawsBackground = false
+        textView.textColor = NSColor.labelColor
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = false
+        scroll.borderType = .noBorder
+        accessory.addSubview(scroll)
+
+        let speakMeaning = popupSpeakText.isEmpty
+            ? [partOfSpeechTitle, meaning].filter { !$0.isEmpty }.joined(separator: "，")
+            : popupSpeakText
+
+        let buttonY: CGFloat = 8
+        let readMeaningButton = makeLookupActionButton(
+            title: "读释义",
+            symbolName: "text.bubble.fill",
+            frame: NSRect(x: 0, y: buttonY, width: 104, height: 30)
+        ) { [weak self] in
+            self?.speakChineseMeaning(speakMeaning)
+        }
+        accessory.addSubview(readMeaningButton)
+
+        if item != nil {
+            var showingEvidence = false
+            var evidenceButton: NSButton?
+            evidenceButton = makeLookupActionButton(
+                title: "证据",
+                symbolName: "doc.text.magnifyingglass",
+                frame: NSRect(x: 114, y: buttonY, width: 94, height: 30)
+            ) {
+                showingEvidence.toggle()
+                textView.string = showingEvidence ? evidenceLines.joined(separator: "\n") : meaningLines.joined(separator: "\n")
+                scroll.hasVerticalScroller = showingEvidence
+                textView.alignment = showingEvidence ? .left : .center
+                textView.font = showingEvidence
+                    ? (NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14))
+                    : (NSFont(name: "Microsoft YaHei", size: 19) ?? NSFont.systemFont(ofSize: 19, weight: .medium))
+                textView.textContainerInset = showingEvidence ? NSSize(width: 0, height: 4) : NSSize(width: 0, height: 17)
+                evidenceButton?.title = showingEvidence ? "释义" : "证据"
             }
-            if !sourceVolume.isEmpty || !sourcePage.isEmpty {
-                let pageText = sourcePage.isEmpty ? "" : "第 \(sourcePage) 页"
-                lines.append("出处：\([sourceVolume, pageText].filter { !$0.isEmpty }.joined(separator: " · "))")
+            if let evidenceButton {
+                accessory.addSubview(evidenceButton)
             }
-            if !alignmentStatus.isEmpty {
-                lines.append("对齐：\(Self.lookupAlignmentTitle(alignmentStatus))")
+        } else {
+            let noteButton = makeLookupActionButton(
+                title: "添加备注",
+                symbolName: "note.text",
+                frame: NSRect(x: 114, y: buttonY, width: 104, height: 30)
+            ) { [weak self] in
+                guard let self else { return }
+                if let sheet = self.window.attachedSheet {
+                    self.window.endSheet(sheet)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    self.showNotePanel(sentence: sentence, sentenceIndex: sentenceIndex)
+                }
             }
-            if !itemStatus.isEmpty {
-                lines.append("状态：\(Self.lookupStatusTitle(itemStatus))")
+            accessory.addSubview(noteButton)
+        }
+
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "关闭")
+
+        alert.beginSheetModal(for: window) { response in
+            _ = response
+            self.lookupActionTargets.removeAll()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.window.attachedSheet != nil else {
+                return
             }
-            if !occurrenceCount.isEmpty {
-                lines.append("本书出现：\(occurrenceCount) 次")
-            }
+            self.speakEnglish(displayWord)
+        }
+    }
+
+    private func showLookupEvidenceAlert(
+        bookID: String,
+        itemID: String,
+        word: String,
+        meaningSource: String,
+        sourceTitle: String,
+        sourceVolume: String,
+        sourcePage: String,
+        alignmentStatus: String,
+        itemStatus: String,
+        occurrenceCount: String,
+        representativeEN: String,
+        representativeZH: String,
+        reviewable: Bool
+    ) {
+        guard window.attachedSheet == nil else {
+            statusLabel.stringValue = "已有弹窗打开，证据未显示"
+            return
+        }
+
+        var lines: [String] = []
+        if !meaningSource.isEmpty {
+            lines.append("来源：\(Self.lookupMeaningSourceTitle(meaningSource))")
+        }
+        if !sourceTitle.isEmpty {
+            lines.append("批次：\(sourceTitle)")
+        }
+        if !sourceVolume.isEmpty || !sourcePage.isEmpty {
+            let pageText = sourcePage.isEmpty ? "" : "第 \(sourcePage) 页"
+            lines.append("出处：\([sourceVolume, pageText].filter { !$0.isEmpty }.joined(separator: " · "))")
+        }
+        if !alignmentStatus.isEmpty {
+            lines.append("对齐：\(Self.lookupAlignmentTitle(alignmentStatus))")
+        }
+        if !itemStatus.isEmpty {
+            lines.append("状态：\(Self.lookupStatusTitle(itemStatus))")
+        }
+        if !occurrenceCount.isEmpty {
+            lines.append("本书出现：\(occurrenceCount) 次")
         }
         if !representativeEN.isEmpty {
             lines.append("")
-            lines.append("英文例句：")
+            lines.append("英文上下文：")
             lines.append(representativeEN)
         }
         if !representativeZH.isEmpty {
             lines.append("")
-            lines.append("对应中文：")
+            lines.append("中文证据：")
             lines.append(representativeZH)
+        }
+        if lines.isEmpty {
+            lines.append("暂无更多证据。")
         }
 
         let alert = NSAlert()
-        alert.messageText = displayWord
-        alert.informativeText = meaning.isEmpty ? "书内上下文查词" : meaning
+        alert.messageText = "\(word) 的证据"
+        alert.informativeText = "这些信息用于复核，不作为默认查词内容。"
 
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 238))
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 220))
         let textView = NSTextView(frame: scroll.bounds)
         textView.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14)
         textView.string = lines.joined(separator: "\n")
@@ -4838,21 +5241,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         scroll.hasVerticalScroller = true
         alert.accessoryView = scroll
 
-        var actions: [(title: String, id: String)] = [
-            ("读词", "speak_word"),
-            ("读句", "speak_sentence"),
-        ]
-        if item == nil || !reviewable {
-            actions.append(("添加备注", "note"))
-        } else {
+        var actions: [(title: String, id: String)] = []
+        if reviewable && !itemID.isEmpty {
             actions.append(("复习", "reviewing"))
             actions.append(("掌握", "known"))
         }
         actions.append(("关闭", "close"))
         actions.forEach { alert.addButton(withTitle: $0.title) }
+        decorateLookupActionButtons(alert.buttons, actions: actions)
 
-        let itemID = Self.lookupText(item?["id"])
-        let speakSentence = representativeEN.isEmpty ? sentence : representativeEN
         alert.beginSheetModal(for: window) { response in
             let firstRaw = NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
             let actionIndex = response.rawValue - firstRaw
@@ -4860,21 +5257,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 return
             }
             switch actions[actionIndex].id {
-            case "speak_word":
-                self.speakEnglish(displayWord)
-            case "speak_sentence":
-                self.speakEnglish(speakSentence)
             case "reviewing", "known":
-                guard !itemID.isEmpty else {
-                    self.statusLabel.stringValue = "单词条目缺少 ID，状态未更新"
-                    return
-                }
-                self.updateVocabItemStatus(bookID: bookID, itemID: itemID, status: actions[actionIndex].id, word: displayWord)
-            case "note":
-                self.showNotePanel(sentence: sentence, sentenceIndex: sentenceIndex)
+                self.updateVocabItemStatus(bookID: bookID, itemID: itemID, status: actions[actionIndex].id, word: word)
             default:
                 break
             }
+        }
+    }
+
+    private func decorateLookupActionButtons(_ buttons: [NSButton], actions: [(title: String, id: String)]) {
+        guard #available(macOS 11.0, *) else {
+            return
+        }
+        for (button, action) in zip(buttons, actions) {
+            let symbolName: String?
+            switch action.id {
+            case "speak_word", "speak_meaning":
+                symbolName = "speaker.wave.2.fill"
+            case "evidence":
+                symbolName = "doc.text.magnifyingglass"
+            case "note":
+                symbolName = "note.text"
+            case "reviewing":
+                symbolName = "arrow.triangle.2.circlepath"
+            case "known":
+                symbolName = "checkmark.circle.fill"
+            case "close":
+                symbolName = "xmark.circle"
+            default:
+                symbolName = nil
+            }
+            if let symbolName,
+               let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: action.title) {
+                button.image = image
+                button.imagePosition = .imageLeading
+            }
+        }
+    }
+
+    private func playLookupAudioData(_ data: Data, status: String) -> Bool {
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        lookupAudioPlayer?.pause()
+        lookupAudioProcess?.terminate()
+        lookupAudioProcess = nil
+        do {
+            let audioURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("click-lookup-tts-\(UUID().uuidString)")
+                .appendingPathExtension("mp3")
+            try data.write(to: audioURL, options: .atomic)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
+            process.arguments = [audioURL.path]
+            process.terminationHandler = { _ in
+                try? FileManager.default.removeItem(at: audioURL)
+            }
+            try process.run()
+            lookupAudioProcess = process
+            statusLabel.stringValue = status
+            return true
+        } catch {
+            statusLabel.stringValue = "afplay 播放失败，尝试 App 内播放器：\(error.localizedDescription)"
+        }
+        if let sound = NSSound(data: data) {
+            lookupSoundPlayer?.stop()
+            sound.volume = 1.0
+            lookupSoundPlayer = sound
+            let ok = sound.play()
+            statusLabel.stringValue = ok ? status : "音频已生成，但 NSSound 未能启动"
+            if ok {
+                return true
+            }
+        }
+        do {
+            let player = try AVAudioPlayer(data: data)
+            player.prepareToPlay()
+            lookupAudioDataPlayer = player
+            let ok = player.play()
+            statusLabel.stringValue = ok ? status : "音频已生成，但播放器未能启动"
+            return ok
+        } catch {
+            statusLabel.stringValue = "音频播放失败：\(error.localizedDescription)"
+            return false
         }
     }
 
@@ -4884,12 +5347,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             statusLabel.stringValue = "没有可朗读的英文"
             return
         }
-        let utterance = AVSpeechUtterance(string: trimmed)
+        statusLabel.stringValue = "正在准备英文朗读"
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let audioData = readerAPI.lookupCachedTTSData(text: trimmed, voice: "en-US-BrianNeural")
+            DispatchQueue.main.async {
+                if let audioData,
+                   self.playLookupAudioData(audioData, status: "正在朗读英文：\(trimmed)") {
+                    return
+                } else {
+                    self.statusLabel.stringValue = "首次生成高质量读音，先用本机语音朗读：\(trimmed)"
+                    self.speakEnglishFallback(trimmed)
+                    DispatchQueue.global(qos: .utility).async {
+                        _ = readerAPI.lookupTTS(text: trimmed, voice: "en-US-BrianNeural")
+                    }
+                }
+            }
+        }
+    }
+
+    private func speakEnglishFallback(_ text: String) {
+        lookupAudioProcess?.terminate()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        process.arguments = ["-v", "Samantha", text]
+        do {
+            try process.run()
+            lookupAudioProcess = process
+            statusLabel.stringValue = "正在用本机语音朗读英文：\(text)"
+            return
+        } catch {
+            statusLabel.stringValue = "本机 say 启动失败，退回系统语音：\(error.localizedDescription)"
+        }
+        let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = 0.45
+        utterance.rate = 0.38
+        utterance.pitchMultiplier = 0.92
         speechSynthesizer.stopSpeaking(at: .immediate)
         speechSynthesizer.speak(utterance)
-        statusLabel.stringValue = "正在朗读：\(trimmed)"
+        statusLabel.stringValue = "正在朗读英文：\(text)"
+    }
+
+    private func speakChineseMeaning(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            statusLabel.stringValue = "没有可朗读的释义"
+            return
+        }
+        statusLabel.stringValue = "正在准备释义朗读"
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let audioData = readerAPI.lookupCachedTTSData(text: trimmed, voice: "zh-CN-YunjianNeural")
+            DispatchQueue.main.async {
+                if let audioData,
+                   self.playLookupAudioData(audioData, status: "正在朗读释义：\(trimmed)") {
+                    return
+                } else {
+                    self.statusLabel.stringValue = "首次生成高质量释义朗读，先用本机语音朗读"
+                    self.speakChineseFallback(trimmed)
+                    DispatchQueue.global(qos: .utility).async {
+                        _ = readerAPI.lookupTTS(text: trimmed, voice: "zh-CN-YunjianNeural")
+                    }
+                }
+            }
+        }
+    }
+
+    private func speakChineseFallback(_ text: String) {
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+        utterance.rate = 0.44
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        speechSynthesizer.speak(utterance)
+        statusLabel.stringValue = "正在朗读释义：\(text)"
     }
 
     private func updateVocabItemStatus(bookID: String, itemID: String, status: String, word: String) {
@@ -4960,6 +5488,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         case "dictionary_fallback": return "本地词典"
         case "lifestudy_context": return "本书语境"
         default: return source
+        }
+    }
+
+    private static func lookupPartOfSpeechTitle(primary: String, fallback: String) -> String {
+        let raw = primary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback : primary
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+        switch key {
+        case "n", "noun", "名词":
+            return "名词"
+        case "v", "verb", "动词":
+            return "动词"
+        case "adj", "a", "adjective", "形容词":
+            return "形容词"
+        case "adv", "adverb", "副词":
+            return "副词"
+        case "proper noun", "proper_noun", "专有名词":
+            return "专有名词"
+        case "noun or verb", "noun_or_verb", "名词或动词":
+            return "名词或动词"
+        case "adjective or noun", "adjective_or_noun", "形容词或名词":
+            return "形容词或名词"
+        case "prep", "preposition", "介词":
+            return "介词"
+        case "conj", "conjunction", "连词":
+            return "连词"
+        case "pron", "pronoun", "代词":
+            return "代词"
+        case "num", "numeral", "number", "数词":
+            return "数词"
+        case "interj", "interjection", "感叹词":
+            return "感叹词"
+        case "article", "art", "冠词":
+            return "冠词"
+        default:
+            return raw
+        }
+    }
+
+    private static func lookupPartOfSpeechShortTitle(primary: String, fallback: String) -> String {
+        let raw = primary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? fallback : primary
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ".", with: "")
+            .replacingOccurrences(of: "_", with: " ")
+            .lowercased()
+        switch key {
+        case "n", "noun", "名词":
+            return "n."
+        case "v", "verb", "动词":
+            return "v."
+        case "adj", "a", "adjective", "形容词":
+            return "adj."
+        case "adv", "adverb", "副词":
+            return "adv."
+        case "proper noun", "proper_noun", "专有名词":
+            return "prop. n."
+        case "noun or verb", "noun_or_verb", "名词或动词":
+            return "n./v."
+        case "adjective or noun", "adjective_or_noun", "形容词或名词":
+            return "adj./n."
+        case "prep", "preposition", "介词":
+            return "prep."
+        case "conj", "conjunction", "连词":
+            return "conj."
+        case "pron", "pronoun", "代词":
+            return "pron."
+        case "num", "numeral", "number", "数词":
+            return "num."
+        case "interj", "interjection", "感叹词":
+            return "interj."
+        case "article", "art", "冠词":
+            return "art."
+        default:
+            return raw
         }
     }
 
@@ -5034,7 +5638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             guard response == .alertFirstButtonReturn else {
                 return
             }
-            let updated = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            let updated = NoteTextNormalizer.normalized(textView.string)
             DispatchQueue.global(qos: .utility).async { [readerAPI = self.readerAPI] in
                 let ok = readerAPI.updateAnnotation(annotationID: annotationID, noteText: updated, color: nil)
                 DispatchQueue.main.async {
@@ -5106,6 +5710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         let chapterTitle = chapterTitles.indices.contains(currentChapterIndex) ? chapterTitles[currentChapterIndex] : nil
+        statusLabel.stringValue = "正在保存备注到 Reader API..."
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let annotationID = readerAPI.createAnnotation(
                 bookID: bookID,
@@ -5175,6 +5780,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                         for key in missingKeys {
                             self.redAnnotationIDs[key] = annotationID
                         }
+                        self.statusLabel.stringValue = "红标已保存到 Reader API"
+                    } else {
+                        self.statusLabel.stringValue = "红标保存失败，已恢复数据库状态"
+                        self.restoreAnnotationsForCurrentChapter()
                     }
                     self.refreshNotes()
                 }
@@ -5191,11 +5800,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            var allDeleted = true
             for annotationID in annotationIDs {
-                readerAPI.deleteAnnotation(annotationID: annotationID)
+                allDeleted = readerAPI.deleteAnnotation(annotationID: annotationID) && allDeleted
             }
             DispatchQueue.main.async {
+                self.statusLabel.stringValue = allDeleted ? "红标取消已保存到 Reader API" : "红标取消保存失败，已恢复数据库状态"
                 self.refreshNotes()
+                self.restoreAnnotationsForCurrentChapter()
             }
         }
     }
@@ -5332,6 +5944,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           transform-style: preserve-3d !important;
           backface-visibility: hidden !important;
         }
+        #sr-page-surface, #sr-page-surface * {
+          box-sizing: border-box !important;
+          max-width: 100% !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+        }
+        #sr-page-surface p, #sr-page-surface li, #sr-page-surface blockquote,
+        #sr-page-surface div, #sr-page-surface section, #sr-page-surface article {
+          min-width: 0 !important;
+        }
+        #sr-page-surface table {
+          width: 100% !important;
+          max-width: 100% !important;
+          table-layout: fixed !important;
+          border-collapse: collapse !important;
+        }
+        #sr-page-surface td, #sr-page-surface th {
+          width: auto !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+        }
+        #sr-page-surface pre, #sr-page-surface code {
+          white-space: pre-wrap !important;
+          overflow-wrap: anywhere !important;
+        }
         @media (min-width: 1180px) {
           #sr-page-surface {
             padding-left: var(--sr-wide-page-margin-x) !important;
@@ -5339,6 +5978,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             column-width: calc((100vw - var(--sr-wide-width-subtract)) / 2) !important;
             column-gap: var(--sr-wide-column-gap) !important;
           }
+        }
+        body.sr-large-font #sr-page-surface {
+          padding-left: var(--sr-page-margin-x) !important;
+          padding-right: var(--sr-page-margin-x) !important;
+          column-width: calc(100vw - var(--sr-page-width-subtract)) !important;
+          column-gap: var(--sr-column-gap) !important;
         }
         #sr-page-flip-overlay {
           position: fixed !important;
@@ -5415,8 +6060,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           break-inside: avoid !important;
         }
         div.right, #main1 {
-          text-align: center !important;
-          break-inside: avoid !important;
+          display: block !important;
+          float: none !important;
+          width: auto !important;
+          min-width: 0 !important;
+          max-width: 100% !important;
+          text-align: left !important;
+          break-inside: auto !important;
         }
         * {
           color: var(--sr-text) !important;
@@ -5426,6 +6076,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         p, li, blockquote, div { line-height: var(--sr-line-height) !important; }
         .sr-sentence { border-radius: 3px !important; cursor: text !important; }
         .sr-sentence.sr-focused { background: var(--sr-focus-bg) !important; box-shadow: 0 0 0 1px var(--sr-focus-ring) inset !important; }
+        .sr-word-focused {
+          border-radius: .24em !important;
+          background: rgba(0, 122, 255, .34) !important;
+          box-shadow: 0 0 0 1.5px rgba(98, 180, 255, .88) inset, 0 0 0 1px rgba(10, 132, 255, .32) !important;
+          padding: 0 .08em !important;
+          margin: 0 -.08em !important;
+          color: inherit !important;
+        }
         .sr-sentence.sr-note { cursor: pointer !important; text-decoration-line: underline !important; text-decoration-style: dotted !important; text-decoration-color: rgba(96, 165, 250, .95) !important; text-underline-offset: .18em !important; }
         .sr-sentence.sr-red, .sr-sentence.sr-red.sr-focused { background: rgba(255, 59, 48, .62) !important; color: #fff !important; box-shadow: 0 0 0 1px rgba(255, 170, 160, .72) inset !important; }
       `;
@@ -5436,8 +6094,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const root = document.documentElement;
         const theme = settings.theme === 'warm' ? 'warm' : 'dark';
         const fontSize = Math.max(15, Math.min(28, Number(settings.fontSize) || 18));
-        const lineHeight = Math.max(1.45, Math.min(2.05, Number(settings.lineHeight) || 1.72));
-        const marginX = Math.max(4, Math.min(40, Number(settings.marginX) || 10));
+        const lineHeight = Math.max(1.2, Math.min(2.05, Number(settings.lineHeight) || 1.58));
+        const marginX = Math.max(2, Math.min(40, Number(settings.marginX) || 8));
         const columnGap = marginX * 2;
         const wideMargin = marginX + 2;
         const wideGap = wideMargin * 2;
@@ -5453,6 +6111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         root.style.setProperty('--sr-wide-page-margin-x', wideMargin + 'px');
         root.style.setProperty('--sr-wide-width-subtract', ((wideMargin * 2) + wideGap) + 'px');
         root.style.setProperty('--sr-wide-column-gap', wideGap + 'px');
+        document.body.classList.toggle('sr-large-font', fontSize >= 24);
         if (typeof applyPage === 'function') {
           invalidatePagination();
           pageIndex = Math.max(0, Math.min(pageIndex, maxPageIndex()));
@@ -5874,6 +6533,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           selection.removeAllRanges();
         }
       }
+      function clearWordFocus() {
+        document.querySelectorAll('.sr-word-focused').forEach(function (node) {
+          const parent = node.parentNode;
+          if (!parent) { return; }
+          while (node.firstChild) {
+            parent.insertBefore(node.firstChild, node);
+          }
+          parent.removeChild(node);
+          if (parent.normalize) { parent.normalize(); }
+        });
+      }
       function selectedEnglishWord() {
         const selection = window.getSelection ? window.getSelection() : null;
         const text = selection ? String(selection.toString() || '').replace(/\\s+/g, ' ').trim() : '';
@@ -5898,10 +6568,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         return null;
       }
-      function wordFromRange(range) {
-        if (!range || !range.startContainer || range.startContainer.nodeType !== Node.TEXT_NODE) { return ''; }
+      function wordHitFromRange(range) {
+        if (!range || !range.startContainer || range.startContainer.nodeType !== Node.TEXT_NODE) { return null; }
         const text = range.startContainer.nodeValue || '';
-        if (!text) { return ''; }
+        if (!text) { return null; }
         function isWordChar(character) {
           return /[A-Za-z'-]/.test(character || '');
         }
@@ -5909,18 +6579,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (cursor > 0 && !isWordChar(text.charAt(cursor)) && isWordChar(text.charAt(cursor - 1))) {
           cursor -= 1;
         }
-        if (!isWordChar(text.charAt(cursor))) { return ''; }
+        if (!isWordChar(text.charAt(cursor))) { return null; }
         let start = cursor;
         let end = cursor;
         while (start > 0 && isWordChar(text.charAt(start - 1))) { start -= 1; }
         while (end < text.length && isWordChar(text.charAt(end))) { end += 1; }
         const word = text.slice(start, end).replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, '');
-        return /^[A-Za-z][A-Za-z'-]*$/.test(word) ? word : '';
+        return /^[A-Za-z][A-Za-z'-]*$/.test(word)
+          ? { word: word, node: range.startContainer, start: start, end: end }
+          : null;
+      }
+      function wordFromRange(range) {
+        const hit = wordHitFromRange(range);
+        return hit ? hit.word : '';
+      }
+      function lookupWordHitFromEvent(event) {
+        const selected = selectedEnglishWord();
+        if (selected) { return { word: selected, node: null, start: 0, end: 0 }; }
+        return wordHitFromRange(caretRangeFromEvent(event));
       }
       function lookupWordFromEvent(event) {
-        const selected = selectedEnglishWord();
-        if (selected) { return selected; }
-        return wordFromRange(caretRangeFromEvent(event));
+        const hit = lookupWordHitFromEvent(event);
+        return hit ? hit.word : '';
+      }
+      function focusWordHit(hit) {
+        clearWordFocus();
+        if (!hit || !hit.node || hit.node.nodeType !== Node.TEXT_NODE) { return false; }
+        try {
+          const range = document.createRange();
+          range.setStart(hit.node, hit.start);
+          range.setEnd(hit.node, hit.end);
+          const span = document.createElement('span');
+          span.className = 'sr-word-focused';
+          range.surroundContents(span);
+          range.detach && range.detach();
+          return true;
+        } catch (error) {
+          return false;
+        }
       }
       function toggleRedSentences(sentences, event) {
         if (event) { claimSentenceEvent(event); }
@@ -5954,11 +6650,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       }
       function toggleRed(sentence, event) {
         if (event) { event.preventDefault(); event.stopPropagation(); }
+        if (sentence) {
+          return toggleRedSentences([sentence], event);
+        }
         const selected = selectedSentences();
         if (selected.length) {
           return toggleRedSentences(selected, event);
         }
-        sentence = sentence || fallbackSentence();
+        sentence = fallbackSentence();
         if (!sentence) { return false; }
         return toggleRedSentences([sentence], event);
       }
@@ -6050,15 +6749,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (shouldLetSystemHandle(event)) { return; }
         const sentence = sentenceFromTarget(event.target);
         if (sentence) {
-          focus(sentence);
+          const hit = lookupWordHitFromEvent(event);
           if (notePreviewTimer) { window.clearTimeout(notePreviewTimer); }
-          const word = lookupWordFromEvent(event);
+          if (hit && hit.word) {
+            claimSentenceEvent(event);
+            focusWordHit(hit);
+            notePreviewTimer = 0;
+            post({ type: 'lookup', word: hit.word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+            return;
+          }
+          clearWordFocus();
+          focus(sentence);
           notePreviewTimer = window.setTimeout(function () {
             notePreviewTimer = 0;
-            if (word) {
-              post({ type: 'lookup', word: word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
-              return;
-            }
             if (sentence.classList.contains('sr-note')) {
               postNotePreview(sentence);
             }
@@ -6074,10 +6777,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const sentence = sentenceFromTarget(event.target) || fallbackSentence();
         if (!sentence) { return; }
         claimSentenceEvent(event);
+        clearWordFocus();
         focus(sentence);
-        const word = event.altKey ? lookupWordFromEvent(event) : '';
-        if (word) {
-          post({ type: 'lookup', word: word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+        const hit = event.altKey ? lookupWordHitFromEvent(event) : null;
+        if (hit && hit.word) {
+          focusWordHit(hit);
+          post({ type: 'lookup', word: hit.word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
           return;
         }
         post({ type: 'note', text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });

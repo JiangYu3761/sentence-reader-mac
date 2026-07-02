@@ -46,7 +46,7 @@ APK_SOURCE="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
 DESKTOP_DIR="${DESKTOP_DIR:-$HOME/Desktop}"
 BACKUP_DIR="${CLICK_ANDROID_APK_DIR:-$DESKTOP_DIR/夸克备份}"
 STAMP="$(date +%Y%m%d)"
-APK_TARGET="$BACKUP_DIR/Click-Android-MobileWorkspace-debug-$STAMP.apk"
+APK_TARGET="$BACKUP_DIR/LocalWorkspace-Android-debug-$STAMP.apk"
 SHA_TARGET="$APK_TARGET.sha256"
 
 if [ ! -f "$APK_SOURCE" ]; then
