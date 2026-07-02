@@ -916,6 +916,20 @@ final class ReaderAPIClient {
         request(method: "PATCH", path: "/books/\(bookID)/vocab/\(itemID)", body: ["status": status]) != nil
     }
 
+    func correctLookupMeaning(bookID: String, word: String, meaning: String, sentenceIndex: String?, sentence: String?) -> [String: Any]? {
+        var body: [String: Any] = [
+            "word": word,
+            "meaning_zh": meaning,
+        ]
+        if let sentenceIndex, !sentenceIndex.isEmpty {
+            body["sentence_id"] = sentenceIndex
+        }
+        if let sentence, !sentence.isEmpty {
+            body["sentence"] = sentence
+        }
+        return request(method: "POST", path: "/books/\(bookID)/lookup-corrections", body: body) as? [String: Any]
+    }
+
     func createLookupEvent(bookID: String, surface: String, lemma: String?, sentenceIndex: String?, sentence: String?) {
         var context: [String: Any] = [:]
         if let sentenceIndex, !sentenceIndex.isEmpty {
@@ -5112,7 +5126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let readMeaningButton = makeLookupActionButton(
             title: "读释义",
             symbolName: "text.bubble.fill",
-            frame: NSRect(x: 0, y: buttonY, width: 104, height: 30)
+            frame: NSRect(x: 0, y: buttonY, width: 92, height: 30)
         ) { [weak self] in
             self?.speakChineseMeaning(speakMeaning)
         }
@@ -5124,7 +5138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             evidenceButton = makeLookupActionButton(
                 title: "证据",
                 symbolName: "doc.text.magnifyingglass",
-                frame: NSRect(x: 114, y: buttonY, width: 94, height: 30)
+                frame: NSRect(x: 100, y: buttonY, width: 82, height: 30)
             ) {
                 showingEvidence.toggle()
                 textView.string = showingEvidence ? evidenceLines.joined(separator: "\n") : meaningLines.joined(separator: "\n")
@@ -5143,7 +5157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             let noteButton = makeLookupActionButton(
                 title: "添加备注",
                 symbolName: "note.text",
-                frame: NSRect(x: 114, y: buttonY, width: 104, height: 30)
+                frame: NSRect(x: 100, y: buttonY, width: 104, height: 30)
             ) { [weak self] in
                 guard let self else { return }
                 if let sheet = self.window.attachedSheet {
@@ -5155,6 +5169,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
             accessory.addSubview(noteButton)
         }
+
+        let correctionButton = makeLookupActionButton(
+            title: "纠错",
+            symbolName: "pencil",
+            frame: NSRect(x: 214, y: buttonY, width: 84, height: 30)
+        ) { [weak self] in
+            guard let self else { return }
+            if let sheet = self.window.attachedSheet {
+                self.window.endSheet(sheet)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.showLookupCorrectionPanel(
+                    bookID: bookID,
+                    word: displayWord,
+                    currentMeaning: meaning,
+                    sentence: sentence,
+                    sentenceIndex: sentenceIndex
+                )
+            }
+        }
+        accessory.addSubview(correctionButton)
 
         alert.accessoryView = accessory
         alert.addButton(withTitle: "关闭")
@@ -5168,6 +5203,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 return
             }
             self.speakEnglish(displayWord)
+        }
+    }
+
+    private func showLookupCorrectionPanel(
+        bookID: String,
+        word: String,
+        currentMeaning: String,
+        sentence: String,
+        sentenceIndex: String
+    ) {
+        guard window.attachedSheet == nil else {
+            statusLabel.stringValue = "已有弹窗打开，暂不能保存纠错"
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "修正释义"
+        alert.informativeText = word
+
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 110))
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.font = NSFont(name: "Microsoft YaHei", size: 16) ?? NSFont.systemFont(ofSize: 16)
+        textView.string = currentMeaning
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        alert.accessoryView = scroll
+
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else {
+                return
+            }
+            let nextMeaning = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nextMeaning.isEmpty else {
+                self.statusLabel.stringValue = "释义不能为空"
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let updated = self.readerAPI.correctLookupMeaning(
+                    bookID: bookID,
+                    word: word,
+                    meaning: nextMeaning,
+                    sentenceIndex: sentenceIndex,
+                    sentence: sentence
+                )
+                DispatchQueue.main.async {
+                    guard let updated else {
+                        self.statusLabel.stringValue = "纠错保存失败"
+                        return
+                    }
+                    self.statusLabel.stringValue = "已保存纠错：\(word)"
+                    self.showLookupAlert(
+                        bookID: bookID,
+                        word: word,
+                        sentence: sentence,
+                        sentenceIndex: sentenceIndex,
+                        payload: ["item": updated]
+                    )
+                }
+            }
         }
     }
 

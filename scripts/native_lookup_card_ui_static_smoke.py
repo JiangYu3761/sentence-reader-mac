@@ -44,9 +44,12 @@ def extract_function(text: str, name: str) -> str:
 def main() -> int:
     text = NATIVE_READER.read_text(encoding="utf-8")
     show_lookup = extract_function(text, "showLookupAlert")
+    show_correction = extract_function(text, "showLookupCorrectionPanel")
     show_evidence = extract_function(text, "showLookupEvidenceAlert")
 
     for marker in [
+        "func correctLookupMeaning(bookID: String, word: String, meaning: String, sentenceIndex: String?, sentence: String?) -> [String: Any]?",
+        "path: \"/books/\\(bookID)/lookup-corrections\"",
         "func lookupTTS(text: String, voice: String? = nil) -> URL?",
         "func lookupTTSData(text: String, voice: String? = nil) -> Data?",
         "func lookupCachedTTSData(text: String, voice: String? = nil) -> Data?",
@@ -102,6 +105,9 @@ def main() -> int:
         "DispatchQueue.main.asyncAfter(deadline: .now() + 0.25)",
         "title: \"读释义\"",
         "title: \"证据\"",
+        "title: \"纠错\"",
+        "symbolName: \"pencil\"",
+        "showLookupCorrectionPanel(",
         "textView.alignment = .center",
         "textView.textContainerInset = NSSize(width: 0, height: 17)",
         "speakChineseMeaning",
@@ -109,6 +115,17 @@ def main() -> int:
         "alert.addButton(withTitle: \"关闭\")",
     ]:
         require(show_lookup, marker)
+
+    for marker in [
+        "alert.messageText = \"修正释义\"",
+        "alert.addButton(withTitle: \"保存\")",
+        "alert.addButton(withTitle: \"取消\")",
+        "correctLookupMeaning(",
+        "已保存纠错",
+        "纠错保存失败",
+        "payload: [\"item\": updated]",
+    ]:
+        require(show_correction, marker)
 
     for forbidden in [
         "(\"读句\", \"speak_sentence\")",
