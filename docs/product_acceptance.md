@@ -30,7 +30,7 @@ Sentence Reader is accepted as a daily-use local reading product when these work
 - Keep the interaction-router contract stable: sentence-level gestures win on sentence text; editing fields and controls still keep system behavior.
 - Use single-click/single-tap on an English word for lookup, double-click/double-tap for sentence notes, Mac two-finger tap for whole-sentence red highlight, the iPad bottom action bar for red highlight, `Command+C` for copying selected text, and `Option` + double-click as a backup word-lookup path on pointer devices.
 - English lookup must fall back to the general dictionary even when the current book has not generated a book-local vocabulary list.
-- If book/domain/local dictionary lookup misses, English lookup may use the Mac-side Hermes/Qwen online fallback, save an `online_lookup` vocab item to the current book, and let the user correct the meaning inline without leaving the lookup card.
+- If book/domain/local dictionary lookup misses, daily English lookup must not call a model by default. The Mac-side Hermes/Qwen fallback is available only when `SENTENCE_READER_ENABLE_HERMES_ONLINE_LOOKUP=1`; normal lookup pressure should stay on the local open ECDICT-compatible dictionary and user corrections.
 - User-corrected lookup meanings must be saved into the current book glossary with `source='user'` and must take priority over dictionary and online lookup results.
 - English phrase lookup must preserve selected phrases such as `tree of life` instead of collapsing them into a single unusable token.
 - Life-study context meanings must stay book/domain-scoped and must not be imported into the general dictionary.

@@ -55,6 +55,10 @@ LOOKUP_TTS_DIR = Path(
         str(Path.home() / "Library" / "Application Support" / "Click" / "ReaderTTS"),
     )
 )
+ENABLE_HERMES_ONLINE_LOOKUP = os.getenv(
+    "SENTENCE_READER_ENABLE_HERMES_ONLINE_LOOKUP",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 VOICE_NOTE_PENDING_TEXT = "语音转写中..."
 VOICE_NOTE_FAILED_TEXT = "语音已保存，转写失败，可稍后重试。"
 
@@ -3031,18 +3035,39 @@ def ensure_dictionary_vocab_item(conn: Any, book_id: str, clean_word: str, dicti
         )
         ON CONFLICT (book_id, lemma, surface) DO UPDATE
         SET lexeme_id = EXCLUDED.lexeme_id,
+            context_meaning = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN EXCLUDED.context_meaning
+                ELSE reader.book_vocab_items.context_meaning
+            END,
             meaning_source = CASE
-                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') = 'none'
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
                 THEN 'dictionary_fallback'
                 ELSE reader.book_vocab_items.meaning_source
             END,
             alignment_status = CASE
-                WHEN COALESCE(reader.book_vocab_items.alignment_status, 'unknown') = 'unknown'
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                  OR COALESCE(reader.book_vocab_items.alignment_status, 'unknown') = 'unknown'
                 THEN 'dictionary_fallback'
                 ELSE reader.book_vocab_items.alignment_status
             END,
-            alignment_reason = COALESCE(reader.book_vocab_items.alignment_reason, EXCLUDED.alignment_reason),
-            metadata = reader.book_vocab_items.metadata || EXCLUDED.metadata,
+            alignment_reason = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') IN ('none', 'dictionary_fallback', 'online_lookup')
+                THEN EXCLUDED.alignment_reason
+                ELSE COALESCE(reader.book_vocab_items.alignment_reason, EXCLUDED.alignment_reason)
+            END,
+            metadata = CASE
+                WHEN COALESCE(reader.book_vocab_items.meaning_source, 'none') = 'online_lookup'
+                THEN (
+                    COALESCE(reader.book_vocab_items.metadata, '{}'::jsonb)
+                    - 'online_lookup'
+                    - 'provider'
+                    - 'confidence'
+                    - 'generated_at'
+                    - 'definition_en'
+                ) || EXCLUDED.metadata
+                ELSE COALESCE(reader.book_vocab_items.metadata, '{}'::jsonb) || EXCLUDED.metadata
+            END,
             updated_at = now()
         RETURNING id
         """,
@@ -3072,6 +3097,8 @@ def ensure_dictionary_vocab_item(conn: Any, book_id: str, clean_word: str, dicti
 
 
 def query_online_word_meaning(clean_word: str, sentence: Optional[str]) -> Optional[dict[str, Any]]:
+    if not ENABLE_HERMES_ONLINE_LOOKUP:
+        return None
     word = clean_vocab_word(clean_word)
     if not word:
         return None
@@ -3546,6 +3573,16 @@ def lookup_book_word(
         item_payload = None
         if item:
             item_dict = dict(item)
+            if (
+                not ENABLE_HERMES_ONLINE_LOOKUP
+                and str(item_dict.get("meaning_source") or "") == "online_lookup"
+                and len(normalized_lookup.split()) <= 1
+            ):
+                dictionary = find_dictionary_entry(conn, clean_word)
+                if dictionary:
+                    vocab_id = ensure_dictionary_vocab_item(conn, book_id, clean_word, dictionary)
+                    item = selected_vocab_row(conn, book_id, vocab_id)
+                    item_dict = dict(item)
             item_payload = item_dict if "context_meaning_zh" in item_dict else vocab_row(item_dict)
             if domain_item:
                 current_source = str(item_payload.get("meaning_source") or "")
