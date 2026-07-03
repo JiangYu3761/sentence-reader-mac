@@ -53,8 +53,14 @@ def main() -> int:
         SWIFT,
         COMMON_MARKERS
         + [
-            "return toggleRed(sentenceFromTarget(event.target), event);",
+            "return toggleRedFromSecondaryEvent(event);",
+            "function toggleRedFromSecondaryEvent(event)",
+            "lastSecondaryRedAt",
+            "lastSecondaryRedIndex",
+            "now - lastSecondaryRedAt < 320",
             "if (sentence) {\n          return toggleRedSentences([sentence], event);\n        }",
+            "document.addEventListener('mousedown', function (event) {\n        if (!event || event.button !== 2) { return; }\n        return toggleRedFromSecondaryEvent(event);",
+            "document.addEventListener('auxclick', function (event) {\n        if (!event || event.button !== 2) { return; }\n        return toggleRedFromSecondaryEvent(event);",
             "english-click-lookup",
             "installApplicationMenu",
             "退出 Sentence Reader",
@@ -120,10 +126,6 @@ def main() -> int:
     forbidden_swift_markers = [
         ".rightMouseDown",
         "__sentenceReaderToggleRedAtPoint",
-        "toggleRedFromSecondaryEvent",
-        "lastSecondaryRedAt",
-        "document.addEventListener('mousedown'",
-        "document.addEventListener('auxclick'",
     ]
     present_forbidden = [marker for marker in forbidden_swift_markers if marker in swift_text]
     if present_forbidden:

@@ -6369,6 +6369,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       let notePreviewTimer = 0;
       let pageIndex = 0;
       let cachedContentWidth = 0;
+      let lastSecondaryRedAt = 0;
+      let lastSecondaryRedIndex = '';
       let wheelGestureDirection = 0;
       let wheelGestureDistance = 0;
       let lastWheelEventAt = 0;
@@ -6767,6 +6769,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (!sentence) { return false; }
         return toggleRedSentences([sentence], event);
       }
+      function toggleRedFromSecondaryEvent(event) {
+        if (shouldLetSystemHandleContext(event)) { return true; }
+        const sentence = sentenceFromTarget(event && event.target);
+        if (!sentence) { return true; }
+        const now = Date.now();
+        const index = sentence.dataset.srIndex || '';
+        if (index && lastSecondaryRedIndex === index && now - lastSecondaryRedAt < 320) {
+          claimSentenceEvent(event);
+          return false;
+        }
+        lastSecondaryRedAt = now;
+        lastSecondaryRedIndex = index;
+        return toggleRed(sentence, event);
+      }
       function undoLast() {
         const action = undoStack.pop();
         if (!action) {
@@ -6893,13 +6909,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         post({ type: 'note', text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
       }, true);
+      document.addEventListener('mousedown', function (event) {
+        if (!event || event.button !== 2) { return; }
+        return toggleRedFromSecondaryEvent(event);
+      }, true);
+      document.addEventListener('auxclick', function (event) {
+        if (!event || event.button !== 2) { return; }
+        return toggleRedFromSecondaryEvent(event);
+      }, true);
       document.addEventListener('contextmenu', function (event) {
-        if (shouldLetSystemHandleContext(event)) { return true; }
-        return toggleRed(sentenceFromTarget(event.target), event);
+        return toggleRedFromSecondaryEvent(event);
       }, true);
       document.oncontextmenu = function (event) {
-        if (shouldLetSystemHandleContext(event)) { return true; }
-        return toggleRed(sentenceFromTarget(event.target), event);
+        return toggleRedFromSecondaryEvent(event);
       };
 
       wrap();
