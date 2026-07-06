@@ -32,6 +32,25 @@ MAC_VOICE_PIPELINE_ID = "mac.local_audio.funasr.v1"
 EDGE_TTS_VOICE = "zh-CN-YunjianNeural"
 HERMES_RUNTIME_BASE_URL = os.getenv("CLICK_HERMES_RUNTIME_BASE_URL", "http://127.0.0.1:8765")
 FUNASR_BASE_URL = os.getenv("CLICK_FUNASR_BASE_URL", "http://127.0.0.1:18081")
+UI_PREFERENCE_COOKIE = "click_ui"
+LEGACY_LITE_UA_PATTERNS = (
+    r"\bKaiOS\b",
+    r"\bOpera Mini\b",
+    r"\bOpera Mobi/12\b",
+    r"\bUC ?Browser/(?:[1-9]|10|11)\.",
+    r"\bUCBrowser/(?:[1-9]|10|11)\.",
+    r"\bAndroid [1-4](?:[\.;]|$)",
+    r"\bCPU (?:iPhone )?OS [1-9]_",
+    r"\bCPU OS [1-9]_",
+    r"\bSeries40\b",
+    r"\bSymbian\b",
+    r"\bBlackBerry\b",
+    r"\bBB10\b",
+    r"\bIEMobile\b",
+    r"\bWindows Phone (?:7|8)\b",
+    r"\bMSIE (?:6|7|8|9|10)\.",
+    r"\bNetFront\b",
+)
 NOTE_SPOKEN_PUNCTUATION = [
     ("新的一行", "\n"),
     ("另起一行", "\n"),
@@ -62,6 +81,52 @@ def normalize_note_text(raw_text: str) -> str:
     if not text or text[-1] in NOTE_CLOSING_PUNCTUATION:
         return text
     return text + ("." if re.search(r"[A-Za-z]", text) and not re.search(r"[\u4e00-\u9fff]", text) else "。")
+
+
+def request_ui_preference(request: Request) -> str:
+    explicit = str(request.query_params.get("ui") or "").strip().lower()
+    if explicit in {"lite", "modern"}:
+        return explicit
+    cookie_value = str(request.cookies.get(UI_PREFERENCE_COOKIE) or "").strip().lower()
+    if cookie_value in {"lite", "modern"}:
+        return cookie_value
+    return ""
+
+
+def is_high_confidence_legacy_ua(user_agent: str) -> bool:
+    ua = str(user_agent or "")
+    if not ua:
+        return False
+    return any(re.search(pattern, ua, flags=re.IGNORECASE) for pattern in LEGACY_LITE_UA_PATTERNS)
+
+
+def should_use_lite_ui(request: Request) -> bool:
+    preference = request_ui_preference(request)
+    if preference == "modern":
+        return False
+    if preference == "lite":
+        return True
+    return is_high_confidence_legacy_ua(request.headers.get("user-agent", ""))
+
+
+def apply_lite_ui_cookie(response: HTMLResponse, request: Request) -> HTMLResponse:
+    explicit = str(request.query_params.get("ui") or "").strip().lower()
+    if explicit in {"lite", "modern"}:
+        response.set_cookie(UI_PREFERENCE_COOKIE, explicit, httponly=False, samesite="lax")
+    return response
+
+
+def modern_capability_guard(redirect_path: str) -> str:
+    target = json.dumps(redirect_path, ensure_ascii=False)
+    return f"""<script>
+(function(){{
+  var forcedModern = /(?:^|[?&])ui=modern(?:&|$)/.test(window.location.search || '');
+  var ok = !!(window.Promise && window.fetch && document.querySelector && window.addEventListener);
+  if (!forcedModern && !ok) {{
+    window.location.replace({target});
+  }}
+}}());
+</script>"""
 
 
 class RecordingCreate(BaseModel):
@@ -1349,6 +1414,7 @@ def home_html() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>本地工作台</title>
+  __CLICK_MODERN_CAPABILITY_GUARD__
   <style>
     :root{color-scheme:dark;background:#050505;color:#f6f0e8;font-family:-apple-system,BlinkMacSystemFont,"Microsoft YaHei",sans-serif}
     body{margin:0;min-height:100vh;background:#050505}
@@ -1382,6 +1448,37 @@ fetch('/v1/mobile/diagnostics').then(r=>r.json()).then(d=>{
   document.getElementById('diag').textContent=`Reader ${d.reader_api.ok?'可用':'异常'} · 录音 ${d.recordings.ok?'可用':'异常'} · Hermes ${d.hermes.ok?'可用':'未连接'} · FunASR ${d.funasr.ok?'可用':'未连接'}`;
 }).catch(()=>{document.getElementById('diag').textContent='诊断暂时不可用'});
 </script>
+</body>
+</html>
+""".replace("__CLICK_MODERN_CAPABILITY_GUARD__", modern_capability_guard("/home-lite?reason=capability"))
+
+
+def home_lite_html() -> str:
+    return """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>本地工作台 Lite</title>
+  <style>
+    body{margin:0;background:#080806;color:#f6f0e8;font-family:Arial,"Microsoft YaHei",sans-serif}
+    main{max-width:620px;margin:0 auto;padding:22px 16px 32px}
+    h1{font-size:30px;margin:0 0 8px}
+    p{font-size:16px;line-height:1.5;color:#c8bfae;margin:0 0 18px}
+    a{display:block;margin:12px 0;padding:18px 16px;border:1px solid #373225;background:#17150f;color:#f6f0e8;text-decoration:none;font-size:24px;font-weight:800}
+    small{display:block;font-size:14px;line-height:1.35;color:#b9ae9e;font-weight:400;margin-top:6px}
+    .primary{background:#f0d36b;color:#15120a}
+  </style>
+</head>
+<body>
+<main>
+  <h1>本地工作台 Lite</h1>
+  <p>旧设备兜底入口。这里只保留阅读、录音、Hermes 三个入口。</p>
+  <a class="primary" href="/library-lite">阅读<small>打开 Lite 书库和核心阅读功能</small></a>
+  <a href="/recordings">录音<small>继续使用现有录音页面</small></a>
+  <a href="/hermes">Hermes<small>继续使用现有 Hermes 页面</small></a>
+</main>
 </body>
 </html>
 """
@@ -1502,12 +1599,19 @@ def html_response_with_access_cookies(content: str, request: Request) -> HTMLRes
         response.set_cookie("click_device_id", device_id, httponly=False, samesite="lax")
     if access_token:
         response.set_cookie("click_access_token", access_token, httponly=False, samesite="lax")
-    return response
+    return apply_lite_ui_cookie(response, request)
 
 
 @router.get("/home", response_class=HTMLResponse)
 def mobile_home(request: Request) -> HTMLResponse:
+    if should_use_lite_ui(request):
+        return html_response_with_access_cookies(home_lite_html(), request)
     return html_response_with_access_cookies(home_html(), request)
+
+
+@router.get("/home-lite", response_class=HTMLResponse)
+def mobile_home_lite(request: Request) -> HTMLResponse:
+    return html_response_with_access_cookies(home_lite_html(), request)
 
 
 @router.get("/recordings", response_class=HTMLResponse)

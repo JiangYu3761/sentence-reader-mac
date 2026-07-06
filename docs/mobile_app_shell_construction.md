@@ -34,6 +34,45 @@ Hermes
 
 阅读继续走现有 `/library` 和 `/lan/reader`。录音走 `/recordings` 并保存到独立 `~/Documents/Recordings` 总仓库。Hermes 走 `/hermes`，通过 Mac 本地同源入口转发到 Hermes Runtime。具体边界见 `docs/hermes_mobile_gateway_construction.md`。
 
+## 旧设备 Lite 兜底
+
+2026-07-04 增加了 Click Mobile/Web 老设备 Lite 自动分流。它的目标是让少数旧机器或功能机可以打开核心阅读功能，而不是降低现代 iPhone、iPad、Android WebView 的体验。
+
+分流规则保持保守：
+
+- 默认进入现代 `/home`、`/library`、`/lan/reader`。
+- `?ui=modern` 强制现代版，并写入 `click_ui=modern` cookie。
+- `?ui=lite` 强制 Lite 版，并写入 `click_ui=lite` cookie。
+- 只有 KaiOS、Opera Mini、老 UC、Android 4.x 及以下、旧 iOS Safari、Windows Phone 等高置信旧设备 UA 才自动进入 Lite。
+- 现代页最前置 ES5 能力检测缺少 `fetch` / `Promise` / `querySelector` / `addEventListener` 时才跳到 Lite。
+- 不用宽泛的 `Mobile` / `Safari` / `Chrome` 规则，避免新机器误跳。
+
+Lite 路由：
+
+```text
+/home-lite
+/library-lite
+/reader-lite
+/reader-lite/toc
+POST /reader-lite/red
+POST /reader-lite/note
+POST /reader-lite/audio-note
+```
+
+Lite 首页仍然只有三个入口：
+
+```text
+阅读 -> /library-lite
+录音 -> /recordings
+Hermes -> /hermes
+```
+
+Lite 阅读器只换旧设备前端呈现，不改 Reader API schema，不改 PostgreSQL 表结构。它按 EPUB/Readium 的 `spine` / `toc` / `readingOrder` 思路分层：Lite Manifest 只生成轻量阅读清单，Lite TOC 只显示目录，不逐章打开正文；Lite 正文页只在打开指定章节时提取正文，并跳过 EPUB 页内的 `上一篇 / 回目录 / 下一篇` 导航块。用户从目录点第几篇，就进入第几篇，不再因为正文里出现“回目录”而跳回目录或简介。
+
+默认 Lite 阅读页只显示正文：不显示书库入口、目录入口、书名、章节名、页码说明或“已跳过”提示。正文采用屏幕分页：服务端提供整章句子和稳定 sentence id，前端用 ES5 JS 根据当前屏幕高度、正文宽度、字体和行距逐句测量，屏幕能容纳多少句就显示多少句，并为旧浏览器底部导航栏预留安全区，避免最后一行被遮挡。左右贴边热区和左右滑动用于上一页/下一页；到本章边界时再进入上一章/下一章。目录仍保留在独立 `/reader-lite/toc` 页面，从目录点第几篇就进入第几篇。默认页面不提前铺开标红、备注、语音备注表单；用户点选某一句后，才在该句附近显示一行式标红、文字备注和语音备注入口。标红/取消标红是瞬时动作，完成后退出选中态并回到阅读；文字备注和语音备注保留选中态，便于继续编辑或上传。标红和文字备注复用 `reader.annotations` 的现有 annotation/note 链路；语音备注使用 `<input type="file" accept="audio/*" capture>` 上传音频，保存到现有 `reader.audio_notes` 链路，并复用 Mac 端 voice pipeline 后台转写。Lite 不替代现代 `/library` 和 `/lan/reader`，只作为旧设备兜底。
+
+Lite 书库不再用一个含糊的“打开”按钮承担所有含义。每本可读书显示两个轻量入口：`继续读` 和 `目录`。`继续读` 优先读取现有 `reader.reading_positions`，把保存的 `chapter_locator` 映射回 Lite reading order 的章节，并使用保存的 `page_index` 回到屏幕分页页码；没有保存进度时才自动打开第一段正文。Lite 翻页时通过 `/reader-lite/position` 轻量写回 `page_index`、`total_pages` 和当前页首句，不新建表，不改 PostgreSQL schema。
+
 ## P1.1-P6 验收边界
 
 | 阶段 | 当前边界 |

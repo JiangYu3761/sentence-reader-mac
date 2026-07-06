@@ -748,21 +748,29 @@ final class ReaderAPIClient {
         color: String?,
         chapterTitle: String?,
         chapterLocator: String,
-        sentenceIndex: String
+        sentenceIndex: String,
+        rangeLocator: [String: Any]? = nil,
+        metadata: [String: Any]? = nil
     ) -> String? {
+        var annotationMetadata: [String: Any] = [
+            "source": "SentenceReaderNative",
+            "sentenceIndex": sentenceIndex,
+        ]
+        if let metadata {
+            for (key, value) in metadata {
+                annotationMetadata[key] = value
+            }
+        }
         var body: [String: Any] = [
             "book_id": bookID,
             "kind": kind,
             "source_text": sourceText,
             "chapter_locator": chapterLocator,
-            "range_locator": [
+            "range_locator": rangeLocator ?? [
                 "chapterLocator": chapterLocator,
                 "sentenceIndex": sentenceIndex,
             ],
-            "metadata": [
-                "source": "SentenceReaderNative",
-                "sentenceIndex": sentenceIndex,
-            ],
+            "metadata": annotationMetadata,
         ]
         if let noteText {
             body["note_text"] = noteText
@@ -4824,6 +4832,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             case "note":
                 self.statusLabel.stringValue = "正在为当前句添加备注"
                 self.showNotePanel(sentence: text, sentenceIndex: self.sentenceIndexPayload(from: payload))
+            case "selectionCopy":
+                let rawText = payload["text"] as? String ?? text
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(rawText, forType: .string)
+                self.statusLabel.stringValue = rawText.isEmpty ? "没有可复制的选中文字" : "已复制选中文字"
+            case "selectionNote":
+                self.statusLabel.stringValue = "正在为选中文字添加备注"
+                self.showNotePanel(
+                    sentence: text,
+                    sentenceIndex: self.sentenceIndexPayload(from: payload),
+                    selectionFragments: self.selectionFragments(from: payload),
+                    selectionMode: "text_selection_note"
+                )
+            case "selectionRed":
+                let count = payload["redCount"] as? Int ?? 0
+                self.redLabel.stringValue = "红标 \(count)"
+                self.statusLabel.stringValue = "正在保存选中文字红标..."
+                self.persistSelectionRed(
+                    sentence: text,
+                    sentenceIndex: self.sentenceIndexPayload(from: payload),
+                    fragments: self.selectionFragments(from: payload)
+                )
+            case "selectionRedUndo":
+                let count = payload["redCount"] as? Int ?? 0
+                self.redLabel.stringValue = "红标 \(count)"
+                self.statusLabel.stringValue = "正在撤回选中文字红标..."
+                self.deleteSelectionRed(
+                    sentenceIndex: self.sentenceIndexPayload(from: payload),
+                    fragments: self.selectionFragments(from: payload)
+                )
             case "lookup":
                 self.showLookupPanel(
                     word: payload["word"] as? String ?? "",
@@ -4879,7 +4917,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         showNotePanel(sentence: sentence, sentenceIndex: "")
     }
 
-    private func showNotePanel(sentence: String, sentenceIndex: String) {
+    private func showNotePanel(
+        sentence: String,
+        sentenceIndex: String,
+        selectionFragments: [[String: Any]] = [],
+        selectionMode: String? = nil
+    ) {
         let alert = NSAlert()
         alert.messageText = "添加备注"
         alert.informativeText = sentence
@@ -4932,7 +4975,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             self.noteSpeechController = nil
             if response == .alertFirstButtonReturn {
                 let noteText = NoteTextNormalizer.normalized(textView.string)
-                self.persistNote(sentence: sentence, sentenceIndex: sentenceIndex, noteText: noteText, audioNoteID: audioNoteID)
+                self.persistNote(
+                    sentence: sentence,
+                    sentenceIndex: sentenceIndex,
+                    noteText: noteText,
+                    audioNoteID: audioNoteID,
+                    selectionFragments: selectionFragments,
+                    selectionMode: selectionMode
+                )
             }
         }
     }
@@ -5807,7 +5857,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return sentenceIndexString(from: payload["index"]) ?? ""
     }
 
-    private func persistNote(sentence: String, sentenceIndex: String, noteText: String, audioNoteID: String? = nil) {
+    private func integerValue(from rawValue: Any?) -> Int? {
+        if let intValue = rawValue as? Int {
+            return intValue
+        }
+        if let doubleValue = rawValue as? Double, doubleValue.rounded() == doubleValue {
+            return Int(doubleValue)
+        }
+        if let numberValue = rawValue as? NSNumber {
+            return numberValue.intValue
+        }
+        if let stringValue = rawValue as? String {
+            return Int(stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func selectionFragments(from payload: [String: Any]) -> [[String: Any]] {
+        guard let rawFragments = payload["fragments"] as? [[String: Any]] else {
+            return []
+        }
+        return rawFragments.compactMap { fragment in
+            guard let sentenceIndex = sentenceIndexString(from: fragment["sentenceIndex"]),
+                  let startOffset = integerValue(from: fragment["startOffset"]),
+                  let endOffset = integerValue(from: fragment["endOffset"]),
+                  endOffset > startOffset
+            else {
+                return nil
+            }
+            return [
+                "sentenceIndex": sentenceIndex,
+                "startOffset": startOffset,
+                "endOffset": endOffset,
+                "text": fragment["text"] as? String ?? "",
+            ]
+        }
+    }
+
+    private func selectionFragmentKey(_ fragment: [String: Any]) -> String? {
+        guard let sentenceIndex = sentenceIndexString(from: fragment["sentenceIndex"]),
+              let startOffset = integerValue(from: fragment["startOffset"]),
+              let endOffset = integerValue(from: fragment["endOffset"]),
+              endOffset > startOffset
+        else {
+            return nil
+        }
+        return "\(sentenceIndex):\(startOffset):\(endOffset)"
+    }
+
+    private func selectionFragmentKeys(from fragments: [[String: Any]]) -> Set<String> {
+        Set(fragments.compactMap { selectionFragmentKey($0) })
+    }
+
+    private func selectionFragments(fromRawFragments rawFragments: Any?) -> [[String: Any]] {
+        guard let rawFragments = rawFragments as? [[String: Any]] else {
+            return []
+        }
+        return selectionFragments(from: ["fragments": rawFragments])
+    }
+
+    private func persistNote(
+        sentence: String,
+        sentenceIndex: String,
+        noteText: String,
+        audioNoteID: String? = nil,
+        selectionFragments: [[String: Any]] = [],
+        selectionMode: String? = nil
+    ) {
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator(),
               !noteText.isEmpty
@@ -5816,6 +5932,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         let chapterTitle = chapterTitles.indices.contains(currentChapterIndex) ? chapterTitles[currentChapterIndex] : nil
+        var rangeLocator: [String: Any]? = nil
+        var metadata: [String: Any]? = nil
+        if let selectionMode, !selectionFragments.isEmpty {
+            rangeLocator = [
+                "chapterLocator": chapterLocator,
+                "sentenceIndex": sentenceIndex,
+                "mode": selectionMode,
+                "fragments": selectionFragments,
+            ]
+            metadata = [
+                "source": "SentenceReaderNative",
+                "sentenceIndex": sentenceIndex,
+                "mode": selectionMode,
+                "fragments": selectionFragments,
+            ]
+        }
         statusLabel.stringValue = "正在保存备注到 Reader API..."
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let annotationID = readerAPI.createAnnotation(
@@ -5826,7 +5958,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 color: nil,
                 chapterTitle: chapterTitle,
                 chapterLocator: chapterLocator,
-                sentenceIndex: sentenceIndex
+                sentenceIndex: sentenceIndex,
+                rangeLocator: rangeLocator,
+                metadata: metadata
             )
             DispatchQueue.main.async {
                 self.statusLabel.stringValue = annotationID == nil ? "备注保存失败：Reader API 未写入" : "已保存备注到 Reader API"
@@ -5842,6 +5976,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                             errorMessage: nil
                         )
                     }
+                }
+                self.refreshNotes()
+                self.restoreAnnotationsForCurrentChapter()
+            }
+        }
+    }
+
+    private func persistSelectionRed(sentence: String, sentenceIndex: String, fragments: [[String: Any]]) {
+        guard let bookID = readerBookID,
+              let chapterLocator = currentChapterLocator(),
+              !sentenceIndex.isEmpty,
+              !fragments.isEmpty
+        else {
+            statusLabel.stringValue = "选中文字红标未保存：Reader API 未连接或选区为空"
+            return
+        }
+        let chapterTitle = chapterTitles.indices.contains(currentChapterIndex) ? chapterTitles[currentChapterIndex] : nil
+        let rangeLocator: [String: Any] = [
+            "chapterLocator": chapterLocator,
+            "sentenceIndex": sentenceIndex,
+            "mode": "text_selection",
+            "fragments": fragments,
+        ]
+        let metadata: [String: Any] = [
+            "source": "SentenceReaderNative",
+            "sentenceIndex": sentenceIndex,
+            "mode": "text_selection",
+            "fragments": fragments,
+        ]
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotationID = readerAPI.createAnnotation(
+                bookID: bookID,
+                kind: "red_highlight",
+                sourceText: sentence,
+                noteText: nil,
+                color: "red",
+                chapterTitle: chapterTitle,
+                chapterLocator: chapterLocator,
+                sentenceIndex: sentenceIndex,
+                rangeLocator: rangeLocator,
+                metadata: metadata
+            )
+            DispatchQueue.main.async {
+                self.statusLabel.stringValue = annotationID == nil ? "选中文字红标保存失败" : "选中文字红标已保存到 Reader API"
+                self.refreshNotes()
+                self.restoreAnnotationsForCurrentChapter()
+            }
+        }
+    }
+
+    private func deleteSelectionRed(sentenceIndex: String, fragments: [[String: Any]]) {
+        guard let bookID = readerBookID,
+              let chapterLocator = currentChapterLocator(),
+              !sentenceIndex.isEmpty,
+              !fragments.isEmpty
+        else {
+            statusLabel.stringValue = "选中文字红标未撤回：Reader API 未连接或选区为空"
+            return
+        }
+
+        let targetKeys = selectionFragmentKeys(from: fragments)
+        guard !targetKeys.isEmpty else {
+            statusLabel.stringValue = "选中文字红标未撤回：选区范围为空"
+            return
+        }
+
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotations = readerAPI.listAnnotations(bookID: bookID)
+            var exactIDs: [String] = []
+            var overlappingIDs: [String] = []
+
+            for annotation in annotations {
+                guard let annotationID = annotation["id"] as? String,
+                      annotation["kind"] as? String == "red_highlight",
+                      annotation["chapter_locator"] as? String == chapterLocator
+                else {
+                    continue
+                }
+                let range = annotation["range_locator"] as? [String: Any] ?? [:]
+                let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+                let mode = range["mode"] as? String ?? metadata["mode"] as? String ?? ""
+                guard mode == "text_selection" else {
+                    continue
+                }
+
+                let rangeFragments = self.selectionFragments(fromRawFragments: range["fragments"])
+                let annotationFragments = rangeFragments.isEmpty
+                    ? self.selectionFragments(fromRawFragments: metadata["fragments"])
+                    : rangeFragments
+                let annotationKeys = self.selectionFragmentKeys(from: annotationFragments)
+                guard !annotationKeys.isEmpty else {
+                    continue
+                }
+                if annotationKeys == targetKeys {
+                    exactIDs.append(annotationID)
+                } else if !annotationKeys.isDisjoint(with: targetKeys) {
+                    overlappingIDs.append(annotationID)
+                }
+            }
+
+            let idsToDelete = Set(exactIDs.isEmpty ? overlappingIDs : exactIDs)
+            var allDeleted = true
+            for annotationID in idsToDelete {
+                allDeleted = readerAPI.deleteAnnotation(annotationID: annotationID) && allDeleted
+            }
+
+            DispatchQueue.main.async {
+                if idsToDelete.isEmpty {
+                    self.statusLabel.stringValue = "没有找到可撤回的选中文字红标"
+                } else {
+                    self.statusLabel.stringValue = allDeleted ? "选中文字红标已撤回" : "选中文字红标撤回失败，已恢复数据库状态"
                 }
                 self.refreshNotes()
                 self.restoreAnnotationsForCurrentChapter()
@@ -5929,6 +6174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             let annotations = readerAPI.listAnnotations(bookID: bookID)
             var redIndexes: [String] = []
             var redIDs: [String: String] = [:]
+            var selectionRedFragments: [[String: Any]] = []
             var noteItems: [[String: Any]] = []
             for annotation in annotations {
                 guard let kind = annotation["kind"] as? String,
@@ -5948,6 +6194,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 }
 
                 if kind == "red_highlight" {
+                    let mode = range["mode"] as? String ?? metadata["mode"] as? String ?? ""
+                    if mode == "text_selection" {
+                        if let fragments = range["fragments"] as? [[String: Any]] {
+                            selectionRedFragments.append(contentsOf: fragments)
+                        } else if let fragments = metadata["fragments"] as? [[String: Any]] {
+                            selectionRedFragments.append(contentsOf: fragments)
+                        }
+                        continue
+                    }
                     redIndexes.append(contentsOf: indexes)
                     for index in indexes {
                         redIDs[self.annotationKey(chapterLocator: chapterLocator, sentenceIndex: index)] = id
@@ -5987,6 +6242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                         }
                         return lhs < rhs
                     },
+                    "selectionRedFragments": selectionRedFragments,
                     "notes": noteItems,
                 ]
                 if let data = try? JSONSerialization.data(withJSONObject: payload),
@@ -6049,6 +6305,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           will-change: transform !important;
           transform-style: preserve-3d !important;
           backface-visibility: hidden !important;
+          -webkit-user-select: text !important;
+          user-select: text !important;
         }
         #sr-page-surface, #sr-page-surface * {
           box-sizing: border-box !important;
@@ -6179,8 +6437,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           background: transparent !important;
           font-family: "Microsoft YaHei", "微软雅黑", "PingFang SC", "Heiti SC", "Helvetica Neue", Arial, sans-serif !important;
         }
+        #sr-page-surface details.sr-reader-details,
+        #sr-page-surface details.sr-scripture-footnote {
+          display: block !important;
+          margin: .34em 0 .46em !important;
+          padding: .18em .52em !important;
+          border: 1px solid rgba(240, 211, 107, .24) !important;
+          border-radius: 8px !important;
+          background: rgba(240, 211, 107, .055) !important;
+          break-inside: avoid !important;
+          page-break-inside: avoid !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote:not([open]) {
+          display: inline-block !important;
+          max-width: 100% !important;
+          margin: 0 .18em .18em 0 !important;
+          padding: 0 .38em !important;
+          vertical-align: baseline !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote > summary,
+        #sr-page-surface details.sr-reader-details > summary {
+          cursor: pointer !important;
+          color: #f0d36b !important;
+          font-weight: 700 !important;
+          font-size: .88em !important;
+          line-height: 1.52 !important;
+          list-style: none !important;
+          outline: none !important;
+          user-select: none !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote > summary::-webkit-details-marker,
+        #sr-page-surface details.sr-reader-details > summary::-webkit-details-marker {
+          display: none !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote > summary::before,
+        #sr-page-surface details.sr-reader-details > summary::before {
+          content: "▸ " !important;
+          color: #f0d36b !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote[open] > summary::before,
+        #sr-page-surface details.sr-reader-details[open] > summary::before {
+          content: "▾ " !important;
+        }
+        #sr-page-surface details.sr-scripture-footnote p,
+        #sr-page-surface details.sr-scripture-footnote li {
+          margin: .32em 0 !important;
+          font-size: .92em !important;
+          line-height: 1.54 !important;
+        }
+        #sr-page-surface a.duokan-footnote,
+        #sr-page-surface a[epub\\:type="noteref"] {
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          min-width: 1.25em !important;
+          min-height: 1.25em !important;
+          margin: 0 .12em !important;
+          border-radius: 999px !important;
+          background: rgba(240, 211, 107, .18) !important;
+          color: #f0d36b !important;
+          text-decoration: none !important;
+          vertical-align: text-bottom !important;
+        }
+        #sr-page-surface a.duokan-footnote img,
+        #sr-page-surface a[epub\\:type="noteref"] img {
+          display: inline-block !important;
+          width: 1em !important;
+          height: 1em !important;
+          margin: 0 !important;
+        }
         p, li, blockquote, div { line-height: var(--sr-line-height) !important; }
-        .sr-sentence { border-radius: 3px !important; cursor: text !important; }
+        .sr-sentence { border-radius: 3px !important; cursor: text !important; -webkit-user-select: text !important; user-select: text !important; }
         .sr-sentence.sr-focused { background: var(--sr-focus-bg) !important; box-shadow: 0 0 0 1px var(--sr-focus-ring) inset !important; }
         .sr-word-focused {
           border-radius: .24em !important;
@@ -6192,6 +6519,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         .sr-sentence.sr-note { cursor: pointer !important; text-decoration-line: underline !important; text-decoration-style: dotted !important; text-decoration-color: rgba(96, 165, 250, .95) !important; text-underline-offset: .18em !important; }
         .sr-sentence.sr-red, .sr-sentence.sr-red.sr-focused { background: rgba(255, 59, 48, .62) !important; color: #fff !important; box-shadow: 0 0 0 1px rgba(255, 170, 160, .72) inset !important; }
+        .sr-selection-red {
+          border-radius: .18em !important;
+          background: rgba(255, 59, 48, .70) !important;
+          color: #fff !important;
+          box-shadow: 0 0 0 1px rgba(255, 190, 180, .62) inset !important;
+          padding: 0 .04em !important;
+          margin: 0 -.04em !important;
+        }
+        #sr-selection-action-bar {
+          position: fixed !important;
+          z-index: 2147483647 !important;
+          display: none !important;
+          align-items: center !important;
+          gap: 0 !important;
+          overflow: hidden !important;
+          border-radius: 14px !important;
+          border: 1px solid rgba(255,255,255,.20) !important;
+          background: rgba(20,20,20,.94) !important;
+          box-shadow: 0 10px 30px rgba(0,0,0,.35) !important;
+          backdrop-filter: blur(14px) !important;
+          -webkit-backdrop-filter: blur(14px) !important;
+          user-select: none !important;
+        }
+        #sr-selection-action-bar.sr-visible {
+          display: flex !important;
+        }
+        #sr-selection-action-bar button {
+          appearance: none !important;
+          -webkit-appearance: none !important;
+          min-width: 58px !important;
+          height: 34px !important;
+          padding: 0 14px !important;
+          margin: 0 !important;
+          border: 0 !important;
+          border-right: 1px solid rgba(255,255,255,.12) !important;
+          border-radius: 0 !important;
+          background: transparent !important;
+          color: #fff !important;
+          font: 600 14px/34px "Microsoft YaHei", "PingFang SC", sans-serif !important;
+          cursor: default !important;
+        }
+        #sr-selection-action-bar button:last-child {
+          border-right: 0 !important;
+        }
+        #sr-selection-action-bar button:hover {
+          background: rgba(10,132,255,.78) !important;
+        }
       `;
       document.head.appendChild(style);
 
@@ -6241,6 +6615,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         document.body.appendChild(surface);
         return surface;
       }
+      function cleanInlineText(value) {
+        return String(value || '').replace(/\\s+/g, ' ').trim();
+      }
+      function hasAttributeContaining(node, names, pattern) {
+        return names.some(function (name) {
+          const value = node.getAttribute && node.getAttribute(name);
+          return value && pattern.test(String(value));
+        });
+      }
+      function isScriptureFootnoteNode(node) {
+        if (!node || !node.matches) { return false; }
+        const tag = String(node.tagName || '').toLowerCase();
+        const idClass = [node.id || '', node.className || ''].join(' ');
+        const hasFootnoteType = hasAttributeContaining(node, ['epub:type', 'type', 'role'], /footnote|endnote|doc-footnote|note/i);
+        const hasFootnoteName = /duokan-footnote|footnote|endnote|sitero|scripture|verse|calibre_verse|note\\d+/i.test(idClass);
+        if (tag === 'aside') {
+          return hasFootnoteType || hasFootnoteName || !!node.querySelector('p.calibre_verse, .duokan-footnote-content');
+        }
+        if (hasFootnoteType && hasFootnoteName) {
+          return true;
+        }
+        return false;
+      }
+      function scriptureSummaryText(node) {
+        const text = cleanInlineText(node ? node.textContent : '');
+        const match = text.match(/([\\u4e00-\\u9fff]{1,4}\\d{1,3}[:：]\\d{1,3}(?:[～~-]\\d{1,3})?|[1-3]?\\s?[A-Za-z][A-Za-z. ]{1,18}\\d{1,3}[:：]\\d{1,3}(?:[～~-]\\d{1,3})?)/);
+        if (match) {
+          return '经节 ' + cleanInlineText(match[1]);
+        }
+        return text ? '经节 ' + text.slice(0, 18) : '经节';
+      }
+      function collapseExistingDetails(surface) {
+        surface.querySelectorAll('details').forEach(function (details) {
+          details.classList.add('sr-reader-details');
+          if (!details.hasAttribute('data-sr-keep-open')) {
+            details.removeAttribute('open');
+          }
+          if (!details.querySelector(':scope > summary')) {
+            const summary = document.createElement('summary');
+            summary.textContent = '展开';
+            details.insertBefore(summary, details.firstChild);
+          }
+        });
+      }
+      function convertScriptureFootnotes(surface) {
+        Array.from(surface.querySelectorAll('aside, section, div')).forEach(function (node) {
+          if (!isScriptureFootnoteNode(node) || node.closest('details.sr-scripture-footnote')) { return; }
+          const details = document.createElement('details');
+          details.className = 'sr-scripture-footnote';
+          details.dataset.srSourceTag = String(node.tagName || '').toLowerCase();
+          if (node.id) { details.id = node.id; }
+          const summary = document.createElement('summary');
+          summary.textContent = scriptureSummaryText(node);
+          details.appendChild(summary);
+          while (node.firstChild) {
+            details.appendChild(node.firstChild);
+          }
+          node.parentNode.replaceChild(details, node);
+        });
+      }
+      function installScriptureFootnoteToggles(surface) {
+        surface.addEventListener('click', function (event) {
+          const link = event.target && event.target.closest ? event.target.closest('a[href^="#"]') : null;
+          if (!link) { return; }
+          let targetId = String(link.getAttribute('href') || '').slice(1);
+          try {
+            targetId = decodeURIComponent(targetId);
+          } catch (error) {}
+          if (!targetId) { return; }
+          const target = document.getElementById(targetId);
+          if (!target || !target.matches || !target.matches('details.sr-scripture-footnote')) { return; }
+          event.preventDefault();
+          event.stopPropagation();
+          target.open = !target.open;
+          target.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+          invalidatePagination();
+          applyPage(false, 0);
+        }, true);
+        surface.addEventListener('toggle', function (event) {
+          const target = event.target;
+          if (!target || !target.matches || !target.matches('details')) { return; }
+          window.setTimeout(function () {
+            invalidatePagination();
+            pageIndex = Math.max(0, Math.min(pageIndex, maxPageIndex()));
+            applyPage(false, 0);
+          }, 0);
+        }, true);
+      }
+      function normalizeCollapsibleScriptureBlocks() {
+        const surface = ensureSurface();
+        collapseExistingDetails(surface);
+        convertScriptureFootnotes(surface);
+        installScriptureFootnoteToggles(surface);
+      }
       function parts(text) {
         const out = [];
         const nonSentenceBoundaryCharacters = '：:；;';
@@ -6270,6 +6738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       }
       function wrap() {
         ensureSurface();
+        normalizeCollapsibleScriptureBlocks();
         const state = { nextIndex: document.querySelectorAll('.sr-sentence').length };
         document.querySelectorAll('#sr-page-surface p, #sr-page-surface li, #sr-page-surface blockquote, #sr-page-surface h1, #sr-page-surface h2, #sr-page-surface h3, #sr-page-surface h4, #sr-page-surface h5, #sr-page-surface h6').forEach(function (root) {
           const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -6282,6 +6751,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (!target) { return null; }
         target = target.nodeType === Node.TEXT_NODE ? target.parentElement : target;
         return target && target.closest ? target.closest('.sr-sentence') : null;
+      }
+      function sentenceFromPoint(x, y) {
+        x = Number(x);
+        y = Number(y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) { return null; }
+        const directNode = document.elementFromPoint ? document.elementFromPoint(x, y) : null;
+        const directSentence = sentenceFromTarget(directNode);
+        if (directSentence) { return directSentence; }
+        let range = null;
+        try {
+          if (document.caretRangeFromPoint) {
+            range = document.caretRangeFromPoint(x, y);
+          } else if (document.caretPositionFromPoint) {
+            const position = document.caretPositionFromPoint(x, y);
+            if (position) {
+              range = document.createRange();
+              range.setStart(position.offsetNode, position.offset);
+              range.collapse(true);
+            }
+          }
+          const caretSentence = range ? sentenceFromTarget(range.startContainer) : null;
+          if (range && range.detach) { range.detach(); }
+          if (caretSentence) { return caretSentence; }
+        } catch (error) {
+          if (range && range.detach) { range.detach(); }
+        }
+        let best = null;
+        let bestScore = Infinity;
+        document.querySelectorAll('.sr-sentence').forEach(function (sentence) {
+          Array.from(sentence.getClientRects ? sentence.getClientRects() : []).forEach(function (rect) {
+            if (!rect || (rect.width <= 0 && rect.height <= 0)) { return; }
+            const inflateX = 8;
+            const inflateY = 10;
+            if (x < rect.left - inflateX || x > rect.right + inflateX || y < rect.top - inflateY || y > rect.bottom + inflateY) { return; }
+            const dx = x < rect.left ? rect.left - x : (x > rect.right ? x - rect.right : 0);
+            const dy = y < rect.top ? rect.top - y : (y > rect.bottom ? y - rect.bottom : 0);
+            const score = dy * 10 + dx;
+            if (score < bestScore) {
+              bestScore = score;
+              best = sentence;
+            }
+          });
+        });
+        return best;
+      }
+      function sentenceFromEvent(event) {
+        return sentenceFromTarget(event && event.target) || sentenceFromPoint(event && event.clientX, event && event.clientY);
       }
       function fallbackSentence() {
         return document.querySelector('.sr-sentence.sr-focused') || document.querySelector('.sr-sentence');
@@ -6312,6 +6828,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           return false;
         }
       }
+      function rangeIntersectsSentence(selectionRange, sentence) {
+        if (!selectionRange || !sentence) { return false; }
+        try {
+          if (selectionRange.intersectsNode && selectionRange.intersectsNode(sentence)) {
+            return true;
+          }
+        } catch (error) {
+        }
+        const sentenceRange = document.createRange();
+        try {
+          sentenceRange.selectNodeContents(sentence);
+          return rangesIntersect(selectionRange, sentenceRange);
+        } finally {
+          sentenceRange.detach && sentenceRange.detach();
+        }
+      }
       function selectedSentences() {
         const selection = window.getSelection ? window.getSelection() : null;
         if (!selection || selection.isCollapsed || selection.rangeCount === 0) { return []; }
@@ -6320,15 +6852,474 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         for (let rangeIndex = 0; rangeIndex < selection.rangeCount; rangeIndex += 1) {
           const selectionRange = selection.getRangeAt(rangeIndex);
           sentences.forEach(function (sentence) {
-            const sentenceRange = document.createRange();
-            sentenceRange.selectNodeContents(sentence);
-            if (rangesIntersect(selectionRange, sentenceRange)) {
+            if (rangeIntersectsSentence(selectionRange, sentence)) {
               matched.add(sentence);
             }
-            sentenceRange.detach && sentenceRange.detach();
           });
         }
         return uniqueSentences(sentences.filter(function (sentence) { return matched.has(sentence); }));
+      }
+      let selectionActionBar = null;
+      let activeSelectionPayload = null;
+      let selectionActionTimer = 0;
+      let suppressSelectionActionBarUntil = 0;
+      let selectionDragStart = null;
+      let selectionDragMoved = false;
+      let selectionDragAllowedUntil = 0;
+      let selectionRedFragments = [];
+      function selectionTextOffset(sentence, node, offset) {
+        if (!sentence || !node) { return -1; }
+        const range = document.createRange();
+        try {
+          range.selectNodeContents(sentence);
+          range.setEnd(node, offset);
+          const value = range.toString().length;
+          range.detach && range.detach();
+          return value;
+        } catch (error) {
+          range.detach && range.detach();
+          return -1;
+        }
+      }
+      function clippedRangeForSentence(selectionRange, sentence) {
+        const sentenceRange = document.createRange();
+        sentenceRange.selectNodeContents(sentence);
+        if (!rangeIntersectsSentence(selectionRange, sentence)) {
+          sentenceRange.detach && sentenceRange.detach();
+          return null;
+        }
+        const clipped = sentenceRange.cloneRange();
+        try {
+          if (selectionRange.compareBoundaryPoints(Range.START_TO_START, sentenceRange) > 0) {
+            clipped.setStart(selectionRange.startContainer, selectionRange.startOffset);
+          }
+          if (selectionRange.compareBoundaryPoints(Range.END_TO_END, sentenceRange) < 0) {
+            clipped.setEnd(selectionRange.endContainer, selectionRange.endOffset);
+          }
+        } catch (error) {
+          sentenceRange.detach && sentenceRange.detach();
+          clipped.detach && clipped.detach();
+          return null;
+        }
+        sentenceRange.detach && sentenceRange.detach();
+        return clipped;
+      }
+      function readerSelectionPayload() {
+        const selection = window.getSelection ? window.getSelection() : null;
+        if (!selection || selection.isCollapsed || selection.rangeCount === 0) { return null; }
+        const rawText = String(selection.toString() || '');
+        const normalizedText = rawText.replace(/\\s+/g, ' ').trim();
+        if (!normalizedText) { return null; }
+        const fragments = [];
+        const indexes = [];
+        const sentences = Array.from(document.querySelectorAll('.sr-sentence'));
+        let anchorRect = null;
+        for (let rangeIndex = 0; rangeIndex < selection.rangeCount; rangeIndex += 1) {
+          const selectionRange = selection.getRangeAt(rangeIndex);
+          sentences.forEach(function (sentence) {
+            const clipped = clippedRangeForSentence(selectionRange, sentence);
+            if (!clipped) { return; }
+            const text = clipped.toString();
+            if (!String(text || '').trim()) {
+              clipped.detach && clipped.detach();
+              return;
+            }
+            const startOffset = selectionTextOffset(sentence, clipped.startContainer, clipped.startOffset);
+            const endOffset = selectionTextOffset(sentence, clipped.endContainer, clipped.endOffset);
+            if (startOffset < 0 || endOffset <= startOffset) {
+              clipped.detach && clipped.detach();
+              return;
+            }
+            const sentenceIndex = String(sentence.dataset.srIndex || '');
+            if (!sentenceIndex) {
+              clipped.detach && clipped.detach();
+              return;
+            }
+            fragments.push({
+              sentenceIndex: sentenceIndex,
+              startOffset: startOffset,
+              endOffset: endOffset,
+              text: text
+            });
+            if (indexes.indexOf(sentenceIndex) < 0) { indexes.push(sentenceIndex); }
+            if (!anchorRect && clipped.getBoundingClientRect) {
+              const rect = clipped.getBoundingClientRect();
+              if (rect && rect.width >= 0 && rect.height >= 0) {
+                anchorRect = rect;
+              }
+            }
+            clipped.detach && clipped.detach();
+          });
+        }
+        if (!fragments.length) { return null; }
+        if (!anchorRect) {
+          const firstRange = selection.getRangeAt(0);
+          anchorRect = firstRange.getBoundingClientRect ? firstRange.getBoundingClientRect() : null;
+        }
+        return {
+          text: rawText,
+          normalizedText: normalizedText,
+          index: indexes.join(','),
+          indexes: indexes,
+          fragments: fragments,
+          rect: anchorRect ? {
+            left: anchorRect.left,
+            top: anchorRect.top,
+            right: anchorRect.right,
+            bottom: anchorRect.bottom,
+            width: anchorRect.width,
+            height: anchorRect.height
+          } : null
+        };
+      }
+      function hasReaderTextSelection() {
+        return !!readerSelectionPayload();
+      }
+      function selectionActionBarNode() {
+        if (selectionActionBar) { return selectionActionBar; }
+        selectionActionBar = document.createElement('div');
+        selectionActionBar.id = 'sr-selection-action-bar';
+        selectionActionBar.className = 'sr-selection-action-bar';
+        selectionActionBar.innerHTML = '<button type="button" data-sr-selection-action="copy">复制</button><button type="button" data-sr-selection-action="red">标红</button><button type="button" data-sr-selection-action="note">备注</button>';
+        selectionActionBar.addEventListener('mousedown', function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+        }, true);
+        selectionActionBar.addEventListener('click', function (event) {
+          const button = event.target && event.target.closest ? event.target.closest('button[data-sr-selection-action]') : null;
+          if (!button) { return; }
+          event.preventDefault();
+          event.stopPropagation();
+          if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+          handleSelectionAction(button.dataset.srSelectionAction || '');
+        }, true);
+        document.body.appendChild(selectionActionBar);
+        return selectionActionBar;
+      }
+      function hideSelectionActionBar() {
+        activeSelectionPayload = null;
+        if (selectionActionBar) {
+          selectionActionBar.classList.remove('sr-visible');
+        }
+      }
+      function selectionActionBarVisible() {
+        return !!(selectionActionBar && selectionActionBar.classList.contains('sr-visible'));
+      }
+      function selectionActionBarSuppressed() {
+        return Date.now() < suppressSelectionActionBarUntil;
+      }
+      function suppressSelectionActionBar(durationMs) {
+        suppressSelectionActionBarUntil = Date.now() + Math.max(120, Number(durationMs) || 450);
+        selectionDragAllowedUntil = 0;
+        selectionDragStart = null;
+        selectionDragMoved = false;
+        if (selectionActionTimer) {
+          window.clearTimeout(selectionActionTimer);
+          selectionActionTimer = 0;
+        }
+        hideSelectionActionBar();
+      }
+      function selectionActionBarCanOpen() {
+        return selectionActionBarVisible() || Date.now() < selectionDragAllowedUntil;
+      }
+      function showSelectionActionBar(payload) {
+        if (selectionActionBarSuppressed() || !selectionActionBarCanOpen()) {
+          hideSelectionActionBar();
+          return;
+        }
+        const bar = selectionActionBarNode();
+        activeSelectionPayload = payload;
+        updateSelectionActionBarState(payload);
+        const rect = payload && payload.rect;
+        const width = 186;
+        const viewportWidthValue = Math.max(320, window.innerWidth || document.documentElement.clientWidth || 0);
+        const viewportHeightValue = Math.max(240, window.innerHeight || document.documentElement.clientHeight || 0);
+        const centerX = rect ? (rect.left + rect.right) / 2 : viewportWidthValue / 2;
+        const topCandidate = rect ? rect.top - 46 : 18;
+        const fallbackTop = rect ? rect.bottom + 8 : 18;
+        const top = Math.max(8, Math.min(viewportHeightValue - 44, topCandidate < 8 ? fallbackTop : topCandidate));
+        const left = Math.max(8, Math.min(viewportWidthValue - width - 8, centerX - width / 2));
+        bar.style.left = left + 'px';
+        bar.style.top = top + 'px';
+        bar.classList.add('sr-visible');
+      }
+      function scheduleSelectionActionBarUpdate() {
+        if (selectionActionTimer) { window.clearTimeout(selectionActionTimer); }
+        selectionActionTimer = window.setTimeout(function () {
+          selectionActionTimer = 0;
+          if (selectionActionBarSuppressed() || !selectionActionBarCanOpen()) {
+            hideSelectionActionBar();
+            return;
+          }
+          const payload = readerSelectionPayload();
+          if (payload) {
+            showSelectionActionBar(payload);
+          } else {
+            hideSelectionActionBar();
+          }
+        }, 40);
+      }
+      function pointFromEvent(event) {
+        return {
+          x: Number(event && event.clientX) || 0,
+          y: Number(event && event.clientY) || 0
+        };
+      }
+      function isSelectionActionExcludedTarget(target) {
+        const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
+        if (!node || !node.closest) { return true; }
+        if (isEditableTarget(node)) { return true; }
+        return !!node.closest('#sr-selection-action-bar, .sr-selection-action-bar, .sr-lookup-card, .sr-note-card, .sr-note-panel, .sr-settings-panel, .sr-toolbar, .sr-controls, .sr-sheet, .sr-popup, summary, details > summary');
+      }
+      function targetAllowsSelectionActionDrag(target) {
+        if (isSelectionActionExcludedTarget(target)) { return false; }
+        const surface = pageSurface();
+        const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
+        return !!(surface && node && surface.contains(node));
+      }
+      function beginSelectionActionDrag(event) {
+        if (!event || event.button !== 0 || !targetAllowsSelectionActionDrag(event.target)) {
+          selectionDragStart = null;
+          selectionDragMoved = false;
+          return;
+        }
+        hideSelectionActionBar();
+        selectionDragAllowedUntil = 0;
+        selectionDragStart = pointFromEvent(event);
+        selectionDragMoved = false;
+      }
+      function updateSelectionActionDrag(event) {
+        if (!selectionDragStart || !event) { return; }
+        if (typeof event.buttons === 'number' && event.buttons !== 0 && (event.buttons & 1) !== 1) { return; }
+        const point = pointFromEvent(event);
+        const dx = point.x - selectionDragStart.x;
+        const dy = point.y - selectionDragStart.y;
+        if (Math.sqrt(dx * dx + dy * dy) >= 8) {
+          selectionDragMoved = true;
+        }
+      }
+      function finishSelectionActionDrag(event) {
+        if (!selectionDragStart) { return; }
+        updateSelectionActionDrag(event);
+        const wasRealDrag = selectionDragMoved;
+        selectionDragStart = null;
+        selectionDragMoved = false;
+        if (!wasRealDrag) {
+          if (!selectionActionBarVisible()) { hideSelectionActionBar(); }
+          return;
+        }
+        selectionDragAllowedUntil = Date.now() + 900;
+        window.setTimeout(scheduleSelectionActionBarUpdate, 40);
+      }
+      function hideSelectionActionBarWhenSelectionGone() {
+        if (!selectionActionBarVisible()) { return; }
+        if (!readerSelectionPayload()) { hideSelectionActionBar(); }
+      }
+      function fragmentKey(fragment) {
+        return String(fragment.sentenceIndex || '') + ':' + String(fragment.startOffset || 0) + ':' + String(fragment.endOffset || 0);
+      }
+      function selectionFragmentKeySet(fragments) {
+        const keys = {};
+        normalizeSelectionFragments(fragments).forEach(function (fragment) {
+          keys[fragmentKey(fragment)] = true;
+        });
+        return keys;
+      }
+      function normalizeSelectionFragments(fragments) {
+        const bySentence = {};
+        (fragments || []).forEach(function (fragment) {
+          const sentenceIndex = String(fragment.sentenceIndex || '');
+          const startOffset = Number(fragment.startOffset);
+          const endOffset = Number(fragment.endOffset);
+          if (!sentenceIndex || !Number.isFinite(startOffset) || !Number.isFinite(endOffset) || endOffset <= startOffset) { return; }
+          if (!bySentence[sentenceIndex]) { bySentence[sentenceIndex] = []; }
+          bySentence[sentenceIndex].push({
+            sentenceIndex: sentenceIndex,
+            startOffset: Math.max(0, Math.floor(startOffset)),
+            endOffset: Math.max(0, Math.floor(endOffset)),
+            text: String(fragment.text || '')
+          });
+        });
+        const merged = [];
+        Object.keys(bySentence).forEach(function (sentenceIndex) {
+          const items = bySentence[sentenceIndex].sort(function (left, right) {
+            if (left.startOffset !== right.startOffset) { return left.startOffset - right.startOffset; }
+            return left.endOffset - right.endOffset;
+          });
+          items.forEach(function (item) {
+            const previous = merged.length ? merged[merged.length - 1] : null;
+            if (previous && previous.sentenceIndex === item.sentenceIndex && item.startOffset <= previous.endOffset) {
+              previous.endOffset = Math.max(previous.endOffset, item.endOffset);
+              return;
+            }
+            merged.push(item);
+          });
+        });
+        return merged;
+      }
+      function clearSelectionRedHighlights() {
+        document.querySelectorAll('.sr-selection-red').forEach(function (node) {
+          const parent = node.parentNode;
+          if (!parent) { return; }
+          while (node.firstChild) {
+            parent.insertBefore(node.firstChild, node);
+          }
+          parent.removeChild(node);
+          if (parent.normalize) { parent.normalize(); }
+        });
+      }
+      function rangeForPlainTextOffsets(sentence, startOffset, endOffset) {
+        const walker = document.createTreeWalker(sentence, NodeFilter.SHOW_TEXT);
+        let current = 0;
+        let startNode = null;
+        let startNodeOffset = 0;
+        let endNode = null;
+        let endNodeOffset = 0;
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          const length = (node.nodeValue || '').length;
+          if (!startNode && startOffset >= current && startOffset <= current + length) {
+            startNode = node;
+            startNodeOffset = startOffset - current;
+          }
+          if (!endNode && endOffset >= current && endOffset <= current + length) {
+            endNode = node;
+            endNodeOffset = endOffset - current;
+            break;
+          }
+          current += length;
+        }
+        if (!startNode || !endNode) { return null; }
+        const range = document.createRange();
+        try {
+          range.setStart(startNode, startNodeOffset);
+          range.setEnd(endNode, endNodeOffset);
+          return range;
+        } catch (error) {
+          range.detach && range.detach();
+          return null;
+        }
+      }
+      function renderSelectionRedFragments() {
+        clearSelectionRedHighlights();
+        const fragments = normalizeSelectionFragments(selectionRedFragments).sort(function (left, right) {
+          const leftIndex = Number(left.sentenceIndex);
+          const rightIndex = Number(right.sentenceIndex);
+          if (Number.isFinite(leftIndex) && Number.isFinite(rightIndex) && leftIndex !== rightIndex) {
+            return rightIndex - leftIndex;
+          }
+          if (left.sentenceIndex !== right.sentenceIndex) {
+            return String(right.sentenceIndex).localeCompare(String(left.sentenceIndex));
+          }
+          return right.startOffset - left.startOffset;
+        });
+        fragments.forEach(function (fragment) {
+          const sentence = document.querySelector('.sr-sentence[data-sr-index="' + String(fragment.sentenceIndex) + '"]');
+          if (!sentence) { return; }
+          const range = rangeForPlainTextOffsets(sentence, fragment.startOffset, fragment.endOffset);
+          if (!range || String(range.toString() || '').length === 0) { return; }
+          try {
+            const span = document.createElement('span');
+            span.className = 'sr-selection-red';
+            span.appendChild(range.extractContents());
+            range.insertNode(span);
+          } catch (error) {
+          } finally {
+            range.detach && range.detach();
+          }
+        });
+      }
+      function addSelectionRedFragments(fragments) {
+        const known = {};
+        selectionRedFragments.forEach(function (fragment) {
+          known[fragmentKey(fragment)] = true;
+        });
+        (fragments || []).forEach(function (fragment) {
+          if (!known[fragmentKey(fragment)]) {
+            selectionRedFragments.push(fragment);
+          }
+        });
+        selectionRedFragments = normalizeSelectionFragments(selectionRedFragments);
+        renderSelectionRedFragments();
+      }
+      function removeSelectionRedFragments(fragments) {
+        const removeKeys = selectionFragmentKeySet(fragments);
+        selectionRedFragments = normalizeSelectionFragments(selectionRedFragments.filter(function (fragment) {
+          return !removeKeys[fragmentKey(fragment)];
+        }));
+        renderSelectionRedFragments();
+      }
+      function selectionPayloadHasExactRed(payload) {
+        const payloadFragments = normalizeSelectionFragments(payload && payload.fragments);
+        if (!payloadFragments.length) { return false; }
+        const redKeys = selectionFragmentKeySet(selectionRedFragments);
+        return payloadFragments.every(function (fragment) {
+          return !!redKeys[fragmentKey(fragment)];
+        });
+      }
+      function updateSelectionActionBarState(payload) {
+        const bar = selectionActionBarNode();
+        const redButton = bar.querySelector('button[data-sr-selection-action="red"]');
+        if (!redButton) { return; }
+        const isExactRed = selectionPayloadHasExactRed(payload);
+        redButton.textContent = isExactRed ? '取消标红' : '标红';
+        redButton.dataset.srSelectionRedMode = isExactRed ? 'remove' : 'add';
+      }
+      function handleSelectionAction(action) {
+        const payload = activeSelectionPayload || readerSelectionPayload();
+        if (!payload) {
+          hideSelectionActionBar();
+          return;
+        }
+        const message = {
+          text: payload.text,
+          index: payload.index,
+          indexes: payload.indexes,
+          fragments: payload.fragments
+        };
+        if (action === 'copy') {
+          post(Object.assign({ type: 'selectionCopy' }, message));
+          hideSelectionActionBar();
+          clearTextSelection();
+          return;
+        }
+        if (action === 'red') {
+          const previousFragments = selectionRedFragments.slice();
+          if (selectionPayloadHasExactRed(payload)) {
+            removeSelectionRedFragments(payload.fragments);
+            undoStack.push({
+              type: 'selectionRedRemove',
+              previousFragments: previousFragments,
+              fragments: payload.fragments,
+              text: payload.text,
+              index: payload.index,
+              indexes: payload.indexes
+            });
+            post(Object.assign({ type: 'selectionRedUndo', actionType: 'selectionRedRemove', redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length }, message));
+            hideSelectionActionBar();
+            clearTextSelection();
+            return;
+          }
+          addSelectionRedFragments(payload.fragments);
+          undoStack.push({
+            type: 'selectionRed',
+            previousFragments: previousFragments,
+            fragments: payload.fragments,
+            text: payload.text,
+            index: payload.index,
+            indexes: payload.indexes
+          });
+          post(Object.assign({ type: 'selectionRed', redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length }, message));
+          hideSelectionActionBar();
+          clearTextSelection();
+          return;
+        }
+        if (action === 'note') {
+          post(Object.assign({ type: 'selectionNote' }, message));
+          hideSelectionActionBar();
+          clearTextSelection();
+        }
       }
       function hasSystemTextSelection() {
         const selection = window.getSelection ? window.getSelection() : null;
@@ -6337,10 +7328,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       window.__SentenceReaderInteractionRouter = {
         contractVersion: 'sentence-reader-interaction-v1',
         priority: 'sentence-reader-first',
-        systemWhen: ['editable-target', 'active-text-selection'],
+        systemWhen: ['editable-target', 'active-text-selection-secondary-click'],
         sentenceWhen: ['plain-click', 'english-click-lookup', 'double-click-note', 'context-click-red'],
-        sentenceContextWinsEvenWithSelection: true,
-        copyPath: 'command-c-or-non-sentence-context-menu'
+        sentenceContextWinsOnlyWithoutSelection: true,
+        selectedTextActionBar: 'sr-selection-action-bar',
+        copyPath: 'selection-action-bar-copy-button-not-command-c'
       };
       function isEditableTarget(target) {
         const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
@@ -6361,6 +7353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       }
       function shouldLetSystemHandleContext(event) {
         if (isEditableTarget(event && event.target)) { return true; }
+        if (hasReaderTextSelection() && selectionActionBarVisible()) { return true; }
         const sentence = sentenceFromTarget(event && event.target);
         if (sentence) { return false; }
         return hasSystemTextSelection();
@@ -6371,6 +7364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       let cachedContentWidth = 0;
       let lastSecondaryRedAt = 0;
       let lastSecondaryRedIndex = '';
+      let lastSecondaryRedClaimedAt = 0;
       let wheelGestureDirection = 0;
       let wheelGestureDistance = 0;
       let lastWheelEventAt = 0;
@@ -6481,6 +7475,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             node.classList.add('sr-red');
           }
         });
+        selectionRedFragments = normalizeSelectionFragments(payload.selectionRedFragments || []);
+        renderSelectionRedFragments();
         if (Array.isArray(payload.notes)) {
           applyNoteMarkers(payload.notes);
         }
@@ -6520,6 +7516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }, 320);
       }
       function applyPage(animated, direction) {
+        hideSelectionActionBar();
         const surface = pageSurface();
         pageIndex = Math.max(0, Math.min(pageIndex, maxPageIndex()));
         if (animated) {
@@ -6636,10 +7633,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         });
       }
       function clearTextSelection() {
+        hideSelectionActionBar();
         const selection = window.getSelection ? window.getSelection() : null;
         if (selection && selection.removeAllRanges) {
           selection.removeAllRanges();
         }
+      }
+      function clearTextSelectionAfterSecondaryRed() {
+        clearTextSelection();
+        [0, 40, 120, 260].forEach(function (delay) {
+          window.setTimeout(clearTextSelection, delay);
+        });
       }
       function clearWordFocus() {
         document.querySelectorAll('.sr-word-focused').forEach(function (node) {
@@ -6742,7 +7746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           sentence.classList.toggle('sr-red', shouldRed);
         });
         focus(targets[0]);
-        clearTextSelection();
+        clearTextSelectionAfterSecondaryRed();
         const indexes = states.map(function (state) { return state.index; }).filter(Boolean);
         const text = states.map(function (state) { return state.text; }).join('');
         undoStack.push({ type: 'redBatch', states: states });
@@ -6770,10 +7774,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return toggleRedSentences([sentence], event);
       }
       function toggleRedFromSecondaryEvent(event) {
-        if (shouldLetSystemHandleContext(event)) { return true; }
-        const sentence = sentenceFromTarget(event && event.target);
-        if (!sentence) { return true; }
+        if (isEditableTarget(event && event.target)) { return true; }
+        const sentence = sentenceFromEvent(event);
+        if (hasReaderTextSelection() && selectionActionBarVisible()) {
+          if (sentence) {
+            claimSentenceEvent(event);
+            scheduleSelectionActionBarUpdate();
+            return false;
+          }
+          return true;
+        }
         const now = Date.now();
+        if (event && event.type === 'contextmenu' && now - lastSecondaryRedClaimedAt < 650) {
+          claimSentenceEvent(event);
+          clearTextSelectionAfterSecondaryRed();
+          return false;
+        }
+        if (!sentence) { return true; }
+        if (hasSystemTextSelection()) {
+          clearTextSelectionAfterSecondaryRed();
+        }
         const index = sentence.dataset.srIndex || '';
         if (index && lastSecondaryRedIndex === index && now - lastSecondaryRedAt < 320) {
           claimSentenceEvent(event);
@@ -6781,6 +7801,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         lastSecondaryRedAt = now;
         lastSecondaryRedIndex = index;
+        lastSecondaryRedClaimedAt = now;
         return toggleRed(sentence, event);
       }
       function undoLast() {
@@ -6810,11 +7831,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             });
           });
         }
+        if (action.type === 'selectionRed') {
+          selectionRedFragments = normalizeSelectionFragments(action.previousFragments || []);
+          renderSelectionRedFragments();
+          post({
+            type: 'selectionRedUndo',
+            actionType: 'selectionRed',
+            text: action.text || '',
+            index: action.index || '',
+            indexes: action.indexes || [],
+            fragments: action.fragments || [],
+            redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length
+          });
+          return false;
+        }
+        if (action.type === 'selectionRedRemove') {
+          addSelectionRedFragments(action.fragments || []);
+          post({
+            type: 'selectionRed',
+            actionType: 'selectionRedRemove',
+            text: action.text || '',
+            index: action.index || '',
+            indexes: action.indexes || [],
+            fragments: action.fragments || [],
+            redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length
+          });
+          return false;
+        }
         return false;
       }
       window.__sentenceReaderUndo = undoLast;
       window.__sentenceReaderTurnPage = turnPage;
       document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape') {
+          hideSelectionActionBar();
+          return;
+        }
         if (shouldLetSystemHandle(event)) { return; }
         if ((event.metaKey || event.ctrlKey) && !event.shiftKey && event.key && event.key.toLowerCase() === 'z') {
           event.preventDefault();
@@ -6892,6 +7944,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       }, true);
       document.addEventListener('dblclick', function (event) {
         if (shouldLetSystemHandle(event, { respectSelection: false })) { return; }
+        suppressSelectionActionBar(520);
         if (notePreviewTimer) {
           window.clearTimeout(notePreviewTimer);
           notePreviewTimer = 0;
@@ -6899,6 +7952,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const sentence = sentenceFromTarget(event.target) || fallbackSentence();
         if (!sentence) { return; }
         claimSentenceEvent(event);
+        clearTextSelection();
+        suppressSelectionActionBar(520);
         clearWordFocus();
         focus(sentence);
         const hit = event.altKey ? lookupWordHitFromEvent(event) : null;
@@ -6923,6 +7978,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       document.oncontextmenu = function (event) {
         return toggleRedFromSecondaryEvent(event);
       };
+      document.addEventListener('mousedown', beginSelectionActionDrag, true);
+      document.addEventListener('mousemove', updateSelectionActionDrag, true);
+      document.addEventListener('mouseup', finishSelectionActionDrag, true);
+      document.addEventListener('dragend', finishSelectionActionDrag, true);
+      document.addEventListener('selectionchange', hideSelectionActionBarWhenSelectionGone, true);
 
       wrap();
       invalidatePagination();

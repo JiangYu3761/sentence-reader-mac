@@ -28,7 +28,9 @@ SWIFT_MARKERS = {
     "system routing guard": "shouldLetSystemHandle",
     "context red routing guard": "shouldLetSystemHandleContext",
     "sentence event claim helper": "claimSentenceEvent",
-    "single context red route": "return toggleRed(sentenceFromTarget(event.target), event);",
+    "secondary click point sentence route": "function sentenceFromPoint(x, y)",
+    "secondary click event sentence route": "const sentence = sentenceFromEvent(event);",
+    "secondary red clears WebKit residual selection": "function clearTextSelectionAfterSecondaryRed()",
     "single sentence before selection red": "if (sentence) {\n          return toggleRedSentences([sentence], event);\n        }",
     "double click note default": "double-click-note",
     "range intersection": "rangesIntersect",
@@ -63,10 +65,6 @@ def main() -> int:
         forbidden_markers = [
             ".rightMouseDown",
             "__sentenceReaderToggleRedAtPoint",
-            "toggleRedFromSecondaryEvent",
-            "lastSecondaryRedAt",
-            "document.addEventListener('mousedown'",
-            "document.addEventListener('auxclick'",
         ]
         present_forbidden = [marker for marker in forbidden_markers if marker in text]
         if present_forbidden:

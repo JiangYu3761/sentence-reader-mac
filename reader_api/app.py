@@ -14,15 +14,17 @@ import sys
 import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qs, quote
+from urllib.request import Request as URLRequest, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree as ET
 
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi import Body, FastAPI, HTTPException, Request as FastAPIRequest
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from reader_api import db
@@ -35,6 +37,8 @@ from reader_api.mobile_workspace import (
     extract_json_object,
     mac_voice_pipeline_transcribe,
     router as mobile_workspace_router,
+    should_use_lite_ui,
+    apply_lite_ui_cookie,
 )
 
 
@@ -1059,13 +1063,13 @@ def lan_reader_html() -> str:
   </section>
   <script>
     const initialBookID = new URLSearchParams(window.location.search).get('book_id');
-    const state = { books: [], book: null, manifest: null, chapterIndex: 0, annotations: [], focused: null, redIDs: new Map(), noteByIndex: new Map(), saveTimer: 0, noteTimer: 0, sentenceTapTimer: 0, voiceToastTimer: 0, noteEditorAnnotationID: '', noteEditorAudioNoteID: '', pendingAudioPolls: new Map(), pageIndex: 0, totalPages: 1, pageTurnLockUntil: 0, pendingPageTurnDirection: 0, pendingPageTurnTimer: 0, wheelGestureDirection: 0, wheelGestureDistance: 0, wheelGestureConsumed: false, lastWheelEventAt: 0, wheelInertiaLockUntil: 0, touchStartX: 0, touchStartY: 0, touchStartTime: 0, touchSentence: null, longPressTimer: 0, longPressTriggered: false, recognition: null, mediaRecorder: null, nativeReaderAudioRecording: false, voiceChunks: [], voiceStartedAt: 0, voiceStream: null, lookup: null };
+    const state = { books: [], book: null, manifest: null, chapterIndex: 0, annotations: [], focused: null, redIDs: new Map(), noteByIndex: new Map(), saveTimer: 0, noteTimer: 0, sentenceTapTimer: 0, voiceToastTimer: 0, noteEditorAnnotationID: '', noteEditorAudioNoteID: '', pendingAudioPolls: new Map(), pageIndex: 0, totalPages: 1, pageTurnLockUntil: 0, pendingPageTurnDirection: 0, pendingPageTurnTimer: 0, wheelGestureDirection: 0, wheelGestureDistance: 0, wheelGestureConsumed: false, lastWheelEventAt: 0, wheelInertiaLockUntil: 0, wheelGestureReleaseUntil: 0, touchStartX: 0, touchStartY: 0, touchStartTime: 0, touchSentence: null, longPressTimer: 0, longPressTriggered: false, recognition: null, mediaRecorder: null, nativeReaderAudioRecording: false, voiceChunks: [], voiceStartedAt: 0, voiceStream: null, lookup: null };
     // Keep the physical wheel gesture boundary separate from page animation:
     // one swipe triggers one page, while the next clear swipe may arrive before the animation ends.
     const pageTurnCooldownMs = 120;
-    const wheelInertiaLockMs = 180;
-    const wheelGestureIdleMs = 220;
-    const wheelPageTurnThreshold = 96;
+    const wheelInertiaLockMs = 520;
+    const wheelGestureIdleMs = 420;
+    const wheelPageTurnThreshold = 120;
     const wheelDominanceRatio = 1.25;
     const $ = (id) => document.getElementById(id);
     const voiceNotePendingText = '语音转写中...';
@@ -1166,6 +1170,7 @@ def lan_reader_html() -> str:
       if (!state.manifest) return false;
       const now = Date.now();
       if (now < state.pageTurnLockUntil) {
+        if (options.allowQueue === false) return false;
         schedulePendingPageTurn(direction);
         return false;
       }
@@ -1188,20 +1193,30 @@ def lan_reader_html() -> str:
       state.wheelGestureDirection = 0;
       state.wheelGestureDistance = 0;
       state.wheelGestureConsumed = false;
+      state.wheelGestureReleaseUntil = 0;
     }
     function handleHorizontalWheel(event) {
       const now = Date.now();
       const absX = Math.abs(event.deltaX || 0);
       const absY = Math.abs(event.deltaY || 0);
-      const startsNewGesture = now - state.lastWheelEventAt > wheelGestureIdleMs;
+      const startsNewGesture = state.lastWheelEventAt === 0 || (now - state.lastWheelEventAt > wheelGestureIdleMs && now > state.wheelGestureReleaseUntil);
       if (startsNewGesture) resetWheelGesture();
       state.lastWheelEventAt = now;
       if (absX < 10 || absX < absY * wheelDominanceRatio) {
-        resetWheelGesture();
+        if (!state.wheelGestureConsumed) {
+          resetWheelGesture();
+        } else {
+          state.wheelGestureReleaseUntil = now + wheelGestureIdleMs;
+        }
         return false;
+      }
+      if (state.wheelGestureConsumed) {
+        state.wheelGestureReleaseUntil = now + wheelGestureIdleMs;
+        return true;
       }
       if (now < state.wheelInertiaLockUntil && !startsNewGesture) {
         state.wheelGestureConsumed = true;
+        state.wheelGestureReleaseUntil = now + wheelGestureIdleMs;
         return true;
       }
       const direction = event.deltaX > 0 ? 1 : -1;
@@ -1216,7 +1231,8 @@ def lan_reader_html() -> str:
         const turnDirection = state.wheelGestureDirection;
         state.wheelGestureConsumed = true;
         state.wheelInertiaLockUntil = now + wheelInertiaLockMs;
-        void turnPage(turnDirection);
+        state.wheelGestureReleaseUntil = now + wheelGestureIdleMs;
+        void turnPage(turnDirection, { fromWheel: true, allowQueue: false });
       }
       return true;
     }
@@ -1521,15 +1537,11 @@ def lan_reader_html() -> str:
     window.__SentenceReaderInteractionRouter = {
       contractVersion: 'sentence-reader-interaction-v1',
       priority: 'sentence-reader-first',
-      systemWhen: ['editable-target', 'active-text-selection'],
+      systemWhen: ['editable-target'],
       sentenceWhen: ['tap-focus-actions', 'english-tap-lookup', 'double-tap-note', 'context-click-red', 'long-press-red'],
       sentenceContextWinsEvenWithSelection: true,
-      copyPath: 'command-c-or-non-sentence-context-menu'
+      copyPath: 'command-c'
     };
-    function hasSystemTextSelection() {
-      const selection = window.getSelection && window.getSelection();
-      return !!(selection && !selection.isCollapsed && String(selection.toString() || '').trim().length > 0);
-    }
     function isEditableTarget(target) {
       const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
       if (!node || !node.closest) return false;
@@ -1537,7 +1549,6 @@ def lan_reader_html() -> str:
     }
     function shouldLetSystemHandle(event, options = {}) {
       if (isEditableTarget(event && event.target)) return true;
-      if (options.respectSelection !== false && hasSystemTextSelection()) return true;
       return false;
     }
     function claimSentenceEvent(event) {
@@ -1550,7 +1561,7 @@ def lan_reader_html() -> str:
       if (isEditableTarget(event && event.target)) return true;
       const node = event && event.target && event.target.closest && event.target.closest('.sr-sentence');
       if (node) return false;
-      return hasSystemTextSelection();
+      return false;
     }
     async function updateVocabStatus(statusValue) {
       const item = state.lookup && state.lookup.item;
@@ -4877,10 +4888,10 @@ def start_lan_audio_note_transcription(audio_note_id: str, audio_path: Path, mim
 def funasr_server_json(path: str, payload: Optional[dict[str, Any]] = None, timeout: float = 45.0) -> dict[str, Any]:
     url = f"http://127.0.0.1:18081{path}"
     if payload is None:
-        request = Request(url, method="GET")
+        request = URLRequest(url, method="GET")
     else:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+        request = URLRequest(url, data=body, method="POST", headers={"Content-Type": "application/json"})
     with urlopen(request, timeout=timeout) as response:  # noqa: S310 - local-only FunASR service.
         return json.loads(response.read().decode("utf-8"))
 
@@ -5477,6 +5488,13 @@ def library_page_html() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sentence Reader Library</title>
+  <script>
+    (function(){
+      var forcedModern = /(?:^|[?&])ui=modern(?:&|$)/.test(window.location.search || '');
+      var ok = !!(window.Promise && window.fetch && document.querySelector && window.addEventListener);
+      if (!forcedModern && !ok) window.location.replace('/library-lite?reason=capability');
+    }());
+  </script>
   <style>
     :root { color-scheme: dark; --bg:#090b10; --panel:#11151d; --panel-2:#171c26; --line:#283142; --text:#f5f7fb; --muted:#9ca8ba; --blue:#4f8cff; --green:#28c76f; --red:#ff5f57; --amber:#ffb020; }
     * { box-sizing:border-box; }
@@ -5774,6 +5792,822 @@ def library_page_html() -> str:
 </html>"""
 
 
+class LiteHTMLTextExtractor(HTMLParser):
+    block_tags = {"p", "section", "article", "li", "br", "h1", "h2", "h3", "h4", "blockquote"}
+    skip_tags = {"head", "script", "style", "nav", "svg"}
+    skip_class_tokens = {"nav", "navigation", "toc", "calibre_nav"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    @staticmethod
+    def attr_value(attrs: list[tuple[str, Optional[str]]], name: str) -> str:
+        for key, value in attrs:
+            if key.lower() == name:
+                return str(value or "")
+        return ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        tag_name = tag.lower()
+        if self.skip_depth:
+            self.skip_depth += 1
+            return
+        class_tokens = set(re.split(r"\s+", self.attr_value(attrs, "class").strip().lower()))
+        role = self.attr_value(attrs, "role").strip().lower()
+        epub_type = self.attr_value(attrs, "epub:type").strip().lower()
+        if (
+            tag_name in self.skip_tags
+            or bool(class_tokens & self.skip_class_tokens)
+            or role in {"navigation", "doc-toc"}
+            or epub_type == "toc"
+        ):
+            self.skip_depth = 1
+            return
+        if tag_name in self.block_tags:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.skip_depth:
+            self.skip_depth = max(0, self.skip_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth:
+            return
+        text = str(data or "").strip()
+        if text:
+            self.parts.append(text)
+
+    def text(self) -> str:
+        raw = " ".join(self.parts).replace("\xa0", " ")
+        raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+        raw = re.sub(r"\s*\n\s*", "\n", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        return raw.strip()
+
+
+LITE_INLINE_NAV_RE = re.compile(
+    r"^(上一篇|下一篇|回目录|回页首|回页頂|上一章|下一章|previous|next|contents|top)(\s*[|｜/·,，;；-]\s*(上一篇|下一篇|回目录|回页首|回页頂|上一章|下一章|previous|next|contents|top))*$",
+    flags=re.IGNORECASE,
+)
+
+
+def lite_clean_text(text: str) -> str:
+    lines: list[str] = []
+    for line in re.split(r"\n+", str(text or "")):
+        clean = re.sub(r"\s+", " ", line).strip()
+        if not clean:
+            continue
+        nav_compact = re.sub(r"\s+", "", clean)
+        if nav_compact in {"上一篇回目录下一篇", "上一篇回页首回目录下一篇", "回目录", "回页首", "上一章下一章"}:
+            continue
+        if LITE_INLINE_NAV_RE.match(clean):
+            continue
+        lines.append(clean)
+    return "\n".join(lines).strip()
+
+
+def lite_extract_text(html_text: str) -> str:
+    parser = LiteHTMLTextExtractor()
+    parser.feed(str(html_text or ""))
+    parser.close()
+    return lite_clean_text(parser.text())
+
+
+def lite_split_sentences(text: str) -> list[str]:
+    sentences: list[str] = []
+    for paragraph in re.split(r"\n+", str(text or "")):
+        paragraph = re.sub(r"\s+", " ", paragraph).strip()
+        if not paragraph:
+            continue
+        for part in re.split(r"(?<=[。！？!?])\s*|(?<=[.!?])\s+", paragraph):
+            clean = part.strip()
+            if not clean:
+                continue
+            if len(clean) <= 520:
+                sentences.append(clean)
+            else:
+                for index in range(0, len(clean), 420):
+                    chunk = clean[index : index + 420].strip()
+                    if chunk:
+                        sentences.append(chunk)
+    return sentences or ([text.strip()] if str(text or "").strip() else [])
+
+
+def lite_chapter_payload(book_id: str, chapter_index: int) -> dict[str, Any]:
+    book = book_with_latest_file(book_id)
+    epub_path = epub_path_for_book(book)
+    publication = epub_publication(epub_path, book=book)
+    chapters = publication["chapters"]
+    if chapter_index < 0 or chapter_index >= len(chapters):
+        raise HTTPException(status_code=404, detail="chapter not found")
+    chapter = chapters[chapter_index]
+    with zipfile.ZipFile(epub_path) as epub:
+        try:
+            raw_html = zip_text(epub, chapter["href"])
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="chapter asset missing") from exc
+    text = lite_extract_text(raw_html)
+    return {
+        "book": jsonable(book),
+        "publication": publication,
+        "chapters": chapters,
+        "chapter": chapter,
+        "chapter_index": chapter_index,
+        "sentences": lite_split_sentences(text),
+    }
+
+
+LITE_FRONT_MATTER_RE = re.compile(
+    r"(版权|图书在版|CIP|ISBN|责任编辑|版权所有|书名原文|中国版本图书馆)",
+    flags=re.IGNORECASE,
+)
+LITE_FRONT_MATTER_TITLE_RE = re.compile(
+    r"^(cover|title\s*page|封面|扉页|目录|目次|table\s+of\s+contents|contents|版权|版权页|copyright)$",
+    flags=re.IGNORECASE,
+)
+LITE_FRONT_MATTER_HREF_RE = re.compile(
+    r"(^|/)(cover[^/]*|titlepage|title-page|toc|contents?|nav|copyright|[^/]*index|section0*1)\.(x?html?|xml)$",
+    flags=re.IGNORECASE,
+)
+LITE_READING_CHAPTER_RE = re.compile(
+    r"(第\s*\d+\s*[章节篇]|第[一二三四五六七八九十百零〇]+[章节篇]|引言|前言|序|推荐序|正文|Chapter)",
+    flags=re.IGNORECASE,
+)
+LITE_MAIN_CHAPTER_RE = re.compile(
+    r"(第\s*\d+\s*[章节篇]|第[一二三四五六七八九十百零〇]+[章节篇]|Chapter\s+\d+)",
+    flags=re.IGNORECASE,
+)
+LITE_FIRST_MAIN_CHAPTER_RE = re.compile(
+    r"(第\s*1\s*[章节篇]|第一[章节篇]|Chapter\s+1\b)",
+    flags=re.IGNORECASE,
+)
+LITE_SCREEN_PAGED_MODE = "screen_paged"
+
+
+def lite_is_probable_front_matter(chapter: dict[str, Any], toc_title: str = "") -> bool:
+    title = re.sub(r"\s+", " ", str(toc_title or chapter.get("title") or "")).strip()
+    href = str(chapter.get("href") or chapter.get("locator") or "").strip()
+    if LITE_FRONT_MATTER_TITLE_RE.search(title):
+        return True
+    if LITE_FRONT_MATTER_HREF_RE.search(href):
+        return True
+    return False
+
+
+def lite_reading_order(book_id: str) -> dict[str, Any]:
+    book = book_with_latest_file(book_id)
+    epub_path = epub_path_for_book(book)
+    publication = epub_publication(epub_path, book=book)
+    toc_by_chapter: dict[int, dict[str, Any]] = {}
+    for entry in publication.get("toc") or []:
+        try:
+            chapter_index = int(entry.get("chapter_index"))
+        except (TypeError, ValueError):
+            continue
+        current = toc_by_chapter.get(chapter_index)
+        if current is None or int(entry.get("level") or 0) < int(current.get("level") or 0):
+            toc_by_chapter[chapter_index] = dict(entry)
+    reading_order: list[dict[str, Any]] = []
+    for chapter in publication["chapters"]:
+        index = int(chapter.get("index") or 0)
+        toc_entry = toc_by_chapter.get(index) or {}
+        toc_title = str(toc_entry.get("title") or "").strip()
+        title = toc_title or str(chapter.get("title") or "").strip() or f"第 {index + 1} 节"
+        reading_order.append(
+            {
+                "book_id": book_id,
+                "chapter_index": index,
+                "href": str(chapter.get("href") or ""),
+                "title": str(chapter.get("title") or ""),
+                "toc_title": toc_title,
+                "display_title": title,
+                "level": int(toc_entry.get("level") or 0),
+                "is_probable_front_matter": lite_is_probable_front_matter(chapter, toc_title),
+            }
+        )
+    return {"book": jsonable(book), "publication": publication, "reading_order": reading_order}
+
+
+def lite_chapter_readability_score(payload: dict[str, Any]) -> int:
+    sentences = [str(item or "").strip() for item in (payload.get("sentences") or []) if str(item or "").strip()]
+    if not sentences:
+        return 0
+    chapter = payload.get("chapter") or {}
+    title = str(chapter.get("title") or "")
+    preview = " ".join(sentences[:12])
+    if LITE_FRONT_MATTER_RE.search(title) or LITE_FRONT_MATTER_RE.search(preview[:700]):
+        return 0
+    score = min(len(preview), 2000) + min(len(sentences), 30) * 20
+    if LITE_READING_CHAPTER_RE.search(title) or LITE_READING_CHAPTER_RE.search(preview[:120]):
+        score += 1000
+    return score
+
+
+def lite_first_readable_chapter_payload(
+    book_id: str,
+    chapter_index: int,
+    *,
+    prefer_main_chapter: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    manifest = lite_reading_order(book_id)
+    reading_order = manifest["reading_order"]
+    chapter_count = len(reading_order)
+    if chapter_count <= 1:
+        return lite_chapter_payload(book_id, chapter_index), False
+    if chapter_index < 0 or chapter_index >= chapter_count:
+        chapter_index = 0
+    scan_order = list(range(chapter_index + 1, chapter_count)) + list(range(0, chapter_index))
+    current_entry = reading_order[chapter_index]
+    current = lite_chapter_payload(book_id, chapter_index)
+    current_score = lite_chapter_readability_score(current)
+    current_title = str(current_entry.get("display_title") or "")
+    if current_score > 0 and not current_entry.get("is_probable_front_matter") and (
+        not prefer_main_chapter or LITE_MAIN_CHAPTER_RE.search(current_title)
+    ):
+        return current, False
+    fallback: Optional[tuple[dict[str, Any], bool]] = None
+    main_fallback: Optional[tuple[dict[str, Any], bool]] = None
+    for candidate_index in scan_order:
+        entry = reading_order[candidate_index]
+        if entry.get("is_probable_front_matter"):
+            continue
+        candidate = lite_chapter_payload(book_id, candidate_index)
+        score = lite_chapter_readability_score(candidate)
+        if score <= 0:
+            continue
+        candidate_title = str(entry.get("display_title") or (candidate.get("chapter") or {}).get("title") or "")
+        candidate_preview = " ".join(str(item or "") for item in (candidate.get("sentences") or [])[:3])
+        candidate_label = f"{candidate_title} {candidate_preview[:160]}"
+        if not prefer_main_chapter:
+            return candidate, True
+        if LITE_FIRST_MAIN_CHAPTER_RE.search(candidate_label):
+            return candidate, True
+        if LITE_MAIN_CHAPTER_RE.search(candidate_label) and main_fallback is None:
+            main_fallback = (candidate, True)
+        if fallback is None:
+            fallback = (candidate, True)
+    if main_fallback is not None:
+        return main_fallback
+    if fallback is not None:
+        return fallback
+    return current, False
+
+
+def lite_adjacent_readable_chapter_index(book_id: str, chapter_index: int, direction: int) -> Optional[int]:
+    manifest = lite_reading_order(book_id)
+    reading_order = manifest["reading_order"]
+    if not reading_order:
+        return None
+    indexes = [int(entry.get("chapter_index") or 0) for entry in reading_order]
+    try:
+        current_position = indexes.index(int(chapter_index))
+    except ValueError:
+        current_position = 0
+    step = 1 if direction >= 0 else -1
+    position = current_position + step
+    while 0 <= position < len(reading_order):
+        entry = reading_order[position]
+        if not entry.get("is_probable_front_matter"):
+            return int(entry.get("chapter_index") or 0)
+        position += step
+    return None
+
+
+def lite_chapter_index_for_locator(book_id: str, chapter_locator: str) -> Optional[int]:
+    locator = str(chapter_locator or "").split("#", 1)[0].strip()
+    if not locator:
+        return None
+    try:
+        book = book_with_latest_file(book_id)
+        publication = epub_publication(epub_path_for_book(book), book=book)
+    except Exception:
+        return None
+    for chapter in publication.get("chapters") or []:
+        if locator in {str(chapter.get("locator") or ""), str(chapter.get("href") or "")}:
+            return int(chapter.get("index") or 0)
+    return None
+
+
+def lite_continue_href(book_id: str, progress: dict[str, Any]) -> str:
+    if progress.get("has_position"):
+        chapter_index = lite_chapter_index_for_locator(book_id, str(progress.get("chapter_locator") or ""))
+        if chapter_index is not None:
+            return f"/reader-lite?{lite_query(book_id=book_id, chapter=chapter_index, page=int(progress.get('page_index') or 0), auto=0)}"
+    return f"/reader-lite?{lite_query(book_id=book_id, auto=1)}"
+
+
+def lite_reading_progress_ratio(book_id: str, chapter_index: int, page_index: int = 0, total_pages: int = 1) -> float:
+    try:
+        manifest = lite_reading_order(book_id)
+    except Exception:
+        return 0.0
+    readable = [
+        int(entry.get("chapter_index") or 0)
+        for entry in manifest.get("reading_order") or []
+        if not entry.get("is_probable_front_matter")
+    ]
+    if not readable:
+        return 0.0
+    try:
+        position = readable.index(int(chapter_index))
+    except ValueError:
+        return 0.0
+    safe_total_pages = max(1, int(total_pages or 1))
+    safe_page = max(0, min(int(page_index or 0), safe_total_pages - 1))
+    intra_chapter = safe_page / float(safe_total_pages)
+    return max(0.0, min(1.0, (position + intra_chapter) / float(len(readable))))
+
+
+def lite_upsert_reading_position(
+    book_id: str,
+    chapter: dict[str, Any],
+    chapter_index: int,
+    *,
+    page_index: int = 0,
+    total_pages: int = 1,
+    first_sentence_index: Optional[str] = None,
+) -> None:
+    safe_total_pages = max(1, int(total_pages or 1))
+    safe_page = max(0, min(int(page_index or 0), safe_total_pages - 1))
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO reader.reading_positions (
+                book_id, chapter_id, chapter_locator, page_index, total_pages, page_ratio, locator, updated_at
+            )
+            VALUES (%s, NULL, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (book_id) DO UPDATE
+            SET chapter_locator = EXCLUDED.chapter_locator,
+                page_index = EXCLUDED.page_index,
+                total_pages = EXCLUDED.total_pages,
+                page_ratio = EXCLUDED.page_ratio,
+                locator = EXCLUDED.locator,
+                updated_at = now()
+            """,
+            (
+                book_id,
+                str(chapter.get("locator") or chapter.get("href") or ""),
+                safe_page,
+                safe_total_pages,
+                lite_reading_progress_ratio(book_id, chapter_index, safe_page, safe_total_pages),
+                db.jsonb(
+                    {
+                        "source": "ClickLiteReader",
+                        "chapterIndex": chapter_index,
+                        "pageIndex": safe_page,
+                        "totalPages": safe_total_pages,
+                        "firstSentenceIndex": str(first_sentence_index or ""),
+                        "chapterTitle": str(chapter.get("title") or ""),
+                        "mode": LITE_SCREEN_PAGED_MODE,
+                    }
+                ),
+            ),
+        )
+
+
+def lite_sentence_index(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("sentenceIndex") is not None:
+        return str(metadata.get("sentenceIndex"))
+    locator = row.get("range_locator") or {}
+    if isinstance(locator, dict):
+        for key in ("sentenceIndex", "sentence_index"):
+            if locator.get(key) is not None:
+                return str(locator.get(key))
+    return ""
+
+
+def lite_annotations_by_sentence(book_id: str, chapter_locator: str) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for row in list_annotations(book_id):
+        if str(row.get("chapter_locator") or "") != str(chapter_locator or ""):
+            continue
+        sentence_index = lite_sentence_index(row)
+        if not sentence_index:
+            continue
+        bucket = output.setdefault(sentence_index, {})
+        if row.get("kind") == "red_highlight":
+            bucket["red"] = row
+        elif row.get("kind") == "note":
+            bucket["note"] = row
+    return output
+
+
+def lite_query(**params: Any) -> str:
+    parts = []
+    for key, value in params.items():
+        if value is None:
+            continue
+        parts.append(f"{quote(str(key))}={quote(str(value))}")
+    return "&".join(parts)
+
+
+def library_lite_html(request: FastAPIRequest) -> str:
+    payload = library_dashboard_payload(include_hidden=False)
+    rows: list[str] = []
+    for book in payload.get("books") or []:
+        counts = book.get("counts") or {}
+        progress = book.get("progress") or {}
+        status = book.get("status") or {}
+        title = html_escape(str(book.get("title") or "未命名书籍"))
+        author = html_escape(str(book.get("author") or "未知作者"))
+        meta = f"{int(progress.get('percent') or 0)}% · 备注 {int(counts.get('notes') or 0)} · 红标 {int(counts.get('red_highlights') or 0)}"
+        if status.get("lan_available"):
+            book_id = str(book.get("id") or "")
+            continue_href = lite_continue_href(book_id, progress)
+            toc_href = f"/reader-lite/toc?book_id={quote(book_id)}"
+            action = f'<div class="actions"><a class="open primary" href="{continue_href}">继续读</a><a class="open secondary" href="{toc_href}">目录</a></div>'
+        else:
+            action = '<span class="disabled">此书暂不支持 Lite 阅读</span>'
+        rows.append(
+            f"""<li>
+  <div><strong>{title}</strong><span>{author}</span><em>{html_escape(meta)}</em></div>
+  {action}
+</li>"""
+        )
+    if not rows:
+        rows.append('<li><div><strong>暂无书籍</strong><span>请先在现代书库导入 EPUB。</span></div></li>')
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Click Lite 书库</title>
+  <style>
+    body{{margin:0;background:#080806;color:#f6f0e8;font-family:Arial,"Microsoft YaHei",sans-serif}}
+    main{{max-width:760px;margin:0 auto;padding:18px 14px 34px}}
+    h1{{font-size:30px;margin:0 0 12px}}
+    a{{color:#f0d36b;text-decoration:none}}
+    .top{{margin-bottom:16px}}
+    ul{{list-style:none;margin:0;padding:0}}
+    li{{border:1px solid #332f24;background:#14120d;margin:10px 0;padding:14px;overflow:hidden}}
+    strong{{display:block;font-size:21px;line-height:1.25}}
+    span,em{{display:block;color:#bdb4a5;font-size:14px;font-style:normal;margin-top:5px}}
+    .actions{{display:flex;gap:8px;margin-top:12px}}
+    .open,.disabled{{display:block;padding:12px 14px;background:#f0d36b;color:#15120a;font-weight:800;text-align:center}}
+    .actions .open{{flex:1}}
+    .secondary{{background:#211f18;color:#f0d36b;border:1px solid #4b3e20}}
+    .disabled{{background:#2a2923;color:#aaa}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="top"><a href="/home-lite">返回首页</a></div>
+  <h1>Click Lite 书库</h1>
+  <ul>{''.join(rows)}</ul>
+</main>
+</body>
+</html>"""
+
+
+def reader_lite_html(
+    request: FastAPIRequest,
+    *,
+    book_id: str,
+    chapter_index: int,
+    page_index: int,
+    selected_sentence: Optional[str] = None,
+    auto_skip: bool = False,
+    notice: str = "",
+) -> str:
+    if auto_skip:
+        payload, skipped_empty_chapter = lite_first_readable_chapter_payload(
+            book_id,
+            chapter_index,
+            prefer_main_chapter=True,
+        )
+    else:
+        payload = lite_chapter_payload(book_id, chapter_index)
+        skipped_empty_chapter = False
+    book = payload["book"]
+    chapter = payload["chapter"]
+    chapter_index = int(payload["chapter_index"])
+    sentences = payload["sentences"]
+    page_index = max(0, int(page_index or 0))
+    lite_upsert_reading_position(book_id, chapter, chapter_index, page_index=page_index, total_pages=max(1, page_index + 1))
+    prev_href = ""
+    next_href = ""
+    prev_chapter = lite_adjacent_readable_chapter_index(book_id, chapter_index, -1)
+    if prev_chapter is not None:
+        prev_href = f"/reader-lite?{lite_query(book_id=book_id, chapter=prev_chapter, page=0, auto=0)}"
+    next_chapter = lite_adjacent_readable_chapter_index(book_id, chapter_index, 1)
+    if next_chapter is not None:
+        next_href = f"/reader-lite?{lite_query(book_id=book_id, chapter=next_chapter, page=0, auto=0)}"
+    annotations = lite_annotations_by_sentence(book_id, str(chapter.get("locator") or ""))
+    sentence_blocks: list[str] = []
+    for offset, sentence in enumerate(sentences):
+        sentence_index = str(offset)
+        existing = annotations.get(sentence_index) or {}
+        red = existing.get("red")
+        note = existing.get("note")
+        is_selected = str(selected_sentence or "") == sentence_index
+        red_class = " red" if red else ""
+        selected_class = " selected" if is_selected else ""
+        selected_href = f"/reader-lite?{lite_query(book_id=book_id, chapter=chapter_index, page=page_index, selected=sentence_index, auto=0)}#s{sentence_index}"
+        red_badge = '<span class="badge">已标红</span>' if red else ""
+        note_badge = '<span class="badge">有备注</span>' if note else ""
+        sentence_html = f"""<div class="sentence-unit" data-sentence-index="{html_escape(sentence_index)}"><p class="sentence{red_class}{selected_class}" id="s{sentence_index}">
+  <a class="sentence-link" href="{selected_href}">{html_escape(sentence)}</a>
+  {red_badge}{note_badge}
+</p>"""
+        if is_selected:
+            note_text = html_escape(str((note or {}).get("note_text") or ""))
+            red_label = "取消红标" if red else "标红"
+            common_hidden = f"""
+      <input type="hidden" name="book_id" value="{html_escape(book_id)}">
+      <input type="hidden" name="chapter" value="{chapter_index}">
+      <input type="hidden" name="page" value="{page_index}">
+      <input type="hidden" name="selected" value="{html_escape(sentence_index)}">
+      <input type="hidden" name="sentence_index" value="{html_escape(sentence_index)}">
+      <input type="hidden" name="chapter_locator" value="{html_escape(str(chapter.get('locator') or ''))}">
+      <input type="hidden" name="chapter_title" value="{html_escape(str(chapter.get('title') or ''))}">
+      <input type="hidden" name="source_text" value="{html_escape(sentence)}">"""
+            sentence_html += f"""<section class="selected-panel">
+  <div class="selected-actions">
+    <form class="action-form" method="post" action="/reader-lite/red">{common_hidden}<button type="submit">{red_label}</button></form>
+    <details class="lite-action"><summary>备注</summary><form method="post" action="/reader-lite/note">{common_hidden}<textarea name="note_text" rows="3" placeholder="写备注">{note_text}</textarea><button type="submit">保存</button></form></details>
+    <details class="lite-action"><summary>语音</summary><form method="post" enctype="multipart/form-data" action="/reader-lite/audio-note">{common_hidden}<input type="file" name="audio_file" accept="audio/*" capture><button type="submit">上传</button></form></details>
+  </div>
+</section>"""
+        sentence_html += "</div>"
+        sentence_blocks.append(sentence_html)
+    if not sentence_blocks:
+        sentence_blocks.append('<p class="sentence extraction-failed">此章节正文提取失败。</p>')
+    prev_link = f'<a class="page-turn prev" id="prevPage" href="{prev_href}" aria-label="上一章">‹</a>' if prev_href else ""
+    next_link = f'<a class="page-turn next" id="nextPage" href="{next_href}" aria-label="下一章">›</a>' if next_href else ""
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{html_escape(str(book.get('title') or 'Click Lite 阅读'))}</title>
+  <style>
+    html,body{{min-height:100%}}
+    body{{margin:0;background:#080806;color:#f6f0e8;font-family:Arial,"Microsoft YaHei",sans-serif}}
+    main{{max-width:760px;margin:0 auto;padding:4px 10px 78px}}
+    a{{color:#f0d36b;text-decoration:none}}
+    .article{{font-size:22px;line-height:1.58}}
+    .sentence-unit{{display:block}}
+    .sentence{{margin:0 0 12px;padding:1px 0 7px;border-bottom:1px solid #17140f}}
+    .sentence.red{{background:#1c0f0d}}
+    .sentence-link{{color:#f6f0e8;text-decoration:none}}
+    .sentence.red .sentence-link{{color:#ffbeb8}}
+    .sentence.selected{{background:#1d1a12;outline:1px solid #f0d36b;padding:6px}}
+    .badge{{display:inline-block;margin:4px 6px 0 0;padding:2px 5px;background:#3a1714;color:#ffd4cd;font-size:11px;text-decoration:none}}
+    .selected-panel{{border:1px solid #f0d36b;background:#17150f;padding:6px;margin:6px 0 1px}}
+    .selected-actions{{display:flex;gap:6px;align-items:flex-start}}
+    .action-form,.lite-action{{flex:1;min-width:0;margin:0}}
+    .lite-action form{{margin-top:6px}}
+    summary{{cursor:pointer;color:#15120a;background:#f0d36b;font-weight:800;padding:9px 4px;text-align:center;list-style:none}}
+    summary::-webkit-details-marker{{display:none}}
+    button{{width:100%;border:0;background:#f0d36b;color:#15120a;font-weight:800;padding:9px 4px;font-size:16px}}
+    textarea{{width:100%;box-sizing:border-box;background:#090806;color:#f6f0e8;border:1px solid #383226;padding:10px;font-size:16px}}
+    input[type=file]{{display:block;width:100%;box-sizing:border-box;margin-bottom:8px;color:#f6f0e8}}
+    .page-turn{{position:fixed;top:35%;bottom:35%;z-index:20;width:34px;color:rgba(240,211,107,.18);font-size:38px;line-height:30vh;text-align:center;text-decoration:none;background:transparent}}
+    .page-turn.prev{{left:0}}
+    .page-turn.next{{right:0}}
+    .page-turn:active,.page-turn:focus{{color:#f0d36b;background:rgba(240,211,107,.08);outline:0}}
+    .lite-paged body{{height:100%;overflow:hidden}}
+    .lite-paged main{{height:100vh;overflow:hidden;box-sizing:border-box;padding-bottom:78px}}
+    .lite-paged .sentence-unit{{display:none}}
+  </style>
+</head>
+<body>
+{prev_link}{next_link}
+<main>
+  <article class="article">
+    {''.join(sentence_blocks)}
+  </article>
+</main>
+<script>
+(function(){{
+  document.documentElement.className += ' lite-paged';
+  var bookId = {json.dumps(book_id)};
+  var chapterIndex = {chapter_index};
+  var initialPage = {page_index};
+  var selectedSentence = {json.dumps(str(selected_sentence) if selected_sentence is not None else "")};
+  var previousHref = {json.dumps(prev_href)};
+  var nextHref = {json.dumps(next_href)};
+  var startX = 0;
+  var startY = 0;
+  var previous = document.getElementById('prevPage');
+  var next = document.getElementById('nextPage');
+  var article = document.getElementsByClassName('article')[0];
+  var units = article ? article.getElementsByClassName('sentence-unit') : [];
+  var pages = [];
+  var currentPage = 0;
+
+  function viewportHeight() {{
+    if (window.visualViewport && window.visualViewport.height) return window.visualViewport.height;
+    return window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight || 640;
+  }}
+
+  function bottomSafeReserve() {{
+    return 84;
+  }}
+
+  function unitHeight(unit) {{
+    unit.style.display = 'block';
+    var height = unit.offsetHeight || 1;
+    unit.style.display = 'none';
+    return height;
+  }}
+
+  function buildPages() {{
+    var maxHeight = Math.max(180, viewportHeight() - bottomSafeReserve());
+    var page = [];
+    var pageHeight = 0;
+    pages = [];
+    for (var index = 0; index < units.length; index += 1) {{
+      var unit = units[index];
+      var height = unitHeight(unit);
+      if (page.length && pageHeight + height > maxHeight) {{
+        pages.push(page);
+        page = [];
+        pageHeight = 0;
+      }}
+      page.push(unit);
+      pageHeight += height;
+    }}
+    if (page.length) pages.push(page);
+    if (!pages.length && units.length) pages.push([units[0]]);
+  }}
+
+  function selectedPageIndex() {{
+    if (!selectedSentence) return -1;
+    for (var pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {{
+      for (var itemIndex = 0; itemIndex < pages[pageIndex].length; itemIndex += 1) {{
+        if (pages[pageIndex][itemIndex].getAttribute('data-sentence-index') === selectedSentence) {{
+          return pageIndex;
+        }}
+      }}
+    }}
+    return -1;
+  }}
+
+  function savePosition() {{
+    var first = '';
+    if (pages[currentPage] && pages[currentPage][0]) {{
+      first = pages[currentPage][0].getAttribute('data-sentence-index') || '';
+    }}
+    var image = new Image();
+    image.src = '/reader-lite/position?book_id=' + encodeURIComponent(bookId)
+      + '&chapter=' + encodeURIComponent(String(chapterIndex))
+      + '&page=' + encodeURIComponent(String(currentPage))
+      + '&total_pages=' + encodeURIComponent(String(Math.max(1, pages.length)))
+      + '&first_sentence=' + encodeURIComponent(first)
+      + '&_=' + String(new Date().getTime());
+  }}
+
+  function setQueryParam(url, key, value) {{
+    var parts = String(url || '').split('#');
+    var hash = parts.length > 1 ? '#' + parts.slice(1).join('#') : '';
+    var base = parts[0];
+    var pair = encodeURIComponent(key) + '=' + encodeURIComponent(String(value));
+    if (base.indexOf('?') < 0) return base + '?' + pair + hash;
+    var queryParts = base.split('?');
+    var query = queryParts[1] ? queryParts[1].split('&') : [];
+    var found = false;
+    for (var i = 0; i < query.length; i += 1) {{
+      if (decodeURIComponent(query[i].split('=')[0] || '') === key) {{
+        query[i] = pair;
+        found = true;
+      }}
+    }}
+    if (!found) query.push(pair);
+    return queryParts[0] + '?' + query.join('&') + hash;
+  }}
+
+  function syncVisiblePageForms() {{
+    if (!pages[currentPage]) return;
+    for (var j = 0; j < pages[currentPage].length; j += 1) {{
+      var unit = pages[currentPage][j];
+      var links = unit.getElementsByTagName('a');
+      for (var linkIndex = 0; linkIndex < links.length; linkIndex += 1) {{
+        if (links[linkIndex].className.indexOf('sentence-link') >= 0) {{
+          links[linkIndex].href = setQueryParam(links[linkIndex].href, 'page', currentPage);
+        }}
+      }}
+      var inputs = unit.getElementsByTagName('input');
+      for (var inputIndex = 0; inputIndex < inputs.length; inputIndex += 1) {{
+        if (inputs[inputIndex].name === 'page') inputs[inputIndex].value = String(currentPage);
+      }}
+    }}
+  }}
+
+  function showPage(pageIndex, shouldSave) {{
+    if (!pages.length) return;
+    currentPage = Math.max(0, Math.min(pageIndex, pages.length - 1));
+    for (var i = 0; i < units.length; i += 1) units[i].style.display = 'none';
+    for (var j = 0; j < pages[currentPage].length; j += 1) pages[currentPage][j].style.display = 'block';
+    syncVisiblePageForms();
+    if (previous) previous.href = currentPage > 0 ? '#' : previousHref;
+    if (next) next.href = currentPage + 1 < pages.length ? '#' : nextHref;
+    window.scrollTo(0, 0);
+    if (shouldSave !== false) savePosition();
+  }}
+
+  function nextPage() {{
+    if (currentPage + 1 < pages.length) {{
+      showPage(currentPage + 1, true);
+      return false;
+    }}
+    return true;
+  }}
+
+  function previousPage() {{
+    if (currentPage > 0) {{
+      showPage(currentPage - 1, true);
+      return false;
+    }}
+    return true;
+  }}
+
+  if (previous) previous.onclick = function() {{ return previousPage(); }};
+  if (next) next.onclick = function() {{ return nextPage(); }};
+
+  document.addEventListener('touchstart', function(event){{
+    if (!event.touches || !event.touches.length) return;
+    startX = event.touches[0].clientX;
+    startY = event.touches[0].clientY;
+  }}, false);
+  document.addEventListener('touchend', function(event){{
+    if (!event.changedTouches || !event.changedTouches.length) return;
+    var dx = event.changedTouches[0].clientX - startX;
+    var dy = event.changedTouches[0].clientY - startY;
+    if (Math.abs(dx) < 54 || Math.abs(dx) < Math.abs(dy) * 1.4) return;
+    if (dx > 0 && previous && previousPage()) window.location.href = previous.href;
+    if (dx < 0 && next && nextPage()) window.location.href = next.href;
+  }}, false);
+
+  buildPages();
+  var selectedPage = selectedPageIndex();
+  showPage(selectedPage >= 0 ? selectedPage : initialPage, true);
+  window.onresize = function() {{
+    var first = '';
+    if (pages[currentPage] && pages[currentPage][0]) first = pages[currentPage][0].getAttribute('data-sentence-index') || '';
+    buildPages();
+    var target = 0;
+    for (var pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {{
+      for (var itemIndex = 0; itemIndex < pages[pageIndex].length; itemIndex += 1) {{
+        if (pages[pageIndex][itemIndex].getAttribute('data-sentence-index') === first) target = pageIndex;
+      }}
+    }}
+    showPage(target, true);
+  }};
+}}());
+</script>
+</body>
+</html>"""
+
+
+def reader_lite_toc_html(request: FastAPIRequest, *, book_id: str) -> str:
+    manifest = lite_reading_order(book_id)
+    book = manifest["book"]
+    reading_order = manifest["reading_order"]
+    rows: list[str] = []
+    for entry in reading_order:
+        index = int(entry.get("chapter_index") or 0)
+        title = str(entry.get("display_title") or "").strip() or f"第 {index + 1} 节"
+        level = max(0, min(int(entry.get("level") or 0), 4))
+        front = bool(entry.get("is_probable_front_matter"))
+        class_name = "front-matter" if front else "readable"
+        note = "<small>封面/版权/目录入口</small>" if front else ""
+        rows.append(
+            f"""<li class="{class_name}" style="padding-left:{level * 14}px">
+  <a href="/reader-lite?{lite_query(book_id=book_id, chapter=index, page=0, auto=0)}">{html_escape(title)}</a>{note}
+</li>"""
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Click Lite 目录</title>
+  <style>
+    body{{margin:0;background:#080806;color:#f6f0e8;font-family:Arial,"Microsoft YaHei",sans-serif}}
+    main{{max-width:760px;margin:0 auto;padding:14px 12px 36px}}
+    a{{color:#f0d36b;text-decoration:none}}
+    h1{{font-size:24px;margin:10px 0 14px}}
+    ol{{margin:0;padding:0;list-style:none}}
+    li{{border-bottom:1px solid #2b261d;padding:13px 0;font-size:19px;line-height:1.35}}
+    li a{{display:block;color:#f6f0e8}}
+    small{{display:block;color:#8f887d;font-size:13px;margin-top:4px}}
+    .front-matter a{{color:#8f887d}}
+  </style>
+</head>
+<body>
+<main>
+  <a href="/library-lite">返回书库</a> · <a href="/reader-lite?{lite_query(book_id=book_id, auto=1)}">开始阅读</a>
+  <h1>{html_escape(str(book.get('title') or '未命名书籍'))} 目录</h1>
+  <ol data-lite-manifest="readingOrder spine toc">{''.join(rows)}</ol>
+</main>
+</body>
+</html>"""
+
+
 def library_page_html_v2() -> str:
     return r'''<!doctype html>
 <html lang="zh-CN">
@@ -5781,6 +6615,13 @@ def library_page_html_v2() -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sentence Reader Library</title>
+  <script>
+    (function(){
+      var forcedModern = /(?:^|[?&])ui=modern(?:&|$)/.test(window.location.search || '');
+      var ok = !!(window.Promise && window.fetch && document.querySelector && window.addEventListener);
+      if (!forcedModern && !ok) window.location.replace('/library-lite?reason=capability');
+    }());
+  </script>
   <style>
     :root {
       color-scheme: dark;
@@ -6920,8 +7761,288 @@ def favicon() -> Response:
 
 
 @app.get("/library", response_class=HTMLResponse)
-def library_page() -> HTMLResponse:
-    return HTMLResponse(library_page_html_v2())
+def library_page(request: FastAPIRequest) -> HTMLResponse:
+    if should_use_lite_ui(request):
+        return apply_lite_ui_cookie(HTMLResponse(library_lite_html(request)), request)
+    return apply_lite_ui_cookie(HTMLResponse(library_page_html_v2()), request)
+
+
+@app.get("/library-lite", response_class=HTMLResponse)
+def library_lite_page(request: FastAPIRequest) -> HTMLResponse:
+    return apply_lite_ui_cookie(HTMLResponse(library_lite_html(request)), request)
+
+
+@app.get("/reader-lite", response_class=HTMLResponse)
+def reader_lite_page(
+    request: FastAPIRequest,
+    book_id: str,
+    chapter: int = 0,
+    page: int = 0,
+    selected: Optional[str] = None,
+    auto: int = 1,
+    notice: str = "",
+) -> HTMLResponse:
+    return apply_lite_ui_cookie(
+        HTMLResponse(
+            reader_lite_html(
+                request,
+                book_id=book_id,
+                chapter_index=chapter,
+                page_index=page,
+                selected_sentence=selected,
+                auto_skip=bool(auto),
+                notice=notice,
+            )
+        ),
+        request,
+    )
+
+
+@app.get("/reader-lite/toc", response_class=HTMLResponse)
+def reader_lite_toc_page(request: FastAPIRequest, book_id: str) -> HTMLResponse:
+    return apply_lite_ui_cookie(HTMLResponse(reader_lite_toc_html(request, book_id=book_id)), request)
+
+
+@app.get("/reader-lite/position")
+def reader_lite_position(
+    request: FastAPIRequest,
+    book_id: str,
+    chapter: int = 0,
+    page: int = 0,
+    total_pages: int = 1,
+    first_sentence: str = "",
+) -> Response:
+    payload = lite_chapter_payload(book_id, chapter)
+    lite_upsert_reading_position(
+        book_id,
+        payload["chapter"],
+        int(payload["chapter_index"]),
+        page_index=page,
+        total_pages=total_pages,
+        first_sentence_index=first_sentence,
+    )
+    return Response(status_code=204)
+
+
+def reader_lite_redirect(book_id: str, chapter: int, page: int, notice: str, selected: Optional[str] = None) -> RedirectResponse:
+    query = lite_query(book_id=book_id, chapter=chapter, page=page, selected=selected, auto=0, notice=notice)
+    suffix = f"#s{selected}" if selected else ""
+    url = f"/reader-lite?{query}{suffix}"
+    return RedirectResponse(url=url, status_code=303)
+
+
+def lite_parse_content_disposition(value: str) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for piece in str(value or "").split(";"):
+        piece = piece.strip()
+        if "=" not in piece:
+            continue
+        key, raw = piece.split("=", 1)
+        output[key.strip().lower()] = raw.strip().strip('"')
+    return output
+
+
+def lite_parse_multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    match = re.search(r'boundary="?([^";]+)"?', content_type or "", flags=re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=422, detail="multipart boundary missing")
+    boundary = ("--" + match.group(1)).encode("utf-8")
+    fields: dict[str, str] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for raw_part in body.split(boundary):
+        part = raw_part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if part.endswith(b"--"):
+            part = part[:-2].rstrip(b"\r\n")
+        if b"\r\n\r\n" not in part:
+            continue
+        header_blob, data = part.split(b"\r\n\r\n", 1)
+        headers: dict[str, str] = {}
+        for line in header_blob.decode("utf-8", errors="ignore").split("\r\n"):
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        disposition = lite_parse_content_disposition(headers.get("content-disposition", ""))
+        name = disposition.get("name", "")
+        if not name:
+            continue
+        filename = disposition.get("filename", "")
+        if filename:
+            if data.endswith(b"\r\n"):
+                data = data[:-2]
+            files[name] = {
+                "filename": filename,
+                "content_type": headers.get("content-type", "application/octet-stream"),
+                "data": data,
+            }
+        else:
+            fields[name] = data.decode("utf-8", errors="replace").strip()
+    return fields, files
+
+
+async def lite_request_form(request: FastAPIRequest) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    content_type = str(request.headers.get("content-type") or "")
+    body = await request.body()
+    if content_type.lower().startswith("application/x-www-form-urlencoded"):
+        parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+        return {key: values[-1] if values else "" for key, values in parsed.items()}, {}
+    if content_type.lower().startswith("multipart/form-data"):
+        return lite_parse_multipart(body, content_type)
+    raise HTTPException(status_code=415, detail="unsupported lite form content type")
+
+
+def lite_required(fields: dict[str, str], name: str) -> str:
+    value = str(fields.get(name) or "")
+    if not value and name in {"book_id", "sentence_index", "chapter_locator"}:
+        raise HTTPException(status_code=422, detail=f"{name} is required")
+    return value
+
+
+def lite_int(fields: dict[str, str], name: str, default: int = 0) -> int:
+    try:
+        return int(str(fields.get(name) or default))
+    except ValueError:
+        return default
+
+
+def reader_lite_annotation_payload(
+    *,
+    book_id: str,
+    sentence_index: str,
+    chapter_locator: str,
+    chapter_title: str,
+    source_text: str,
+    kind: str,
+    note_text: Optional[str] = None,
+    color: Optional[str] = None,
+) -> AnnotationCreate:
+    return AnnotationCreate(
+        book_id=book_id,
+        kind=kind,
+        source_text=source_text,
+        note_text=note_text,
+        color=color,
+        chapter_title=chapter_title,
+        chapter_locator=chapter_locator,
+        range_locator={"chapterLocator": chapter_locator, "sentenceIndex": sentence_index},
+        metadata={"source": "ClickLiteReader", "sentenceIndex": sentence_index},
+    )
+
+
+@app.post("/reader-lite/red")
+async def reader_lite_red(request: FastAPIRequest) -> RedirectResponse:
+    fields, _files = await lite_request_form(request)
+    book_id = lite_required(fields, "book_id")
+    chapter = lite_int(fields, "chapter")
+    page = lite_int(fields, "page")
+    sentence_index = lite_required(fields, "sentence_index")
+    chapter_locator = lite_required(fields, "chapter_locator")
+    chapter_title = str(fields.get("chapter_title") or "")
+    source_text = str(fields.get("source_text") or "")
+    existing = lite_annotations_by_sentence(book_id, chapter_locator).get(sentence_index, {}).get("red")
+    if existing:
+        delete_annotation(str(existing.get("id")))
+        return reader_lite_redirect(book_id, chapter, page, "已取消红标")
+    create_annotation(
+        reader_lite_annotation_payload(
+            book_id=book_id,
+            sentence_index=sentence_index,
+            chapter_locator=chapter_locator,
+            chapter_title=chapter_title,
+            source_text=source_text,
+            kind="red_highlight",
+            color="red",
+        )
+    )
+    return reader_lite_redirect(book_id, chapter, page, "已标红")
+
+
+@app.post("/reader-lite/note")
+async def reader_lite_note(request: FastAPIRequest) -> RedirectResponse:
+    fields, _files = await lite_request_form(request)
+    book_id = lite_required(fields, "book_id")
+    chapter = lite_int(fields, "chapter")
+    page = lite_int(fields, "page")
+    sentence_index = lite_required(fields, "sentence_index")
+    selected = str(fields.get("selected") or sentence_index)
+    chapter_locator = lite_required(fields, "chapter_locator")
+    chapter_title = str(fields.get("chapter_title") or "")
+    source_text = str(fields.get("source_text") or "")
+    note_text = str(fields.get("note_text") or "")
+    note = normalize_note_text(note_text)
+    existing = lite_annotations_by_sentence(book_id, chapter_locator).get(sentence_index, {}).get("note")
+    if existing:
+        patch_annotation(str(existing.get("id")), AnnotationPatch(note_text=note))
+    elif note:
+        create_annotation(
+            reader_lite_annotation_payload(
+                book_id=book_id,
+                sentence_index=sentence_index,
+                chapter_locator=chapter_locator,
+                chapter_title=chapter_title,
+                source_text=source_text,
+                kind="note",
+                note_text=note,
+            )
+        )
+    return reader_lite_redirect(book_id, chapter, page, "备注已保存", selected)
+
+
+@app.post("/reader-lite/audio-note")
+async def reader_lite_audio_note(request: FastAPIRequest) -> RedirectResponse:
+    fields, files = await lite_request_form(request)
+    book_id = lite_required(fields, "book_id")
+    chapter = lite_int(fields, "chapter")
+    page = lite_int(fields, "page")
+    sentence_index = lite_required(fields, "sentence_index")
+    selected = str(fields.get("selected") or sentence_index)
+    chapter_locator = lite_required(fields, "chapter_locator")
+    chapter_title = str(fields.get("chapter_title") or "")
+    source_text = str(fields.get("source_text") or "")
+    upload = files.get("audio_file") or {}
+    book_with_latest_file(book_id)
+    audio_data = upload.get("data") or b""
+    if not audio_data:
+        raise HTTPException(status_code=422, detail="audio file is empty")
+    if len(audio_data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="audio note is too large")
+    filename = str(upload.get("filename") or "")
+    mime_type = str(upload.get("content_type") or "") or mimetypes.guess_type(filename)[0] or "audio/m4a"
+    annotations = lite_annotations_by_sentence(book_id, chapter_locator)
+    note_annotation = annotations.get(sentence_index, {}).get("note")
+    if not note_annotation:
+        note_annotation = create_annotation(
+            reader_lite_annotation_payload(
+                book_id=book_id,
+                sentence_index=sentence_index,
+                chapter_locator=chapter_locator,
+                chapter_title=chapter_title,
+                source_text=source_text,
+                kind="note",
+                note_text=VOICE_NOTE_PENDING_TEXT,
+            )
+        )
+    audio_hash = hashlib.sha256(audio_data).hexdigest()
+    file_id = new_id("liteaud")
+    audio_dir = sentence_reader_app_support_dir() / "AudioNotes" / "Lite"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / f"{file_id}{lan_audio_extension(mime_type)}"
+    audio_path.write_bytes(audio_data)
+    audio_note = create_audio_note(
+        AudioNoteCreate(
+            book_id=book_id,
+            annotation_id=str(note_annotation.get("id")),
+            audio_path=str(audio_path),
+            audio_hash=audio_hash,
+            provider="mac_voice_pipeline",
+            raw_result=lan_audio_raw_result(mime_type=mime_type, audio_byte_count=len(audio_data), async_processing=True),
+            status="pending",
+        )
+    )
+    start_lan_audio_note_transcription(str(audio_note.get("id")), audio_path, mime_type, len(audio_data))
+    return reader_lite_redirect(book_id, chapter, page, "语音备注已保存，Mac 正在后台转写", selected)
 
 
 @app.get("/vocab", response_class=HTMLResponse)

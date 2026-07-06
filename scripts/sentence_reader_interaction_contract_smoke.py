@@ -12,19 +12,6 @@ STATUS = ROOT / "docs" / "current_status.md"
 ACCEPTANCE = ROOT / "docs" / "product_acceptance.md"
 
 
-COMMON_MARKERS = [
-    "contractVersion: 'sentence-reader-interaction-v1'",
-    "priority: 'sentence-reader-first'",
-    "sentenceContextWinsEvenWithSelection: true",
-    "copyPath: 'command-c-or-non-sentence-context-menu'",
-    "shouldLetSystemHandleContext",
-    "claimSentenceEvent",
-    "hasSystemTextSelection",
-    "isEditableTarget",
-    "context-click-red",
-]
-
-
 def require_contains(path: Path, markers: list[str], missing: dict[str, list[str]]) -> None:
     text = path.read_text(encoding="utf-8")
     absent = [marker for marker in markers if marker not in text]
@@ -32,18 +19,19 @@ def require_contains(path: Path, markers: list[str], missing: dict[str, list[str
         missing[str(path)] = absent
 
 
-def context_guard_has_sentence_priority(text: str, sentence_marker: str) -> bool:
+def swift_selection_context_does_not_route_to_secondary_red(text: str) -> bool:
     start = text.find("function shouldLetSystemHandleContext")
     if start < 0:
         return False
-    window = text[start : start + 700]
-    sentence_index = window.find(sentence_marker)
-    selection_index = window.find("return hasSystemTextSelection")
-    return sentence_index >= 0 and selection_index >= 0 and sentence_index < selection_index
+    window = text[start : start + 420]
+    selection_index = window.find("if (hasReaderTextSelection() && selectionActionBarVisible()) { return true; }")
+    sentence_index = window.find("const sentence = sentenceFromTarget")
+    return selection_index >= 0 and sentence_index >= 0 and selection_index < sentence_index
 
 
 def main() -> int:
-    missing_files = [str(path) for path in [SWIFT, APP, DOC, STATUS, ACCEPTANCE] if not path.exists()]
+    paths = [SWIFT, APP, DOC, STATUS, ACCEPTANCE]
+    missing_files = [str(path) for path in paths if not path.exists()]
     missing_markers: dict[str, list[str]] = {}
     if missing_files:
         print(f"interaction contract smoke FAIL missing_files={missing_files}")
@@ -51,96 +39,121 @@ def main() -> int:
 
     require_contains(
         SWIFT,
-        COMMON_MARKERS
-        + [
-            "return toggleRedFromSecondaryEvent(event);",
+        [
+            "contractVersion: 'sentence-reader-interaction-v1'",
+            "priority: 'sentence-reader-first'",
+            "sentenceContextWinsOnlyWithoutSelection: true",
+            "selectedTextActionBar: 'sr-selection-action-bar'",
+            "copyPath: 'selection-action-bar-copy-button-not-command-c'",
+            "function readerSelectionPayload()",
+            "function hasReaderTextSelection()",
+            "function selectionActionBarNode()",
+            "id = 'sr-selection-action-bar'",
+            "data-sr-selection-action=\"copy\"",
+            "data-sr-selection-action=\"red\"",
+            "data-sr-selection-action=\"note\"",
+            "type: 'selectionCopy'",
+            "type: 'selectionRed'",
+            "type: 'selectionNote'",
+            "取消标红",
+            "function selectionPayloadHasExactRed(payload)",
+            "function removeSelectionRedFragments(fragments)",
+            "type: 'selectionRedRemove'",
+            "\"mode\": \"text_selection\"",
+            "selectionMode: \"text_selection_note\"",
+            "NSPasteboard.general.setString(rawText, forType: .string)",
+            "document.addEventListener('dblclick', function (event)",
+            "post({ type: 'note'",
             "function toggleRedFromSecondaryEvent(event)",
-            "lastSecondaryRedAt",
-            "lastSecondaryRedIndex",
-            "now - lastSecondaryRedAt < 320",
-            "if (sentence) {\n          return toggleRedSentences([sentence], event);\n        }",
-            "document.addEventListener('mousedown', function (event) {\n        if (!event || event.button !== 2) { return; }\n        return toggleRedFromSecondaryEvent(event);",
-            "document.addEventListener('auxclick', function (event) {\n        if (!event || event.button !== 2) { return; }\n        return toggleRedFromSecondaryEvent(event);",
-            "english-click-lookup",
-            "installApplicationMenu",
-            "退出 Sentence Reader",
-            "keyEquivalent: \"q\"",
-            "key == \"q\"",
-            "notePreviewTimer = window.setTimeout(function ()",
+            "function sentenceFromPoint(x, y)",
+            "function sentenceFromEvent(event)",
+            "function clearTextSelectionAfterSecondaryRed()",
+            "lastSecondaryRedClaimedAt",
+            "event.type === 'contextmenu'",
+            "now - lastSecondaryRedClaimedAt < 650",
+            "claimSentenceEvent(event);",
+            "return toggleRed(sentence, event);",
             "post({ type: 'lookup'",
+            "isEditableTarget",
+            "function beginSelectionActionDrag(event)",
+            "function finishSelectionActionDrag(event)",
+            "selectionDragAllowedUntil",
+            "document.addEventListener('selectionchange', hideSelectionActionBarWhenSelectionGone, true);",
         ],
         missing_markers,
     )
+
     require_contains(
         APP,
-        COMMON_MARKERS
-        + [
-            "toggleRed().catch",
-            "long-press-red",
+        [
+            "sentence-reader-interaction-v1",
             "english-tap-lookup",
+            "double-tap-note",
+            "context-click-red",
             "reader-keyboard-note-red-voice-v1",
             "key === 'n'",
             "key === 'r'",
             "key === 'v'",
-            "sentenceTapTimer",
-            "clearTimeout(state.sentenceTapTimer)",
-            "showLookup(word, node.textContent || '', node.dataset.srIndex || '')",
         ],
         missing_markers,
     )
+
     require_contains(
         DOC,
         [
             "Sentence Reader Interaction Contract",
-            "sentence-reader-interaction-v1",
-            "English word in sentence text",
-            "pending lookup is cancelled",
-            "Sentence Reader owns it and toggles red highlight",
+            "selected-text action bar",
+            "Selection action bar `复制`",
+            "Selection action bar `标红`",
+            "Selection action bar `备注`",
+            "active selection + two-finger tap is not",
             "Command+C",
-            "Command+Q",
-            "Inputs, textareas, buttons, controls",
-            "Mac sentence text | Two-finger tap",
-            "iPad sentence action bar | Red button",
-            "Desktop Web / Windows route focused sentence",
-            "聚焦句子后 `N`",
-            "聚焦句子后 `R`",
-            "聚焦句子后 `V`",
+            "not a Click-owned reading command",
+            "single-click lookup",
+            "double-click note",
+            "two-finger whole-sentence red",
         ],
         missing_markers,
     )
+
     require_contains(
         ACCEPTANCE,
         [
-            "Keep the interaction-router contract stable",
-            "single-click/single-tap on an English word",
-            "Mac two-finger tap for whole-sentence red highlight",
-            "iPad bottom action bar for red highlight",
-            "Command+C",
-            "Command+Q",
+            "Mac selected-text action bar `复制 / 标红 / 备注`",
+            "single-click English lookup",
+            "double-click sentence note",
+            "two-finger whole-sentence red highlight",
+            "must not make `Command+C` a reading-surface command",
         ],
         missing_markers,
     )
 
     swift_text = SWIFT.read_text(encoding="utf-8")
-    app_text = APP.read_text(encoding="utf-8")
     forbidden_swift_markers = [
         ".rightMouseDown",
         "__sentenceReaderToggleRedAtPoint",
+        "key == \"c\"",
+        "key === 'c'",
+        "document.addEventListener('selectionchange', scheduleSelectionActionBarUpdate, true);",
+        "document.addEventListener('mousemove', observeReaderSelection, true);",
+        "window.setInterval(observeReaderSelection",
+        "lastObservedSelectionText",
     ]
     present_forbidden = [marker for marker in forbidden_swift_markers if marker in swift_text]
     if present_forbidden:
         missing_markers.setdefault(str(SWIFT), []).extend(
-            [f"forbidden secondary red route: {marker}" for marker in present_forbidden]
+            [f"forbidden reading command or native secondary route: {marker}" for marker in present_forbidden]
         )
-    if not context_guard_has_sentence_priority(swift_text, "if (sentence) { return false; }"):
-        missing_markers.setdefault(str(SWIFT), []).append("context guard must route sentence before selection")
-    if not context_guard_has_sentence_priority(app_text, "if (node) return false;"):
-        missing_markers.setdefault(str(APP), []).append("context guard must route sentence before selection")
+    if not swift_selection_context_does_not_route_to_secondary_red(swift_text):
+        missing_markers.setdefault(str(SWIFT), []).append(
+            "active reader selection must return before sentence secondary-red routing"
+        )
 
     status_text = STATUS.read_text(encoding="utf-8")
     obsolete_phrases = [
-        "trackpad two-finger context click now passes through to the system/WebKit context menu",
-        "context click for red highlight when there is no active text selection",
+        "not implemented in the current app",
+        "plan-only future additive feature",
+        "active正文 selection + two-finger tap",
     ]
     obsolete = [phrase for phrase in obsolete_phrases if phrase in status_text]
     if obsolete:

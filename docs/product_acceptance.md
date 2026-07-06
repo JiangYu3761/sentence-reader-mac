@@ -1,6 +1,6 @@
 # Sentence Reader Product Acceptance
 
-Updated: 2026-06-29
+Updated: 2026-07-05
 
 ## Daily-use Product Boundary
 
@@ -23,12 +23,13 @@ Sentence Reader is accepted as a daily-use local reading product when these work
 - Keep正文 controls readable and grouped: visible reader chrome is limited to `书库`, `目录`, `笔记`, `设置`, and `更多`; secondary actions belong under `更多`.
 - Import EPUB files into Sentence Reader's owned app-support library so the original source file can be deleted or moved after import.
 - Read EPUB in a black, Microsoft YaHei reading surface with compact hidden chrome.
-- Turn pages horizontally without cropped bottom text or trailing blank pages.
+- Turn pages horizontally without cropped bottom text, trailing blank pages, or one physical trackpad swipe turning multiple pages.
 - Move across chapter edges without losing reading position.
+- Keep EPUB scripture/footnote expansion blocks compact by default: native `details` and Duokan-style `aside epub:type=footnote` verse blocks start collapsed and can be opened/closed from the summary or original verse-reference icon.
 - Mark whole sentences red, including multi-line selections.
 - Add text notes and voice notes, then see the note again by clicking the sentence.
 - Keep the interaction-router contract stable: sentence-level gestures win on sentence text; editing fields and controls still keep system behavior.
-- Use single-click/single-tap on an English word for lookup, double-click/double-tap for sentence notes, Mac two-finger tap for whole-sentence red highlight, the iPad bottom action bar for red highlight, `Command+C` for copying selected text, and `Option` + double-click as a backup word-lookup path on pointer devices.
+- Use single-click/single-tap on an English word for lookup, double-click/double-tap for sentence notes, Mac two-finger tap for no-selection whole-sentence red highlight, the Mac selected-text action bar `复制 / 标红 / 备注`, the iPad bottom action bar for red highlight, and `Option` + double-click as a backup word-lookup path on pointer devices. On the Mac native reader, no-selection double-click opens the existing sentence note panel, no-selection two-finger tap toggles whole-sentence red highlight without also opening the WebKit right-click menu, and single-click English lookup uses a short pending delay that is cancelled by a real double-click. Only after deliberate正文 drag selection, `复制` copies exact selected text, `标红` marks exact selected fragments, and `备注` reuses the existing note panel; double-click selection, right-click selection, lookup side effects, keyboard selection, and generic `selectionchange` must not open the action bar. Secondary click on selected正文 should keep the action-bar path instead of opening the system menu only when the bar was opened by drag selection. `Command+Z` must undo red-highlight operations, including deleting the matching persisted selected-fragment red annotation. Click must not make `Command+C` a reading-surface command and must not use active selection + two-finger tap as the selected-text red path. Reader API schema does not change.
 - English lookup must fall back to the general dictionary even when the current book has not generated a book-local vocabulary list.
 - If book/domain/local dictionary lookup misses, daily English lookup must not call a model by default. The Mac-side Hermes/Qwen fallback is available only when `SENTENCE_READER_ENABLE_HERMES_ONLINE_LOOKUP=1`; normal lookup pressure should stay on the local open ECDICT-compatible dictionary and user corrections.
 - User-corrected lookup meanings must be saved into the current book glossary with `source='user'` and must take priority over dictionary and online lookup results.
@@ -44,6 +45,13 @@ Sentence Reader is accepted as a daily-use local reading product when these work
 - Open the iPad LAN library at `http://<mac-lan-ip>:18180/library` on the same Wi-Fi.
 - Open the Mobile Workspace home at `http://<mac-lan-ip>:18180/home` on the same Wi-Fi and see only the three primary entries `阅读`, `录音`, and `Hermes`.
 - Use the mobile `阅读` entry to keep the existing `/library` and `/lan/reader` reading path.
+- Keep modern mobile/iPad/Android WebView clients on the modern `/home`, `/library`, and `/lan/reader` path by default. Lite must be a conservative fallback only: explicit `?ui=lite`, `click_ui=lite`, high-confidence legacy UA, or earliest ES5 capability failure. `?ui=modern` must force the modern path.
+- Use `/home-lite`, `/library-lite`, `/reader-lite`, and `/reader-lite/toc` only as old-device fallback pages. Lite must show only the three entries `阅读`, `录音`, and `Hermes`; it must not show duplicate modern/Lite entry sets.
+- In `/reader-lite`, keep core reading possible without modern frontend JS: open book, open a specific chapter from the server-rendered目录, read server-rendered text, navigate page/chapter, select a sentence, toggle red highlight, save text note, and upload a voice-note audio file through an HTML form.
+- Lite must use a lightweight EPUB `spine` / `toc` / `readingOrder` boundary: `/reader-lite/toc` must not open every chapter to extract正文, and a user-selected chapter must not be auto-rewritten to another chapter.
+- The default `/reader-lite` reading page must show正文 only: no visible library/toc/book/chapter/skip-notice chrome on the concrete reading page. It must use screen-fit pagination: rendered sentence units are measured against the current viewport so one screen becomes one page, with enough bottom safe reserve for browser navigation bars. It must skip EPUB inline navigation blocks such as `上一篇 / 回目录 / 下一篇`, avoid persistent top/bottom navigation chrome, support page movement through left/right edge hit zones or swipe, save Lite `page_index` through the existing reading position path, and must not fill the page with red/note/audio forms before a sentence is selected. Sentence actions appear as a compact one-row strip only after selecting a正文 sentence; red highlight/cancel-red exits the selected state after completion, while note and audio-note may keep it for editing/upload.
+- Lite red highlight, note, and voice-note upload must reuse existing Reader annotation/audio-note data paths and must not change Reader API schema or PostgreSQL schema.
+- Mac native reader preserves the stable no-selection reading baseline: single-click English lookup, double-click sentence note, and two-finger whole-sentence red highlight. The selected-text action bar is additive: it appears only after deliberate正文 drag selection and offers `复制 / 标红 / 备注`. If the drag selection exactly matches existing selected-text red fragments, the red button must change to `取消标红` and remove those exact fragments. `selectionchange` may hide the bar but must not open it. `复制` uses the native pasteboard route, `标红` saves `range_locator.mode=text_selection`, and `备注` saves `range_locator.mode=text_selection_note` while reusing the original note panel. Double-click note must cancel pending lookup, clear正文 selection/cache, open the note for the clicked sentence, and never delete or overwrite red highlights.
 - Use the mobile `录音` entry to save new recordings into the independent `~/Documents/Recordings` total recording store with schema `local.recordings.audio_asset.v1`; the old Click Knowledge Inbox recording path is legacy read-only compatibility, and recording assets must not be stored in Hermes internal state or Marketplace OS.
 - Manage mobile recordings through list/detail/audio, manual title/category/tag editing, non-destructive hide, and reprocess dry-run; manual corrections must not be overwritten by processing unless explicitly allowed.
 - Use local mobile access control for phone clients: unapproved devices can request/poll access and view basic connection state, but durable recording upload and Hermes routes require local approval/token when a device ID is present. Mac localhost browser debugging remains available.
@@ -69,10 +77,14 @@ The product-grade check is not a single manual glance. It requires:
 - `python3 scripts/public_readme_platform_smoke.py`
 - `python3 scripts/android_shell_static_smoke.py`
 - `python3 scripts/mobile_shell_static_smoke.py`
+- `python3 scripts/click_lite_static_smoke.py`
+- `python3 scripts/click_lite_user_flow_smoke.py` after Reader API is running
+- `python3 scripts/click_lite_full_library_smoke.py` after Reader API is running
 - `python3 scripts/click_mobile_workspace_smoke.py`
 - `scripts/build_android_click_shell.sh`
 - `python3 scripts/sentence_reader_import_ownership_static_smoke.py`
 - `python3 scripts/sentence_reader_interaction_contract_smoke.py`
+- `python3 scripts/native_scripture_collapse_static_smoke.py`
 - `python3 scripts/sentence_reader_vocab_lookup_static_smoke.py`
 - `.venv-reader-api/bin/python scripts/lifestudy_context_vocab_pipeline_smoke.py`
 - `.venv-reader-api/bin/python scripts/lifestudy_context_vocab_import_smoke.py`
