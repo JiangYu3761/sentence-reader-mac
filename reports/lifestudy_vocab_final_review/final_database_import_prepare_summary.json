@@ -1,0 +1,80 @@
+{
+  "schema": "sentence_reader.lifestudy_vocab_importable.v1",
+  "generated_at": "2026-07-06T09:33:08.451184+00:00",
+  "source_report": "reports/lifestudy_vocab_final_review/productized_lifestudy_vocab_all_layers.csv",
+  "database_write_performed": false,
+  "front_end_import_ready": false,
+  "import_policy": {
+    "target_table": "reader.domain_glossary_entries",
+    "all_reviewed_rows_are_database_candidates": true,
+    "default_popup_means_single_click_word_popup": true,
+    "all_reviewed_rows_enable_single_click_popup": true,
+    "high_confidence_popup_is_priority_flag_only": true,
+    "reader_dictionary_entries_import": false,
+    "requires_user_confirmation_before_apply": true
+  },
+  "quality": {
+    "total_import_candidates": 4102,
+    "default_popup_count": 4102,
+    "single_click_popup_count": 4102,
+    "high_confidence_popup_count": 49,
+    "learning_search_count": 4102,
+    "needs_followup_review_count": 52,
+    "repaired_from_reject_count": 5,
+    "quality_grade_counts": {
+      "A": 49,
+      "B": 4053
+    },
+    "product_layer_after_prepare_counts": {
+      "default_front_glossary": 49,
+      "learning_vocab": 3996,
+      "learning_vocab_needs_followup": 52,
+      "learning_vocab_repaired": 5
+    },
+    "match_source_counts": {
+      "final_import_precheck_49": 33,
+      "productized_final_review": 4014,
+      "evidence_queue_round_001": 50,
+      "reject_repair_for_database_import": 5
+    },
+    "database_write_count": 0,
+    "front_end_import_ready_count": 0
+  },
+  "repaired_from_reject": [
+    {
+      "term": "ephesians",
+      "suggested_meaning_zh_simp": "以弗所书",
+      "reason": "Repair rejected row for database import: English evidence names Ephesians, and Chinese evidence has 以弗所/以弗所书 context."
+    },
+    {
+      "term": "philippians",
+      "suggested_meaning_zh_simp": "腓立比书",
+      "reason": "Repair rejected row for database import: English evidence names Philippians, and Chinese evidence uses 腓立比二章 as the book reference."
+    },
+    {
+      "term": "divinity",
+      "suggested_meaning_zh_simp": "神性",
+      "reason": "Repair rejected row for database import: aligned Chinese evidence directly contains 神性."
+    },
+    {
+      "term": "pharisees",
+      "suggested_meaning_zh_simp": "法利赛人",
+      "reason": "Repair rejected row for database import: aligned Chinese evidence directly contains 法利赛人."
+    },
+    {
+      "term": "anointed",
+      "suggested_meaning_zh_simp": "膏",
+      "reason": "Repair rejected row for database import: aligned Chinese evidence contains 所膏; use the supported root meaning 膏 for learning/search."
+    }
+  ],
+  "outputs": {
+    "importable_json": "reports/lifestudy_vocab_final_review/final_database_import_prepare_all_4102.json",
+    "importable_csv": "reports/lifestudy_vocab_final_review/final_database_import_prepare_all_4102.csv",
+    "default_popup_csv": "reports/lifestudy_vocab_final_review/final_database_import_prepare_default_popup.csv",
+    "high_confidence_popup_csv": "reports/lifestudy_vocab_final_review/final_database_import_prepare_high_confidence_popup.csv",
+    "learning_search_csv": "reports/lifestudy_vocab_final_review/final_database_import_prepare_learning_search.csv",
+    "repaired_from_reject_csv": "reports/lifestudy_vocab_final_review/final_database_import_prepare_repaired_from_reject.csv",
+    "summary_json": "reports/lifestudy_vocab_final_review/final_database_import_prepare_summary.json",
+    "summary_md": "reports/lifestudy_vocab_final_review/final_database_import_prepare_summary.md"
+  }
+}
