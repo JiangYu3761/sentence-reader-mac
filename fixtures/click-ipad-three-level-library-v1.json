@@ -1,0 +1,86 @@
+{
+  "annotations": [],
+  "books": [
+    {
+      "author": "Click P0 验收",
+      "contentHash": "e03e6866f513597f37d6d64a4ac0d13577954d72550608cbff21fa43cac3ab3c",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000001",
+      "importedAt": "2026-07-31T01:49:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000001/click-stageb-listening.epub",
+      "progress": 0,
+      "title": "Click 三章朗读验收"
+    },
+    {
+      "author": "全国中医药行业高等教育教材",
+      "contentHash": "ipad-hierarchy-tcm-basic",
+      "folderName": "中医与健康 / 基础理论",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000101",
+      "importedAt": "2026-08-01T00:00:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000101/book.epub",
+      "progress": 0,
+      "serverID": "ipad-hierarchy-tcm-basic",
+      "title": "中医基础理论"
+    },
+    {
+      "author": "中华传世珍藏古典文库",
+      "contentHash": "ipad-hierarchy-tcm-neijing-1",
+      "folderName": "中医与健康 / 经典 / 黄帝内经体系",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000102",
+      "importedAt": "2026-08-01T00:00:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000102/book.epub",
+      "progress": 0,
+      "serverID": "ipad-hierarchy-tcm-neijing-1",
+      "title": "黄帝内经"
+    },
+    {
+      "author": "三级路径验收",
+      "contentHash": "ipad-hierarchy-tcm-neijing-2",
+      "folderName": "中医与健康 / 经典 / 黄帝内经体系",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000103",
+      "importedAt": "2026-08-01T00:00:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000103/book.epub",
+      "progress": 0,
+      "serverID": "ipad-hierarchy-tcm-neijing-2",
+      "title": "黄帝内经校读"
+    },
+    {
+      "author": "全国中医药行业高等教育教材",
+      "contentHash": "ipad-hierarchy-tcm-herb",
+      "folderName": "中医与健康 / 中药与方剂",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000104",
+      "importedAt": "2026-08-01T00:00:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000104/book.epub",
+      "progress": 0,
+      "serverID": "ipad-hierarchy-tcm-herb",
+      "title": "中药学"
+    },
+    {
+      "author": "Click 分类验收",
+      "contentHash": "ipad-hierarchy-business-strategy",
+      "folderName": "商业与经营 / 战略",
+      "format": "epub",
+      "id": "00000000-0000-4000-8000-000000000105",
+      "importedAt": "2026-08-01T00:00:00Z",
+      "isFavorite": false,
+      "localRelativePath": "Books/00000000-0000-4000-8000-000000000105/book.epub",
+      "progress": 0,
+      "serverID": "ipad-hierarchy-business-strategy",
+      "title": "好战略，坏战略"
+    }
+  ],
+  "conflicts": [],
+  "hasFullBaseline": false,
+  "pendingOperations": [],
+  "schemaVersion": 2,
+  "syncSequence": 0
+}

@@ -117,6 +117,8 @@ def main() -> int:
         "min=\"4\" max=\"40\"",
         "data-open-book=\"${esc(book.id)}\"",
         "bindOpenBookTargets($('continueHero'))",
+        "event.stopPropagation();",
+        "if (event.defaultPrevented) return;",
         "['topImport'].forEach",
         "@media (max-width: 1024px)",
         "#toolbar { top:auto; bottom:0;",

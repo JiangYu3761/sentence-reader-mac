@@ -95,6 +95,7 @@ def install_requirements(python: Path, requirements: Path) -> dict[str, Any]:
 def candidate_python(runtime: Path, app_support: Path) -> list[dict[str, Any]]:
     candidates: list[tuple[str, Path | None]] = [
         ("env_READER_API_PYTHON", Path(os.environ["READER_API_PYTHON"]) if os.getenv("READER_API_PYTHON") else None),
+        ("bundled_signed_python_framework", runtime / "Python3.framework" / "Versions" / "3.9" / "bin" / "python3.9"),
         ("user_app_support_venv", app_support / "Runtime" / ".venv-reader-api" / "bin" / "python"),
         ("bundled_runtime_venv", runtime / ".venv-reader-api" / "bin" / "python"),
         ("system_python3", Path(shutil.which("python3")) if shutil.which("python3") else None),

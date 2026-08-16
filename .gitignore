@@ -11,8 +11,29 @@ build/
 reports/
 data/external/
 output/
-docs/images/
+docs/images/*
+!docs/images/public/
+!docs/images/public/*.jpg
 backups/
+.tmp/
+media/
+
+# Android signing material and machine-local build configuration.
+**/local.properties
+**/keystore.properties
+**/signing*.properties
+**/*password*.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pfx
+**/*.key
+**/private*.pem
+**/drawable-nodpi/ic_launcher_*_workspace.png
+
+# Large optional runtimes and redistributable fonts are supplied at build time.
+apps/android/ClickShell/app/src/main/jniLibs/
+apps/ios/ClickShell/ClickShell/Fonts/*.otf
 
 # Local runtime and user data should never be published.
 *.sqlite

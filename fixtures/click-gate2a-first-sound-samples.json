@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "fixture_id": "click-gate2a-public-synthetic-v1",
+  "samples": [
+    {
+      "id": "gate2a-01",
+      "voice": "zh-CN-YunjianNeural",
+      "text": "清晨的微风穿过树梢，新的阅读从这一句开始。"
+    },
+    {
+      "id": "gate2a-02",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "text": "窗边的光慢慢移动，我们继续听下一段安静的文字。"
+    },
+    {
+      "id": "gate2a-03",
+      "voice": "zh-CN-YunjianNeural",
+      "text": "稳定的节奏让人专注，也让机器保持安静和清凉。"
+    },
+    {
+      "id": "gate2a-04",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "text": "这一段只用于公开测试，不包含书籍、笔记或个人资料。"
+    },
+    {
+      "id": "gate2a-05",
+      "voice": "zh-CN-YunjianNeural",
+      "text": "短小的首段应该尽快出声，后续内容再按顺序准备。"
+    },
+    {
+      "id": "gate2a-06",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "text": "播放开始以后，后台工作必须有界，而且可以随时取消。"
+    },
+    {
+      "id": "gate2a-07",
+      "voice": "zh-CN-YunjianNeural",
+      "text": "每个句子都有稳定位置，前进和返回都不会丢失顺序。"
+    },
+    {
+      "id": "gate2a-08",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "text": "网络只负责生成新声音，已经缓存的内容留在本机播放。"
+    },
+    {
+      "id": "gate2a-09",
+      "voice": "zh-CN-YunjianNeural",
+      "text": "如果资源超过预算，系统应当暂停，而不是增加并发。"
+    },
+    {
+      "id": "gate2a-10",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "text": "最后一条样本用于确认结果可以重复测量并清楚解释。"
+    }
+  ]
+}

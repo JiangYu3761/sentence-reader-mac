@@ -6,7 +6,32 @@
 
 Click 是一个本地优先的精读系统。它不是普通电子书阅读器，重点不是把书翻过去，而是在阅读时用最短动作沉淀句子、笔记、红标、单词和复习材料。
 
-当前产品以 macOS 为主，局域网网页端可以在 iPad 或手机浏览器里使用。Windows 不是不能做，但应该按层拆开适配，不能把 macOS 原生壳硬搬过去。
+当前产品以 macOS 为主，并有 Android 原生候选版和 iPad 原生开发线；局域网网页端也可以在 iPad 或手机浏览器里使用。Android 的正式私签版本支持前台自动检查、验证并下载升级包。Windows 不是不能做，但应该按层拆开适配，不能把 macOS 原生壳硬搬过去。
+
+<p align="center">
+  <img src="docs/images/public/click-library-sanitized.jpg" width="880" alt="Click 脱敏后的真实书库界面">
+</p>
+
+<p align="center"><sub>真实产品界面；书名、正文、备注与统计均已替换为演示数据。</sub></p>
+
+## 两个动作，读完立刻沉淀
+
+Click 把一句话直接变成操作对象。看到值得留下的内容时，不必先拖选文字、打开菜单、挑颜色，再回头整理。
+
+<table>
+  <tr>
+    <td width="50%" align="center"><strong>快速双击：写备注</strong></td>
+    <td width="50%" align="center"><strong>双指点按：整句标红</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/public/click-note-double-click-sanitized.jpg" alt="Click 快速双击句子写备注"></td>
+    <td><img src="docs/images/public/click-red-mark-two-finger-sanitized.jpg" alt="Click 双指点按整句标红"></td>
+  </tr>
+  <tr>
+    <td>想法直接绑定原句；以后单击这句话即可回看。</td>
+    <td>不用拖选、不用调范围；再点一次即可取消。</td>
+  </tr>
+</table>
 
 ## 先记住这几个动作
 
@@ -247,10 +272,10 @@ python3 scripts/public_readme_platform_smoke.py
 - Python 虚拟环境
 - 构建缓存
 - 运行报告
-- 真实界面截图
+- 未脱敏的真实界面截图
 - 书籍封面或阅读内容图片
 
-GitHub 只保存源码、文档、迁移脚本和小型测试样本。
+GitHub 只保存源码、文档、迁移脚本、小型测试样本，以及经过逐项复核的脱敏产品截图。公开截图会替换书名、作者、正文、备注、红标内容、统计和设备信息，并在画面或说明中标注为演示数据。
 
 ## 文档入口
 

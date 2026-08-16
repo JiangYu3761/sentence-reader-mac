@@ -28,7 +28,17 @@ def main() -> int:
     for path, markers in {
         ICON_GENERATOR: ["SentenceReader.icns", "iconutil", "leftPage", "rightPage", "bookmark"],
         DOCK_PIN: ["persistent-apps", "Click.app", "Sentence Reader.app", "killall", "Dock", "--dry-run", "dedupe_dock_entries", "removed_duplicates"],
-        PACKAGE: ["CFBundleIconFile", "SentenceReader.icns", "ensure_app_icon", "app_icon="],
+        PACKAGE: [
+            "CFBundleIconFile",
+            "SentenceReader.icns",
+            "ensure_app_icon",
+            "app_icon=",
+            "FROZEN_TTS_APP_CANDIDATES",
+            "verify_frozen_tts_runtime",
+            "copy_frozen_tts_runtime",
+            "frozen_tts_hashes = copy_frozen_tts_runtime()",
+            "App signing changed the frozen Microsoft TTS runtime",
+        ],
     }.items():
         result = has_markers(path, markers)
         if result:

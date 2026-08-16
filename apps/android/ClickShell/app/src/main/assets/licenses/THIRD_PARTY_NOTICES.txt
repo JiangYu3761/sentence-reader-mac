@@ -1,0 +1,27 @@
+Click Android Reader P1.3 third-party notices
+
+sherpa-onnx
+Project: https://github.com/k2-fsa/sherpa-onnx
+License: Apache License 2.0
+Use: ARM64 offline TTS runtime and upstream Kotlin JNI wrapper.
+The full license text is packaged beside this notice.
+
+Kokoro-82M-v1.1-zh optional voice model
+Model source: https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
+sherpa conversion documentation: https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/kokoro.html
+License: Apache License 2.0
+Delivery: optional user-imported package; model weights are not embedded in the base APK.
+
+eSpeak NG pronunciation data
+Project: https://github.com/espeak-ng/espeak-ng
+License: GNU General Public License v3.0 or later
+Use: language/pronunciation data inside the optional Kokoro voice package.
+Delivery: not embedded in the base APK; the optional local package must retain the GPL notice and source reference.
+
+PdfBox-Android 2.0.27.0
+Project: https://github.com/TomRoush/PdfBox-Android
+Upstream: https://pdfbox.apache.org/
+License: Apache License 2.0
+Use: on-demand, read-only PDF catalog outline parsing; AndroidX PDF remains the renderer.
+The complete Apache License 2.0 text is packaged beside this notice in
+sherpa-onnx-Apache-2.0.txt and applies equally to this component.

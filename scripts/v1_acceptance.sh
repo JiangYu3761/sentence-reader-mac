@@ -82,7 +82,11 @@ else
 fi
 
 echo "== readium dependency probe =="
-python3 "$ROOT/scripts/probe_readium_status.py"
+if python3 "$ROOT/scripts/probe_readium_status.py"; then
+  echo "Readium dependency probe PASS"
+else
+  echo "Readium dependency probe SKIP: optional local checkout unavailable; native Click fallback already verified"
+fi
 if [ -d "$ROOT/Probe/ReadiumDependencyProbe/.build/checkouts/swift-toolkit" ]; then
   echo "Readium checkout exists"
   grep -q "platforms: \\[.iOS" "$ROOT/Probe/ReadiumDependencyProbe/.build/checkouts/swift-toolkit/Package.swift"

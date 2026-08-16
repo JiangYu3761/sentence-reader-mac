@@ -3,6 +3,183 @@ import WebKit
 import AVFoundation
 import Speech
 import UniformTypeIdentifiers
+import PDFKit
+import CryptoKit
+import CoreFoundation
+import Network
+import Security
+import MediaPlayer
+
+private enum EPUBTextRuntimeNormalizer {
+    private static let markerName = ".click-utf8-normalized-v2"
+    private static let markupExtensions: Set<String> = ["html", "xhtml", "htm", "xml", "opf", "ncx"]
+
+    @discardableResult
+    static func normalizeMarkup(in rootURL: URL) -> Int {
+        let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
+        let targetPath = rootURL.standardizedFileURL.path
+        guard targetPath != bundlePath, !targetPath.hasPrefix(bundlePath + "/") else {
+            return 0
+        }
+
+        let markerURL = rootURL.appendingPathComponent(markerName)
+        if FileManager.default.fileExists(atPath: markerURL.path) {
+            return 0
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return 0
+        }
+
+        var normalizedCount = 0
+        var encounteredFailure = false
+        for case let fileURL as URL in enumerator {
+            guard markupExtensions.contains(fileURL.pathExtension.lowercased()),
+                  let data = try? Data(contentsOf: fileURL),
+                  let decoded = decode(data)
+            else {
+                continue
+            }
+
+            let normalized = normalizedMarkup(decoded, extension: fileURL.pathExtension.lowercased())
+            let normalizedData = Data(normalized.utf8)
+            guard normalizedData != data else {
+                continue
+            }
+
+            do {
+                try normalizedData.write(to: fileURL, options: .atomic)
+                normalizedCount += 1
+            } catch {
+                encounteredFailure = true
+            }
+        }
+
+        if !encounteredFailure {
+            try? "click.epub.text_runtime.utf8.v2\n".write(
+                to: markerURL,
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        return normalizedCount
+    }
+
+    private static func decode(_ data: Data) -> String? {
+        if data.starts(with: [0xEF, 0xBB, 0xBF]),
+           let value = String(data: data.dropFirst(3), encoding: .utf8) {
+            return value
+        }
+        if data.starts(with: [0xFF, 0xFE]),
+           let value = String(data: data, encoding: .utf16LittleEndian) {
+            return value
+        }
+        if data.starts(with: [0xFE, 0xFF]),
+           let value = String(data: data, encoding: .utf16BigEndian) {
+            return value
+        }
+        if let value = String(data: data, encoding: .utf8) {
+            return value
+        }
+
+        var candidates: [String] = []
+        if let declared = declaredEncoding(in: data) {
+            candidates.append(declared)
+        }
+        candidates.append(contentsOf: ["gb18030", "gbk", "big5", "shift_jis", "windows-1252"])
+
+        var seen = Set<String>()
+        for candidate in candidates {
+            let key = candidate.lowercased()
+            guard seen.insert(key).inserted,
+                  let encoding = stringEncoding(ianaName: candidate),
+                  let value = String(data: data, encoding: encoding)
+            else {
+                continue
+            }
+            return value
+        }
+        return nil
+    }
+
+    private static func declaredEncoding(in data: Data) -> String? {
+        let prefix = data.prefix(8_192)
+        guard let probe = String(data: prefix, encoding: .isoLatin1) else {
+            return nil
+        }
+        let patterns = [
+            #"(?i)<\?xml[^>]*encoding\s*=\s*[\"']?\s*([A-Za-z0-9._:-]+)"#,
+            #"(?i)<meta[^>]+charset\s*=\s*[\"']?\s*([A-Za-z0-9._:-]+)"#,
+            #"(?i)<meta[^>]+content\s*=\s*[\"'][^\"']*charset\s*=\s*([A-Za-z0-9._:-]+)"#,
+        ]
+        let fullRange = NSRange(probe.startIndex..<probe.endIndex, in: probe)
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: probe, range: fullRange),
+                  match.numberOfRanges > 1,
+                  let range = Range(match.range(at: 1), in: probe)
+            else {
+                continue
+            }
+            return String(probe[range])
+        }
+        return nil
+    }
+
+    private static func stringEncoding(ianaName: String) -> String.Encoding? {
+        let cfEncoding = CFStringConvertIANACharSetNameToEncoding(ianaName as CFString)
+        guard cfEncoding != kCFStringEncodingInvalidId else {
+            return nil
+        }
+        return String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEncoding))
+    }
+
+    private static func normalizedMarkup(_ source: String, extension fileExtension: String) -> String {
+        var value = source
+        let isHTML = ["html", "xhtml", "htm"].contains(fileExtension)
+        value = replacingFirstMatch(
+            in: value,
+            pattern: #"(?i)(<\?xml[^>]*encoding\s*=\s*[\"'])[^\"']+([\"'])"#,
+            template: "$1UTF-8$2"
+        )
+
+        if value.range(of: #"(?i)^\s*<\?xml"#, options: .regularExpression) == nil,
+           fileExtension != "html",
+           fileExtension != "htm" {
+            value = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + value
+        }
+
+        guard isHTML else {
+            return value
+        }
+
+        value = replacingFirstMatch(
+            in: value,
+            pattern: #"(?i)(<meta[^>]*charset\s*=\s*[\"']?)[^\"'\s/>;]+"#,
+            template: "$1utf-8"
+        )
+        if value.range(of: #"(?i)<meta[^>]+charset\s*="#, options: .regularExpression) == nil,
+           let headRange = value.range(of: #"(?i)<head(?:\s[^>]*)?>"#, options: .regularExpression) {
+            value.insert(contentsOf: "<meta charset=\"utf-8\" />", at: headRange.upperBound)
+        }
+        return value
+    }
+
+    private static func replacingFirstMatch(in source: String, pattern: String, template: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return source
+        }
+        let range = NSRange(source.startIndex..<source.endIndex, in: source)
+        guard regex.firstMatch(in: source, range: range) != nil else {
+            return source
+        }
+        return regex.stringByReplacingMatches(in: source, range: range, withTemplate: template)
+    }
+}
 
 private enum SpeechTranscriptionProvider: String {
     case appleSpeech = "apple_speech"
@@ -39,10 +216,1696 @@ private enum SpeechTranscriptionProvider: String {
 }
 
 private final class WindowDragView: NSView {
-    override var mouseDownCanMoveWindow: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            window?.performZoom(nil)
+            return
+        }
         window?.performDrag(with: event)
+    }
+}
+
+private enum MacPDFPageMode: String {
+    case automatic
+    case single
+    case double
+    case continuous
+
+    var title: String {
+        switch self {
+        case .automatic: return "自动"
+        case .single: return "单页"
+        case .double: return "双页"
+        case .continuous: return "连续"
+        }
+    }
+}
+
+private struct PDFAnnotationTarget {
+    let sourceText: String
+    let chapterLocator: String
+    let chapterTitle: String
+    let sentenceIndex: String
+    let rangeLocator: [String: Any]
+    let signature: String
+    let mode: String
+}
+
+enum ClickPDFSentenceRangeResolver {
+    static let maximumSentenceLength = 2_000
+
+    static func sentenceRange(in text: String, containingUTF16Index index: Int) -> NSRange? {
+        let utf16Length = (text as NSString).length
+        guard !text.isEmpty, index != NSNotFound, index >= 0, index < utf16Length else { return nil }
+
+        var resolved: NSRange?
+        text.enumerateSubstrings(
+            in: text.startIndex..<text.endIndex,
+            options: [.bySentences, .substringNotRequired]
+        ) { _, substringRange, _, stop in
+            let candidate = NSRange(substringRange, in: text)
+            guard NSLocationInRange(index, candidate) else { return }
+            let trimmed = trimWhitespace(candidate, in: text as NSString)
+            if trimmed.length > 0, trimmed.length <= maximumSentenceLength {
+                resolved = trimmed
+            }
+            stop = true
+        }
+        return resolved
+    }
+
+    private static func trimWhitespace(_ range: NSRange, in text: NSString) -> NSRange {
+        var location = range.location
+        var end = NSMaxRange(range)
+        while location < end, isWhitespace(text.character(at: location)) { location += 1 }
+        while end > location, isWhitespace(text.character(at: end - 1)) { end -= 1 }
+        return NSRange(location: location, length: end - location)
+    }
+
+    private static func isWhitespace(_ character: unichar) -> Bool {
+        guard let scalar = UnicodeScalar(character) else { return false }
+        return CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+}
+
+enum ClickPDFOverlayKind: String {
+    case red
+    case note
+    case pendingRed = "pending-red"
+    case pendingNote = "pending-note"
+}
+
+struct ClickPDFAnnotationProjectionResult {
+    var highlightIDsBySignature: [String: [String]] = [:]
+    var annotationIDsBySignature: [String: [String]] = [:]
+    var annotationsByID: [String: [String: Any]] = [:]
+    var audioNotesByAnnotationID: [String: [[String: Any]]] = [:]
+    var redOverlayCount = 0
+    var noteAnchorCount = 0
+}
+
+enum ClickPDFAnnotationProjection {
+    static let namespace = "ClickAnnotation:v1:"
+    static let legacyNamespace = "Click:"
+
+    static func signature(for locator: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(locator),
+              let data = try? JSONSerialization.data(withJSONObject: locator, options: [.sortedKeys])
+        else { return UUID().uuidString }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func overlayName(kind: ClickPDFOverlayKind, annotationID: String) -> String {
+        "\(namespace)\(kind.rawValue):\(annotationID)"
+    }
+
+    static func overlayIdentity(from annotation: PDFAnnotation) -> (kind: ClickPDFOverlayKind, annotationID: String)? {
+        guard let name = annotation.userName, !name.isEmpty else { return nil }
+        if name.hasPrefix(namespace) {
+            let payload = String(name.dropFirst(namespace.count))
+            guard let separator = payload.firstIndex(of: ":") else { return nil }
+            let rawKind = String(payload[..<separator])
+            let annotationID = String(payload[payload.index(after: separator)...])
+            guard let kind = ClickPDFOverlayKind(rawValue: rawKind), !annotationID.isEmpty else { return nil }
+            return (kind, annotationID)
+        }
+        if name.hasPrefix(legacyNamespace) {
+            let annotationID = String(name.dropFirst(legacyNamespace.count))
+            guard !annotationID.isEmpty else { return nil }
+            return (.red, annotationID)
+        }
+        return nil
+    }
+
+    static func clickAnnotationIDs(at point: NSPoint, on page: PDFPage) -> [String] {
+        var seen = Set<String>()
+        var hits: [(priority: Int, annotationID: String)] = []
+        for annotation in page.annotations {
+            guard annotation.bounds.insetBy(dx: -4, dy: -4).contains(point),
+                  let identity = overlayIdentity(from: annotation),
+                  !identity.kind.rawValue.hasPrefix("pending-")
+            else { continue }
+            guard seen.insert(identity.annotationID).inserted else { continue }
+            let priority = identity.kind == .note ? 0 : 1
+            hits.append((priority, identity.annotationID))
+        }
+        return hits.sorted { lhs, rhs in
+            if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
+            return lhs.annotationID < rhs.annotationID
+        }.map(\.annotationID)
+    }
+
+    static func removeClickOverlays(from document: PDFDocument) {
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            let clickOverlays = page.annotations.filter { overlayIdentity(from: $0) != nil }
+            for annotation in clickOverlays {
+                annotation.shouldDisplay = false
+                annotation.shouldPrint = false
+                annotation.color = .clear
+                annotation.contents = ""
+                annotation.bounds = .zero
+                page.removeAnnotation(annotation)
+            }
+        }
+    }
+
+    static func project(
+        annotations: [[String: Any]],
+        audioNotes: [[String: Any]],
+        onto document: PDFDocument,
+        clearExisting: Bool = true
+    ) -> ClickPDFAnnotationProjectionResult {
+        if clearExisting {
+            removeClickOverlays(from: document)
+        }
+        var result = ClickPDFAnnotationProjectionResult()
+        for audioNote in audioNotes {
+            guard let annotationID = audioNote["annotation_id"] as? String, !annotationID.isEmpty else { continue }
+            result.audioNotesByAnnotationID[annotationID, default: []].append(audioNote)
+        }
+
+        var noteOrdinalByPage: [Int: Int] = [:]
+        for annotation in annotations {
+            guard let annotationID = annotation["id"] as? String,
+                  let kind = annotation["kind"] as? String,
+                  kind == "red_highlight" || kind == "note"
+            else { continue }
+            let locator = annotation["range_locator"] as? [String: Any] ?? [:]
+            let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+            let locatorSignature = metadata["pdf_locator_signature"] as? String ?? signature(for: locator)
+            result.annotationsByID[annotationID] = annotation
+            if !result.annotationIDsBySignature[locatorSignature, default: []].contains(annotationID) {
+                result.annotationIDsBySignature[locatorSignature, default: []].append(annotationID)
+            }
+            if kind == "red_highlight" {
+                if !result.highlightIDsBySignature[locatorSignature, default: []].contains(annotationID) {
+                    result.highlightIDsBySignature[locatorSignature, default: []].append(annotationID)
+                }
+                result.redOverlayCount += addRedOverlays(
+                    annotationID: annotationID,
+                    locator: locator,
+                    sourceText: annotation["source_text"] as? String ?? "",
+                    document: document,
+                    pending: false
+                )
+            }
+
+            let noteText = (annotation["note_text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let linkedAudio = result.audioNotesByAnnotationID[annotationID] ?? []
+            if kind == "note" || !noteText.isEmpty || !linkedAudio.isEmpty {
+                if addNoteAnchor(
+                    annotationID: annotationID,
+                    locator: locator,
+                    sourceText: annotation["source_text"] as? String ?? "",
+                    noteText: noteText,
+                    audioNotes: linkedAudio,
+                    document: document,
+                    noteOrdinalByPage: &noteOrdinalByPage,
+                    pending: false
+                ) {
+                    result.noteAnchorCount += 1
+                }
+            }
+        }
+        return result
+    }
+
+    @discardableResult
+    static func addPendingOverlay(
+        annotationID: String,
+        kind: String,
+        locator: [String: Any],
+        sourceText: String,
+        onto document: PDFDocument
+    ) -> Int {
+        if kind == "red_highlight" {
+            return addRedOverlays(
+                annotationID: annotationID,
+                locator: locator,
+                sourceText: sourceText,
+                document: document,
+                pending: true
+            )
+        }
+        var ordinals: [Int: Int] = [:]
+        return addNoteAnchor(
+            annotationID: annotationID,
+            locator: locator,
+            sourceText: sourceText,
+            noteText: "正在保存...",
+            audioNotes: [],
+            document: document,
+            noteOrdinalByPage: &ordinals,
+            pending: true
+        ) ? 1 : 0
+    }
+
+    private static func addRedOverlays(
+        annotationID: String,
+        locator: [String: Any],
+        sourceText: String,
+        document: PDFDocument,
+        pending: Bool
+    ) -> Int {
+        guard let pageLocators = locator["pages"] as? [[String: Any]] else { return 0 }
+        let mode = locator["mode"] as? String ?? "pdf_text_selection"
+        var count = 0
+        for pageLocator in pageLocators {
+            guard let pageIndex = (pageLocator["page_index"] as? NSNumber)?.intValue,
+                  let page = document.page(at: pageIndex)
+            else { continue }
+            for rectPayload in pageLocator["rects"] as? [[String: Any]] ?? [] {
+                let rect = denormalizedRect(rectPayload, page: page)
+                guard rect.width > 0, rect.height > 0 else { continue }
+                let subtype: PDFAnnotationSubtype = mode == "pdf_area" ? .square : .highlight
+                let overlay = PDFAnnotation(bounds: rect, forType: subtype, withProperties: nil)
+                overlay.userName = overlayName(kind: pending ? .pendingRed : .red, annotationID: annotationID)
+                overlay.contents = sourceText
+                overlay.color = NSColor.systemRed.withAlphaComponent(pending ? 0.24 : mode == "pdf_area" ? 0.72 : 0.48)
+                if mode == "pdf_area" {
+                    let border = PDFBorder()
+                    border.lineWidth = pending ? 1 : 2
+                    overlay.border = border
+                }
+                page.addAnnotation(overlay)
+                count += 1
+            }
+        }
+        return count
+    }
+
+    private static func addNoteAnchor(
+        annotationID: String,
+        locator: [String: Any],
+        sourceText: String,
+        noteText: String,
+        audioNotes: [[String: Any]],
+        document: PDFDocument,
+        noteOrdinalByPage: inout [Int: Int],
+        pending: Bool
+    ) -> Bool {
+        guard let firstPageLocator = (locator["pages"] as? [[String: Any]])?.first,
+              let pageIndex = (firstPageLocator["page_index"] as? NSNumber)?.intValue,
+              let page = document.page(at: pageIndex)
+        else { return false }
+        let firstRectPayload = (firstPageLocator["rects"] as? [[String: Any]])?.first
+        let contentRect = firstRectPayload.map { denormalizedRect($0, page: page) }
+        let ordinal = noteOrdinalByPage[pageIndex, default: 0]
+        noteOrdinalByPage[pageIndex] = ordinal + 1
+        let anchor = noteAnchorRect(contentRect: contentRect, page: page, ordinal: ordinal)
+        let overlay = PDFAnnotation(bounds: anchor, forType: .text, withProperties: nil)
+        overlay.userName = overlayName(kind: pending ? .pendingNote : .note, annotationID: annotationID)
+        overlay.contents = noteText.isEmpty ? sourceText : noteText
+        overlay.iconType = .comment
+        overlay.color = pending ? NSColor.systemOrange : noteColor(audioNotes: audioNotes)
+        page.addAnnotation(overlay)
+        return true
+    }
+
+    private static func noteColor(audioNotes: [[String: Any]]) -> NSColor {
+        let statuses = Set(audioNotes.compactMap { $0["status"] as? String })
+        if statuses.contains("failed") { return .systemRed }
+        if statuses.contains("pending") { return .systemOrange }
+        if statuses.contains("transcribed") { return .systemPurple }
+        return .systemBlue
+    }
+
+    private static func noteAnchorRect(contentRect: NSRect?, page: PDFPage, ordinal: Int) -> NSRect {
+        let pageBounds = page.bounds(for: .cropBox)
+        let size: CGFloat = 18
+        let base = contentRect ?? NSRect(x: pageBounds.maxX - size - 4, y: pageBounds.maxY - size - 4, width: size, height: size)
+        var x = min(pageBounds.maxX - size - 2, max(pageBounds.minX + 2, base.maxX + 3))
+        if x + size > pageBounds.maxX - 1 {
+            x = max(pageBounds.minX + 2, base.minX - size - 3)
+        }
+        let offset = CGFloat(ordinal % 5) * (size + 2)
+        var y = base.maxY - size - offset
+        if y < pageBounds.minY + 2 {
+            y = min(pageBounds.maxY - size - 2, base.minY + offset)
+        }
+        return NSRect(x: x, y: y, width: size, height: size).intersection(pageBounds)
+    }
+
+    static func denormalizedRect(_ payload: [String: Any], page: PDFPage) -> NSRect {
+        let box = page.bounds(for: .cropBox)
+        func value(_ key: String) -> CGFloat { CGFloat((payload[key] as? NSNumber)?.doubleValue ?? 0) }
+        return NSRect(
+            x: box.minX + value("x") * box.width,
+            y: box.minY + value("y") * box.height,
+            width: value("width") * box.width,
+            height: value("height") * box.height
+        ).intersection(box)
+    }
+}
+
+private struct PDFAnnotationInteractionContext {
+    let annotations: [[String: Any]]
+    let audioNotes: [[String: Any]]
+}
+
+private final class ClickPDFView: PDFView {
+    var onDiscretePageTurn: ((Int) -> Void)?
+    var onAreaSelected: ((PDFPage, NSRect) -> Void)?
+    var onWordClicked: ((String, String) -> Void)?
+    var onAnnotationClicked: (([String]) -> Void)?
+    var onSentenceNoteRequested: ((PDFPage, NSPoint) -> Bool)?
+    var onSentenceHighlightRequested: ((PDFPage, NSPoint) -> Bool)?
+    var onAreaSelectionCancelled: (() -> Void)?
+    var onChromeToggle: (() -> Void)?
+    var areaSelectionMode = false
+    var discretePagingEnabled = true
+
+    private var wheelAccumulation: CGFloat = 0
+    private var wheelDirection = 0
+    private var wheelConsumed = false
+    private var wheelResetWorkItem: DispatchWorkItem?
+    private var areaStartPoint: NSPoint?
+    private weak var areaStartPage: PDFPage?
+    private var normalMouseDownPoint: NSPoint?
+    private var interceptedAnnotationIDs: [String] = []
+    private var secondaryMouseDownPoint: NSPoint?
+    private weak var secondaryMouseDownPage: PDFPage?
+    private var secondaryClickPreservesSelection = false
+    private var pendingWordLookupWorkItem: DispatchWorkItem?
+
+    override func scrollWheel(with event: NSEvent) {
+        guard discretePagingEnabled else {
+            super.scrollWheel(with: event)
+            return
+        }
+        if !event.momentumPhase.isEmpty {
+            return
+        }
+        if event.phase == .began || event.phase.isEmpty && event.momentumPhase.isEmpty && wheelAccumulation == 0 {
+            resetWheelGesture()
+        }
+        let horizontal = abs(event.scrollingDeltaX)
+        let vertical = abs(event.scrollingDeltaY)
+        let primary = horizontal >= vertical * 0.72 ? event.scrollingDeltaX : -event.scrollingDeltaY
+        guard abs(primary) > 0.01 else { return }
+        let direction = primary > 0 ? 1 : -1
+        if wheelDirection != 0 && wheelDirection != direction {
+            resetWheelGesture()
+        }
+        wheelDirection = direction
+        wheelAccumulation += abs(primary)
+        wheelResetWorkItem?.cancel()
+        let reset = DispatchWorkItem { [weak self] in self?.resetWheelGesture() }
+        wheelResetWorkItem = reset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.34, execute: reset)
+        if !wheelConsumed && wheelAccumulation >= 34 {
+            wheelConsumed = true
+            onDiscretePageTurn?(direction)
+        }
+        if event.phase == .ended || event.phase == .cancelled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in self?.resetWheelGesture() }
+        }
+    }
+
+    private func resetWheelGesture() {
+        wheelAccumulation = 0
+        wheelDirection = 0
+        wheelConsumed = false
+        wheelResetWorkItem?.cancel()
+        wheelResetWorkItem = nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if areaSelectionMode, let page = page(for: point, nearest: true) {
+            areaStartPage = page
+            areaStartPoint = convert(point, to: page)
+            return
+        }
+        if event.clickCount == 2 {
+            pendingWordLookupWorkItem?.cancel()
+            pendingWordLookupWorkItem = nil
+            normalMouseDownPoint = point
+            interceptedAnnotationIDs = []
+            return
+        }
+        normalMouseDownPoint = point
+        if let page = page(for: point, nearest: false) {
+            let pagePoint = convert(point, to: page)
+            let noteIDs = page.annotations.compactMap { annotation -> String? in
+                guard annotation.bounds.insetBy(dx: -4, dy: -4).contains(pagePoint),
+                      let identity = ClickPDFAnnotationProjection.overlayIdentity(from: annotation),
+                      identity.kind == .note
+                else { return nil }
+                return identity.annotationID
+            }
+            if !noteIDs.isEmpty {
+                interceptedAnnotationIDs = Array(Set(noteIDs)).sorted()
+                return
+            }
+        }
+        interceptedAnnotationIDs = []
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if areaSelectionMode, areaStartPoint != nil {
+            return
+        }
+        if !interceptedAnnotationIDs.isEmpty {
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if areaSelectionMode, let page = areaStartPage, let start = areaStartPoint {
+            let end = convert(point, to: page)
+            areaStartPoint = nil
+            areaStartPage = nil
+            let rect = NSRect(
+                x: min(start.x, end.x),
+                y: min(start.y, end.y),
+                width: abs(end.x - start.x),
+                height: abs(end.y - start.y)
+            ).intersection(page.bounds(for: .cropBox))
+            if rect.width >= 8, rect.height >= 8 {
+                onAreaSelected?(page, rect)
+            }
+            return
+        }
+
+        if event.clickCount == 2 {
+            pendingWordLookupWorkItem?.cancel()
+            pendingWordLookupWorkItem = nil
+            let start = normalMouseDownPoint
+            normalMouseDownPoint = nil
+            interceptedAnnotationIDs = []
+            guard let start,
+                  hypot(point.x - start.x, point.y - start.y) < 4,
+                  let page = page(for: point, nearest: false)
+            else { return }
+            clearSelection()
+            _ = onSentenceNoteRequested?(page, convert(point, to: page))
+            return
+        }
+
+        if !interceptedAnnotationIDs.isEmpty {
+            let start = normalMouseDownPoint
+            normalMouseDownPoint = nil
+            let annotationIDs = interceptedAnnotationIDs
+            interceptedAnnotationIDs = []
+            if event.clickCount == 1,
+               let start,
+               hypot(point.x - start.x, point.y - start.y) < 4 {
+                clearSelection()
+                onAnnotationClicked?(annotationIDs)
+            }
+            return
+        }
+
+        super.mouseUp(with: event)
+        let start = normalMouseDownPoint
+        normalMouseDownPoint = nil
+        guard event.clickCount == 1,
+              let start,
+              hypot(point.x - start.x, point.y - start.y) < 4
+        else {
+            return
+        }
+        guard let page = page(for: point, nearest: false) else {
+            onChromeToggle?()
+            return
+        }
+        let pagePoint = convert(point, to: page)
+        let annotationIDs = ClickPDFAnnotationProjection.clickAnnotationIDs(at: pagePoint, on: page)
+        if !annotationIDs.isEmpty {
+            clearSelection()
+            onAnnotationClicked?(annotationIDs)
+            return
+        }
+        guard currentSelection?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else { return }
+        guard let wordSelection = page.selectionForWord(at: pagePoint),
+              let word = wordSelection.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              word.range(of: #"^[A-Za-z][A-Za-z'-]*$"#, options: .regularExpression) != nil
+        else {
+            onChromeToggle?()
+            return
+        }
+        let context = page.string ?? ""
+        pendingWordLookupWorkItem?.cancel()
+        let lookup = DispatchWorkItem { [weak self] in
+            guard self?.currentSelection?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else { return }
+            self?.onWordClicked?(word, context)
+        }
+        pendingWordLookupWorkItem = lookup
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: lookup)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        pendingWordLookupWorkItem?.cancel()
+        pendingWordLookupWorkItem = nil
+        guard let page = page(for: point, nearest: false) else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        secondaryMouseDownPoint = point
+        secondaryMouseDownPage = page
+        secondaryClickPreservesSelection = currentSelection?.string?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        guard secondaryMouseDownPage == nil else { return }
+        super.rightMouseDragged(with: event)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let start = secondaryMouseDownPoint,
+              let page = secondaryMouseDownPage
+        else {
+            super.rightMouseUp(with: event)
+            return
+        }
+        secondaryMouseDownPoint = nil
+        secondaryMouseDownPage = nil
+        guard hypot(point.x - start.x, point.y - start.y) < 4 else { return }
+        if secondaryClickPreservesSelection {
+            secondaryClickPreservesSelection = false
+            return
+        }
+        secondaryClickPreservesSelection = false
+        clearSelection()
+        _ = onSentenceHighlightRequested?(page, convert(point, to: page))
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        if page(for: point, nearest: false) != nil { return nil }
+        return super.menu(for: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53, areaSelectionMode {
+            areaStartPoint = nil
+            areaStartPage = nil
+            onAreaSelectionCancelled?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
+private final class MacPDFReaderController: NSObject {
+    let view = NSView()
+    let pdfView = ClickPDFView()
+    var onPositionChanged: (([String: Any]) -> Void)?
+    var onToggleHighlight: ((PDFAnnotationTarget) -> Void)?
+    var onNote: ((PDFAnnotationTarget) -> Void)?
+    var onRead: ((String) -> Void)?
+    var onLookup: ((String, String) -> Void)?
+    var onManageAnnotations: ((PDFAnnotationInteractionContext) -> Void)?
+    var onAreaSelectionModeChanged: ((Bool) -> Void)?
+    var onChromeToggle: (() -> Void)?
+    var onStatus: ((String) -> Void)?
+
+    private let actionBar = NSVisualEffectView()
+    private let copyButton = NSButton(title: "复制", target: nil, action: nil)
+    private let highlightButton = NSButton(title: "标红", target: nil, action: nil)
+    private let noteButton = NSButton(title: "备注", target: nil, action: nil)
+    private let readButton = NSButton(title: "朗读", target: nil, action: nil)
+    private var pendingTarget: PDFAnnotationTarget?
+    private var highlightIDsBySignature: [String: [String]] = [:]
+    private var annotationIDsBySignature: [String: [String]] = [:]
+    private var annotationsByID: [String: [String: Any]] = [:]
+    private var audioNotesByAnnotationID: [String: [[String: Any]]] = [:]
+    private(set) var pageMode: MacPDFPageMode = .automatic
+    private var viewportWidth: CGFloat = 1180
+    private var suppressPositionEvents = false
+    private(set) var lastError = ""
+
+    override init() {
+        super.init()
+        buildView()
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    var document: PDFDocument? { pdfView.document }
+    var pageCount: Int { pdfView.document?.pageCount ?? 0 }
+    var requiresPassword: Bool { pdfView.document?.isLocked == true }
+    var effectiveDoublePage: Bool {
+        pageMode == .double || (pageMode == .automatic && viewportWidth >= 980)
+    }
+
+    private func buildView() {
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.black.cgColor
+        pdfView.backgroundColor = .black
+        pdfView.displayBox = .cropBox
+        pdfView.displaysPageBreaks = true
+        pdfView.pageBreakMargins = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
+        pdfView.autoScales = true
+        pdfView.onDiscretePageTurn = { [weak self] direction in self?.turn(direction: direction) }
+        pdfView.onAreaSelected = { [weak self] page, rect in self?.showAreaActions(page: page, rect: rect) }
+        pdfView.onWordClicked = { [weak self] word, context in self?.onLookup?(word, context) }
+        pdfView.onAnnotationClicked = { [weak self] annotationIDs in self?.showExistingActions(annotationIDs: annotationIDs) }
+        pdfView.onSentenceNoteRequested = { [weak self] page, point in
+            self?.performSentenceNote(on: page, at: point) ?? false
+        }
+        pdfView.onSentenceHighlightRequested = { [weak self] page, point in
+            self?.performSentenceHighlight(on: page, at: point) ?? false
+        }
+        pdfView.onAreaSelectionCancelled = { [weak self] in self?.setAreaSelectionMode(false) }
+        pdfView.onChromeToggle = { [weak self] in self?.onChromeToggle?() }
+
+        actionBar.material = .hudWindow
+        actionBar.blendingMode = .withinWindow
+        actionBar.state = .active
+        actionBar.wantsLayer = true
+        actionBar.layer?.cornerRadius = 7
+        actionBar.isHidden = true
+        let buttons = [copyButton, highlightButton, noteButton, readButton]
+        for button in buttons {
+            button.bezelStyle = .rounded
+            button.controlSize = .small
+            button.font = NSFont(name: "Microsoft YaHei", size: 12) ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        }
+        copyButton.target = self
+        copyButton.action = #selector(copySelection(_:))
+        highlightButton.target = self
+        highlightButton.action = #selector(toggleHighlight(_:))
+        noteButton.target = self
+        noteButton.action = #selector(addNote(_:))
+        readButton.target = self
+        readButton.action = #selector(readSelection(_:))
+        let stack = NSStackView(views: buttons)
+        stack.orientation = .horizontal
+        stack.spacing = 5
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 7, bottom: 5, right: 7)
+
+        [pdfView, actionBar, stack].forEach { $0.translatesAutoresizingMaskIntoConstraints = false }
+        view.addSubview(pdfView)
+        view.addSubview(actionBar)
+        actionBar.addSubview(stack)
+        NSLayoutConstraint.activate([
+            pdfView.topAnchor.constraint(equalTo: view.topAnchor),
+            pdfView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            pdfView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            pdfView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            actionBar.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            actionBar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.topAnchor.constraint(equalTo: actionBar.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: actionBar.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: actionBar.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: actionBar.bottomAnchor),
+        ])
+
+        NotificationCenter.default.addObserver(self, selector: #selector(pageChanged(_:)), name: .PDFViewPageChanged, object: pdfView)
+        NotificationCenter.default.addObserver(self, selector: #selector(selectionChanged(_:)), name: .PDFViewSelectionChanged, object: pdfView)
+        NotificationCenter.default.addObserver(self, selector: #selector(scaleChanged(_:)), name: .PDFViewScaleChanged, object: pdfView)
+    }
+
+    @discardableResult
+    func load(url: URL, mode: MacPDFPageMode, viewportWidth: CGFloat, password: String? = nil) -> Bool {
+        guard let document = PDFDocument(url: url) else {
+            lastError = "PDF 文件无法打开"
+            return false
+        }
+        if document.isLocked, let password, !password.isEmpty {
+            _ = document.unlock(withPassword: password)
+        }
+        guard !document.isLocked else {
+            pdfView.document = document
+            lastError = "PDF 需要密码"
+            return false
+        }
+        suppressPositionEvents = true
+        self.pageMode = mode
+        self.viewportWidth = max(320, viewportWidth)
+        pdfView.document = document
+        applyPageMode()
+        pdfView.goToFirstPage(nil)
+        pdfView.autoScales = true
+        pendingTarget = nil
+        actionBar.isHidden = true
+        highlightIDsBySignature = [:]
+        annotationIDsBySignature = [:]
+        annotationsByID = [:]
+        audioNotesByAnnotationID = [:]
+        lastError = ""
+        suppressPositionEvents = false
+        return true
+    }
+
+    func unlock(password: String) -> Bool {
+        guard let document = pdfView.document, document.isLocked else { return true }
+        guard document.unlock(withPassword: password) else {
+            lastError = "PDF 密码不正确"
+            return false
+        }
+        suppressPositionEvents = true
+        applyPageMode()
+        pdfView.goToFirstPage(nil)
+        pdfView.autoScales = true
+        suppressPositionEvents = false
+        lastError = ""
+        return true
+    }
+
+    func setPageMode(_ mode: MacPDFPageMode) {
+        guard pageMode != mode else { return }
+        let index = currentPageIndex
+        pageMode = mode
+        applyPageMode()
+        goTo(pageIndex: index)
+        publishPosition()
+    }
+
+    func updateViewport(width: CGFloat) {
+        let wasDouble = effectiveDoublePage
+        viewportWidth = max(320, width)
+        guard pageMode == .automatic, wasDouble != effectiveDoublePage else { return }
+        let index = currentPageIndex
+        applyPageMode()
+        goTo(pageIndex: index)
+    }
+
+    private func applyPageMode() {
+        switch pageMode {
+        case .automatic:
+            pdfView.displayMode = effectiveDoublePage ? .twoUp : .singlePage
+            pdfView.displayDirection = .horizontal
+        case .single:
+            pdfView.displayMode = .singlePage
+            pdfView.displayDirection = .horizontal
+        case .double:
+            pdfView.displayMode = .twoUp
+            pdfView.displayDirection = .horizontal
+        case .continuous:
+            pdfView.displayMode = .singlePageContinuous
+            pdfView.displayDirection = .vertical
+        }
+        pdfView.displaysAsBook = effectiveDoublePage
+        pdfView.discretePagingEnabled = pageMode != .continuous
+        pdfView.autoScales = true
+    }
+
+    var currentPageIndex: Int {
+        guard let document = pdfView.document, let page = pdfView.currentPage else { return 0 }
+        return max(0, document.index(for: page))
+    }
+
+    func turn(direction: Int) {
+        guard direction != 0, pageCount > 0 else { return }
+        if pageMode == .continuous {
+            if direction > 0 { pdfView.goToNextPage(nil) } else { pdfView.goToPreviousPage(nil) }
+            return
+        }
+        let step = effectiveDoublePage ? 2 : 1
+        goTo(pageIndex: currentPageIndex + (direction > 0 ? step : -step))
+    }
+
+    func goTo(pageIndex: Int) {
+        guard let document = pdfView.document, document.pageCount > 0 else { return }
+        let bounded = max(0, min(pageIndex, document.pageCount - 1))
+        let aligned = effectiveDoublePage ? (bounded / 2) * 2 : bounded
+        guard let page = document.page(at: aligned) else { return }
+        pdfView.go(to: page)
+        publishPosition()
+    }
+
+    func restore(locator: [String: Any]) {
+        let pageIndex = (locator["page_index"] as? NSNumber)?.intValue
+            ?? (locator["pageIndex"] as? NSNumber)?.intValue
+            ?? 0
+        if let rawMode = locator["display_mode"] as? String, let mode = MacPDFPageMode(rawValue: rawMode) {
+            pageMode = mode
+            applyPageMode()
+        }
+        goTo(pageIndex: pageIndex)
+        if let scale = (locator["scale_factor"] as? NSNumber)?.doubleValue, scale > 0 {
+            pdfView.autoScales = false
+            pdfView.scaleFactor = CGFloat(scale)
+        }
+    }
+
+    func positionLocator() -> [String: Any] {
+        let index = currentPageIndex
+        return [
+            "schema": "click.pdf.position.v1",
+            "page_index": index,
+            "page_number": index + 1,
+            "page_count": pageCount,
+            "display_mode": pageMode.rawValue,
+            "effective_double_page": effectiveDoublePage,
+            "scale_factor": Double(pdfView.scaleFactor),
+            "display_box": "cropBox",
+        ]
+    }
+
+    func setAreaSelectionMode(_ enabled: Bool) {
+        pdfView.areaSelectionMode = enabled
+        onAreaSelectionModeChanged?(enabled)
+        if enabled {
+            pdfView.clearSelection()
+            actionBar.isHidden = true
+            onStatus?("区域批注已开启：拖拉框选扫描页区域")
+        } else {
+            onStatus?("区域批注已关闭")
+        }
+    }
+
+    func renderAnnotations(_ annotations: [[String: Any]], audioNotes: [[String: Any]] = []) {
+        guard let document = pdfView.document else { return }
+        let result = ClickPDFAnnotationProjection.project(
+            annotations: annotations,
+            audioNotes: audioNotes,
+            onto: document
+        )
+        highlightIDsBySignature = result.highlightIDsBySignature
+        annotationIDsBySignature = result.annotationIDsBySignature
+        annotationsByID = result.annotationsByID
+        audioNotesByAnnotationID = result.audioNotesByAnnotationID
+        refreshAnnotationRendering(document)
+    }
+
+    func removeHighlight(annotationID: String) {
+        guard let document = pdfView.document else { return }
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            let matching = page.annotations.filter {
+                ClickPDFAnnotationProjection.overlayIdentity(from: $0)?.annotationID == annotationID
+            }
+            for annotation in matching {
+                annotation.shouldDisplay = false
+                annotation.shouldPrint = false
+                annotation.color = .clear
+                annotation.contents = ""
+                annotation.bounds = .zero
+                page.removeAnnotation(annotation)
+            }
+        }
+        highlightIDsBySignature = highlightIDsBySignature.compactMapValues { ids in
+            let filtered = ids.filter { $0 != annotationID }
+            return filtered.isEmpty ? nil : filtered
+        }
+        annotationIDsBySignature = annotationIDsBySignature.compactMapValues { ids in
+            let filtered = ids.filter { $0 != annotationID }
+            return filtered.isEmpty ? nil : filtered
+        }
+        annotationsByID[annotationID] = nil
+        audioNotesByAnnotationID[annotationID] = nil
+        refreshAnnotationRendering(document)
+    }
+
+    private func clearClickAnnotations() {
+        guard let document = pdfView.document else { return }
+        ClickPDFAnnotationProjection.removeClickOverlays(from: document)
+        refreshAnnotationRendering(document)
+    }
+
+    private func refreshAnnotationRendering(_ document: PDFDocument) {
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            pdfView.annotationsChanged(on: page)
+        }
+        pdfView.needsDisplay = true
+    }
+
+    private func normalizedRect(_ rect: NSRect, page: PDFPage) -> [String: Any] {
+        let box = page.bounds(for: .cropBox)
+        guard box.width > 0, box.height > 0 else { return [:] }
+        return [
+            "x": Double((rect.minX - box.minX) / box.width),
+            "y": Double((rect.minY - box.minY) / box.height),
+            "width": Double(rect.width / box.width),
+            "height": Double(rect.height / box.height),
+        ]
+    }
+
+    private func target(from selection: PDFSelection, mode: String = "pdf_text_selection") -> PDFAnnotationTarget? {
+        guard let document = pdfView.document,
+              let text = selection.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty
+        else { return nil }
+        var pageLocators: [[String: Any]] = []
+        for page in selection.pages {
+            let pageIndex = document.index(for: page)
+            guard pageIndex >= 0 else { continue }
+            let lineRects = selection.selectionsByLine()
+                .filter { $0.pages.contains(page) }
+                .map { normalizedRect($0.bounds(for: page), page: page) }
+                .filter { !$0.isEmpty }
+            let rects = lineRects.isEmpty ? [normalizedRect(selection.bounds(for: page), page: page)] : lineRects
+            var ranges: [[String: Int]] = []
+            for rangeIndex in 0..<selection.numberOfTextRanges(on: page) {
+                let range = selection.range(at: rangeIndex, on: page)
+                if range.location != NSNotFound {
+                    ranges.append(["location": range.location, "length": range.length])
+                }
+            }
+            pageLocators.append([
+                "page_index": pageIndex,
+                "page_number": pageIndex + 1,
+                "rotation": page.rotation,
+                "display_box": "cropBox",
+                "rects": rects,
+                "character_ranges": ranges,
+            ])
+        }
+        guard let first = pageLocators.first,
+              let pageIndex = (first["page_index"] as? NSNumber)?.intValue
+        else { return nil }
+        let locator: [String: Any] = [
+            "schema": "click.pdf.locator.v1",
+            "mode": mode,
+            "page_index": pageIndex,
+            "pages": pageLocators,
+            "source_text": text,
+        ]
+        let signature = Self.signature(for: locator)
+        return PDFAnnotationTarget(
+            sourceText: text,
+            chapterLocator: String(format: "pdf:page:%06d", pageIndex + 1),
+            chapterTitle: "第 \(pageIndex + 1) 页",
+            sentenceIndex: "\(mode == "pdf_text_sentence" ? "pdf-sentence" : "pdf-selection")-\(signature.prefix(16))",
+            rangeLocator: locator,
+            signature: signature,
+            mode: mode
+        )
+    }
+
+    private func sentenceTarget(on page: PDFPage, at point: NSPoint) -> PDFAnnotationTarget? {
+        guard let text = page.string, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            onStatus?("当前 PDF 页没有文字层，请使用区域批注")
+            return nil
+        }
+        let characterIndex = nearbyCharacterIndex(on: page, at: point)
+        guard characterIndex != NSNotFound,
+              let sentenceRange = ClickPDFSentenceRangeResolver.sentenceRange(
+                in: text,
+                containingUTF16Index: characterIndex
+              ),
+              let selection = page.selection(for: sentenceRange),
+              let target = target(from: selection, mode: "pdf_text_sentence")
+        else {
+            onStatus?("未能可靠定位整句，请拖选文字后操作")
+            return nil
+        }
+        return target
+    }
+
+    private func nearbyCharacterIndex(on page: PDFPage, at point: NSPoint) -> Int {
+        let direct = page.characterIndex(at: point)
+        if direct != NSNotFound { return direct }
+
+        let offsets: [CGFloat] = [-6, -3, 0, 3, 6]
+        var best: (index: Int, distance: CGFloat)?
+        for xOffset in offsets {
+            for yOffset in offsets where xOffset != 0 || yOffset != 0 {
+                let candidate = page.characterIndex(at: NSPoint(x: point.x + xOffset, y: point.y + yOffset))
+                guard candidate != NSNotFound else { continue }
+                let bounds = page.characterBounds(at: candidate)
+                guard !bounds.isEmpty,
+                      bounds.insetBy(dx: -7, dy: -7).contains(point)
+                else { continue }
+                let distance = hypot(bounds.midX - point.x, bounds.midY - point.y)
+                if let current = best, distance >= current.distance {
+                    continue
+                } else {
+                    best = (candidate, distance)
+                }
+            }
+        }
+        return best?.index ?? NSNotFound
+    }
+
+    private func performSentenceNote(on page: PDFPage, at point: NSPoint) -> Bool {
+        guard let target = sentenceTarget(on: page, at: point) else { return false }
+        dismissActions()
+        onNote?(target)
+        return true
+    }
+
+    private func performSentenceHighlight(on page: PDFPage, at point: NSPoint) -> Bool {
+        guard let target = sentenceTarget(on: page, at: point) else { return false }
+        dismissActions()
+        onToggleHighlight?(target)
+        return true
+    }
+
+    private func showAreaActions(page: PDFPage, rect: NSRect) {
+        guard let document = pdfView.document else { return }
+        let pageIndex = document.index(for: page)
+        guard pageIndex >= 0 else { return }
+        let locator: [String: Any] = [
+            "schema": "click.pdf.locator.v1",
+            "mode": "pdf_area",
+            "page_index": pageIndex,
+            "pages": [[
+                "page_index": pageIndex,
+                "page_number": pageIndex + 1,
+                "rotation": page.rotation,
+                "display_box": "cropBox",
+                "rects": [normalizedRect(rect, page: page)],
+                "character_ranges": [],
+            ]],
+        ]
+        let signature = Self.signature(for: locator)
+        showActions(
+            PDFAnnotationTarget(
+                sourceText: "第 \(pageIndex + 1) 页区域",
+                chapterLocator: String(format: "pdf:page:%06d", pageIndex + 1),
+                chapterTitle: "第 \(pageIndex + 1) 页",
+                sentenceIndex: "pdf-area-\(signature.prefix(16))",
+                rangeLocator: locator,
+                signature: signature,
+                mode: "pdf_area"
+            )
+        )
+    }
+
+    private func showActions(_ target: PDFAnnotationTarget) {
+        pendingTarget = target
+        let isArea = target.mode == "pdf_area"
+        copyButton.isHidden = isArea
+        readButton.isHidden = isArea
+        copyButton.isEnabled = !isArea
+        readButton.isEnabled = !isArea
+        highlightButton.title = highlightIDsBySignature[target.signature]?.isEmpty == false ? "取消标红" : "标红"
+        actionBar.isHidden = false
+    }
+
+    private func showExistingActions(annotationIDs: [String]) {
+        var relatedIDs = Set(annotationIDs)
+        for annotationID in annotationIDs {
+            guard let annotation = annotationsByID[annotationID] else { continue }
+            let locator = annotation["range_locator"] as? [String: Any] ?? [:]
+            let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+            let signature = metadata["pdf_locator_signature"] as? String ?? Self.signature(for: locator)
+            relatedIDs.formUnion(annotationIDsBySignature[signature] ?? [])
+        }
+        let uniqueIDs = relatedIDs.sorted()
+        let annotations = uniqueIDs.compactMap { annotationsByID[$0] }
+        guard !annotations.isEmpty else {
+            onStatus?("正在刷新 PDF 批注...")
+            return
+        }
+        let audioNotes = uniqueIDs.flatMap { audioNotesByAnnotationID[$0] ?? [] }
+        dismissActions()
+        onManageAnnotations?(PDFAnnotationInteractionContext(annotations: annotations, audioNotes: audioNotes))
+    }
+
+    func renderPendingAnnotation(_ target: PDFAnnotationTarget, kind: String) {
+        guard let document = pdfView.document else { return }
+        let pendingID = pendingAnnotationID(target, kind: kind)
+        _ = ClickPDFAnnotationProjection.addPendingOverlay(
+            annotationID: pendingID,
+            kind: kind,
+            locator: target.rangeLocator,
+            sourceText: target.sourceText,
+            onto: document
+        )
+        refreshAnnotationRendering(document)
+    }
+
+    func promotePendingAnnotation(
+        _ target: PDFAnnotationTarget,
+        kind: String,
+        annotationID: String,
+        noteText: String = "",
+        audioNoteID: String? = nil
+    ) {
+        guard let document = pdfView.document else { return }
+        let pendingID = pendingAnnotationID(target, kind: kind)
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            for overlay in page.annotations {
+                guard let identity = ClickPDFAnnotationProjection.overlayIdentity(from: overlay),
+                      identity.annotationID == pendingID
+                else { continue }
+                if kind == "red_highlight", identity.kind == .pendingRed {
+                    overlay.userName = ClickPDFAnnotationProjection.overlayName(kind: .red, annotationID: annotationID)
+                    overlay.contents = target.sourceText
+                    overlay.color = NSColor.systemRed.withAlphaComponent(target.mode == "pdf_area" ? 0.72 : 0.48)
+                    if target.mode == "pdf_area" {
+                        let border = overlay.border ?? PDFBorder()
+                        border.lineWidth = 2
+                        overlay.border = border
+                    }
+                } else if kind == "note", identity.kind == .pendingNote {
+                    overlay.userName = ClickPDFAnnotationProjection.overlayName(kind: .note, annotationID: annotationID)
+                    overlay.contents = noteText.isEmpty ? target.sourceText : noteText
+                    overlay.color = audioNoteID == nil ? .systemBlue : .systemOrange
+                }
+            }
+        }
+        var metadata: [String: Any] = [
+            "source": "ClickPDFKit",
+            "mode": target.mode,
+            "pdf_locator_signature": target.signature,
+            "source_pdf_modified": false,
+            "sentenceIndex": target.sentenceIndex,
+        ]
+        if let audioNoteID { metadata["audio_note_id"] = audioNoteID }
+        annotationsByID[annotationID] = [
+            "id": annotationID,
+            "kind": kind,
+            "source_text": target.sourceText,
+            "note_text": noteText,
+            "chapter_title": target.chapterTitle,
+            "chapter_locator": target.chapterLocator,
+            "range_locator": target.rangeLocator,
+            "metadata": metadata,
+        ]
+        if !annotationIDsBySignature[target.signature, default: []].contains(annotationID) {
+            annotationIDsBySignature[target.signature, default: []].append(annotationID)
+        }
+        if kind == "red_highlight",
+           !highlightIDsBySignature[target.signature, default: []].contains(annotationID) {
+            highlightIDsBySignature[target.signature, default: []].append(annotationID)
+        }
+        if let audioNoteID {
+            audioNotesByAnnotationID[annotationID] = [[
+                "id": audioNoteID,
+                "annotation_id": annotationID,
+                "status": "pending",
+            ]]
+        }
+        refreshAnnotationRendering(document)
+    }
+
+    func updateAudioNoteStatus(_ audioNote: [String: Any]) {
+        guard let document = pdfView.document,
+              let annotationID = audioNote["annotation_id"] as? String,
+              !annotationID.isEmpty,
+              let audioNoteID = audioNote["id"] as? String
+        else { return }
+        var notes = audioNotesByAnnotationID[annotationID] ?? []
+        if let index = notes.firstIndex(where: { $0["id"] as? String == audioNoteID }) {
+            notes[index] = audioNote
+        } else {
+            notes.append(audioNote)
+        }
+        audioNotesByAnnotationID[annotationID] = notes
+        let statuses = Set(notes.compactMap { $0["status"] as? String })
+        let color: NSColor = statuses.contains("failed")
+            ? .systemRed
+            : statuses.contains("pending")
+                ? .systemOrange
+                : statuses.contains("transcribed") ? .systemPurple : .systemBlue
+        let noteText = (annotationsByID[annotationID]?["note_text"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let transcript = notes.compactMap { $0["transcript"] as? String }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            for overlay in page.annotations {
+                guard let identity = ClickPDFAnnotationProjection.overlayIdentity(from: overlay),
+                      identity.kind == .note,
+                      identity.annotationID == annotationID
+                else { continue }
+                overlay.color = color
+                overlay.contents = [noteText, transcript].filter { !$0.isEmpty }.joined(separator: "\n")
+            }
+        }
+        refreshAnnotationRendering(document)
+    }
+
+    func discardPendingAnnotation(_ target: PDFAnnotationTarget, kind: String) {
+        guard let document = pdfView.document else { return }
+        let pendingID = pendingAnnotationID(target, kind: kind)
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index) else { continue }
+            let matches = page.annotations.filter {
+                ClickPDFAnnotationProjection.overlayIdentity(from: $0)?.annotationID == pendingID
+            }
+            for overlay in matches {
+                overlay.shouldDisplay = false
+                overlay.shouldPrint = false
+                overlay.color = .clear
+                overlay.contents = ""
+                overlay.bounds = .zero
+                page.removeAnnotation(overlay)
+            }
+        }
+        refreshAnnotationRendering(document)
+    }
+
+    private func pendingAnnotationID(_ target: PDFAnnotationTarget, kind: String) -> String {
+        "pending-\(kind)-\(target.signature)"
+    }
+
+    private func completeAreaInteractionIfNeeded(_ target: PDFAnnotationTarget) {
+        if target.mode == "pdf_area" {
+            setAreaSelectionMode(false)
+        }
+    }
+
+    private func dismissActions(clearSelection: Bool = true) {
+        pendingTarget = nil
+        actionBar.isHidden = true
+        if clearSelection { pdfView.clearSelection() }
+    }
+
+    @objc private func selectionChanged(_ notification: Notification) {
+        guard !pdfView.areaSelectionMode,
+              let selection = pdfView.currentSelection,
+              let target = target(from: selection)
+        else {
+            if !pdfView.areaSelectionMode { dismissActions(clearSelection: false) }
+            return
+        }
+        showActions(target)
+    }
+
+    @objc private func pageChanged(_ notification: Notification) {
+        dismissActions()
+        publishPosition()
+    }
+
+    @objc private func scaleChanged(_ notification: Notification) {
+        publishPosition()
+    }
+
+    private func publishPosition() {
+        guard !suppressPositionEvents, pageCount > 0 else { return }
+        let index = currentPageIndex
+        onStatus?("PDF · 第 \(index + 1) / \(pageCount) 页 · \(pageMode.title)")
+        onPositionChanged?(positionLocator())
+    }
+
+    @objc private func copySelection(_ sender: Any?) {
+        guard let target = pendingTarget, target.mode != "pdf_area" else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(target.sourceText, forType: .string)
+        onStatus?("已复制选中文字")
+        dismissActions()
+    }
+
+    @objc private func toggleHighlight(_ sender: Any?) {
+        guard let target = pendingTarget else { return }
+        dismissActions()
+        completeAreaInteractionIfNeeded(target)
+        onToggleHighlight?(target)
+    }
+
+    @objc private func addNote(_ sender: Any?) {
+        guard let target = pendingTarget else { return }
+        dismissActions()
+        completeAreaInteractionIfNeeded(target)
+        onNote?(target)
+    }
+
+    @objc private func readSelection(_ sender: Any?) {
+        guard let target = pendingTarget, target.mode != "pdf_area" else { return }
+        onRead?(target.sourceText)
+        dismissActions()
+    }
+
+    static func signature(for locator: [String: Any]) -> String {
+        ClickPDFAnnotationProjection.signature(for: locator)
+    }
+
+    func showContents(from sender: NSButton, target: AnyObject, action: Selector) {
+        let menu = NSMenu(title: "PDF 目录")
+        menu.autoenablesItems = false
+        if let root = pdfView.document?.outlineRoot, root.numberOfChildren > 0 {
+            appendOutlineChildren(root, level: 0, to: menu, target: target, action: action)
+        } else {
+            let pageCount = pdfView.document?.pageCount ?? 0
+            for index in 0..<pageCount {
+                let item = NSMenuItem(title: "第 \(index + 1) 页", action: action, keyEquivalent: "")
+                item.target = target
+                item.tag = index
+                item.state = index == currentPageIndex ? .on : .off
+                menu.addItem(item)
+            }
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
+    private func appendOutlineChildren(_ outline: PDFOutline, level: Int, to menu: NSMenu, target: AnyObject, action: Selector) {
+        for childIndex in 0..<outline.numberOfChildren {
+            guard let child = outline.child(at: childIndex) else { continue }
+            if let page = child.destination?.page, let document = pdfView.document {
+                let pageIndex = document.index(for: page)
+                let prefix = String(repeating: "　", count: min(level, 5))
+                let item = NSMenuItem(title: prefix + (child.label ?? "第 \(pageIndex + 1) 页"), action: action, keyEquivalent: "")
+                item.target = target
+                item.tag = pageIndex
+                item.state = pageIndex == currentPageIndex ? .on : .off
+                menu.addItem(item)
+            }
+            if child.numberOfChildren > 0 {
+                appendOutlineChildren(child, level: level + 1, to: menu, target: target, action: action)
+            }
+        }
+    }
+
+    func search(_ query: String) -> Int {
+        guard let document = pdfView.document else { return 0 }
+        let selections = document.findString(query, withOptions: [.caseInsensitive, .diacriticInsensitive])
+        pdfView.highlightedSelections = selections
+        if let first = selections.first {
+            pdfView.go(to: first)
+        }
+        return selections.count
+    }
+}
+
+private enum MacComicPageMode: String {
+    case automatic
+    case single
+    case double
+
+    var title: String {
+        switch self {
+        case .automatic: return "自动"
+        case .single: return "单页"
+        case .double: return "双页"
+        }
+    }
+}
+
+private final class MacComicSpreadController: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    let webView: WKWebView
+    var onPageChanged: ((Int, Int, Bool) -> Void)?
+    var onPageReady: ((Int) -> Void)?
+    var onChromeToggle: (() -> Void)?
+
+    private static let maximumComicPageVisibleText = 80
+
+    private var rootURL: URL?
+    private var imageURLs: [URL?] = []
+    private var pageProgression = "ltr"
+    private var viewportWidth: CGFloat = 1180
+    private(set) var currentPageIndex = 0
+    private(set) var pageMode: MacComicPageMode = .automatic
+
+    override init() {
+        let configuration = WKWebViewConfiguration()
+        let userContent = WKUserContentController()
+        configuration.userContentController = userContent
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        super.init()
+        userContent.add(self, name: "comicReader")
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.wantsLayer = true
+        webView.layer?.backgroundColor = NSColor.black.cgColor
+    }
+
+    deinit {
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: "comicReader")
+    }
+
+    var pageCount: Int {
+        imageURLs.count
+    }
+
+    var usesDoublePage: Bool {
+        switch pageMode {
+        case .automatic:
+            return viewportWidth >= 900
+        case .single:
+            return false
+        case .double:
+            return true
+        }
+    }
+
+    func configure(chapters: [URL], rootURL: URL, pageMode: MacComicPageMode, viewportWidth: CGFloat) -> Bool {
+        let candidates = chapters.map(Self.comicPageImageURL(in:))
+        let imageOnlyCount = candidates.compactMap { $0 }.count
+        let imageOnlyRatio = chapters.isEmpty ? 0 : Double(imageOnlyCount) / Double(chapters.count)
+        guard imageOnlyCount >= min(2, chapters.count), imageOnlyRatio >= 0.80 else {
+            reset()
+            return false
+        }
+
+        self.rootURL = rootURL
+        imageURLs = candidates
+        pageProgression = Self.pageProgression(in: rootURL)
+        self.pageMode = pageMode
+        self.viewportWidth = max(320, viewportWidth)
+        currentPageIndex = 0
+        return true
+    }
+
+    func reset() {
+        rootURL = nil
+        imageURLs = []
+        pageProgression = "ltr"
+        currentPageIndex = 0
+        webView.loadHTMLString("<html><body style='margin:0;background:#000'></body></html>", baseURL: nil)
+    }
+
+    func setPageMode(_ mode: MacComicPageMode) {
+        guard pageMode != mode else { return }
+        pageMode = mode
+        currentPageIndex = alignedPageIndex(currentPageIndex)
+        render()
+    }
+
+    func updateViewport(width: CGFloat) {
+        let wasDouble = usesDoublePage
+        viewportWidth = max(320, width)
+        guard wasDouble != usesDoublePage else { return }
+        currentPageIndex = alignedPageIndex(currentPageIndex)
+        render()
+    }
+
+    func display(chapterIndex: Int) {
+        guard !imageURLs.isEmpty else { return }
+        currentPageIndex = alignedPageIndex(max(0, min(chapterIndex, imageURLs.count - 1)))
+        render()
+    }
+
+    func turn(direction: Int) {
+        guard !imageURLs.isEmpty, direction != 0 else { return }
+        let step = usesDoublePage ? 2 : 1
+        let target = currentPageIndex + (direction > 0 ? step : -step)
+        let bounded = max(0, min(target, imageURLs.count - 1))
+        let aligned = alignedPageIndex(bounded)
+        guard aligned != currentPageIndex else { return }
+        currentPageIndex = aligned
+        render()
+    }
+
+    private func alignedPageIndex(_ index: Int) -> Int {
+        guard usesDoublePage else { return max(0, min(index, max(0, imageURLs.count - 1))) }
+        let bounded = max(0, min(index, max(0, imageURLs.count - 1)))
+        return (bounded / 2) * 2
+    }
+
+    private func render() {
+        guard let rootURL, !imageURLs.isEmpty else { return }
+        let firstIndex = alignedPageIndex(currentPageIndex)
+        currentPageIndex = firstIndex
+        var indexes = [firstIndex]
+        if usesDoublePage, firstIndex + 1 < imageURLs.count {
+            indexes.append(firstIndex + 1)
+        }
+        if pageProgression == "rtl", indexes.count == 2 {
+            indexes.reverse()
+        }
+
+        let pages = indexes.map { index -> String in
+            guard let imageURL = imageURLs[index] else {
+                return "<div class=\"comic-page missing\"><span>第 \(index + 1) 页无法提取图像</span></div>"
+            }
+            let source = Self.htmlAttribute(imageURL.absoluteString)
+            return "<div class=\"comic-page\"><img src=\"\(source)\" alt=\"第 \(index + 1) 页\"></div>"
+        }.joined()
+        let layoutClass = indexes.count == 2 ? "double" : "single"
+        let html = """
+        <!doctype html>
+        <html lang="zh-CN">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+          <style>
+            :root { color-scheme: dark; }
+            * { box-sizing: border-box; }
+            html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #000; }
+            body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; color: #aaa; }
+            #spread { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 4px 6px; }
+            #spread.double .comic-page { width: calc((100vw - 20px) / 2); }
+            #spread.single .comic-page { width: 100vw; }
+            .comic-page { min-width: 0; height: calc(100vh - 8px); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+            .comic-page img { display: block; width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+            .comic-page.missing { border: 1px solid #333; }
+          </style>
+        </head>
+        <body>
+          <main id="spread" class="\(layoutClass)">\(pages)</main>
+          <script>
+            (function () {
+              var accumulation = 0;
+              var gestureDirection = 0;
+              var consumed = false;
+              var lastEventAt = 0;
+              var resetTimer = 0;
+              function post(type, direction) {
+                window.webkit.messageHandlers.comicReader.postMessage({ type: type, direction: direction || 0 });
+              }
+              function resetGesture() {
+                accumulation = 0;
+                gestureDirection = 0;
+                consumed = false;
+              }
+              document.addEventListener('wheel', function (event) {
+                var now = Date.now();
+                if (now - lastEventAt > 260) { resetGesture(); }
+                lastEventAt = now;
+                var dx = Number(event.deltaX || 0);
+                var dy = Number(event.deltaY || 0);
+                if (Math.abs(dx) < Math.abs(dy) * 1.15) { return; }
+                event.preventDefault();
+                event.stopPropagation();
+                var direction = dx > 0 ? 1 : -1;
+                if (gestureDirection && gestureDirection !== direction) { resetGesture(); }
+                gestureDirection = direction;
+                accumulation += Math.abs(dx);
+                window.clearTimeout(resetTimer);
+                resetTimer = window.setTimeout(resetGesture, 280);
+                if (!consumed && accumulation >= 86) {
+                  consumed = true;
+                  post('turn', direction);
+                }
+              }, { capture: true, passive: false });
+              document.addEventListener('keydown', function (event) {
+                if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+                  event.preventDefault(); post('turn', 1);
+                } else if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+                  event.preventDefault(); post('turn', -1);
+                }
+              }, true);
+              document.addEventListener('click', function (event) {
+                var ratio = event.clientX / Math.max(1, window.innerWidth);
+                if (ratio < 0.28) { post('turn', -1); }
+                else if (ratio > 0.72) { post('turn', 1); }
+                else { post('chrome', 0); }
+              }, true);
+              window.focus();
+            })();
+          </script>
+        </body>
+        </html>
+        """
+        let spreadURL = rootURL.appendingPathComponent(".click-comic-spread.html")
+        do {
+            try html.write(to: spreadURL, atomically: true, encoding: .utf8)
+            webView.loadFileURL(spreadURL, allowingReadAccessTo: rootURL)
+        } catch {
+            let message = Self.htmlAttribute(error.localizedDescription)
+            webView.loadHTMLString(
+                "<html><body style='margin:0;background:#000;color:#aaa;font-family:sans-serif'>漫画页面生成失败：\(message)</body></html>",
+                baseURL: nil
+            )
+        }
+        onPageChanged?(firstIndex, imageURLs.count, indexes.count == 2)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let payload = message.body as? [String: Any],
+              let type = payload["type"] as? String
+        else {
+            return
+        }
+        switch type {
+        case "turn":
+            turn(direction: payload["direction"] as? Int ?? 0)
+        case "chrome":
+            onChromeToggle?()
+        default:
+            break
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView === self.webView else { return }
+        onPageReady?(currentPageIndex)
+    }
+
+    private static func comicPageImageURL(in chapterURL: URL) -> URL? {
+        guard let document = try? XMLDocument(contentsOf: chapterURL, options: [.nodePreserveAll]),
+              let body = (try? document.nodes(forXPath: "//*[local-name()='body']"))?.first as? XMLElement,
+              visibleTextCount(in: body) <= maximumComicPageVisibleText,
+              let image = (try? body.nodes(forXPath: ".//*[local-name()='img' or local-name()='image']"))?.first as? XMLElement,
+              !hasInlinePresentation(image)
+        else {
+            // Classification must fail closed: malformed or text-rich chapters stay in the
+            // normal reflow reader instead of turning a small inline glyph into a comic page.
+            return nil
+        }
+
+        let source = image.attribute(forName: "src")?.stringValue
+            ?? image.attribute(forName: "href")?.stringValue
+            ?? image.attribute(forName: "xlink:href")?.stringValue
+        guard let source, !source.isEmpty else { return nil }
+        return resolvedResourceURL(source, relativeTo: chapterURL)
+    }
+
+    private static func visibleTextCount(in body: XMLElement) -> Int {
+        let nodes = (try? body.nodes(
+            forXPath: ".//text()[not(ancestor::*[local-name()='script' or local-name()='style'])]"
+        )) ?? []
+        let visibleText = nodes.compactMap(\.stringValue).joined(separator: " ")
+        return visibleText.unicodeScalars.reduce(into: 0) { count, scalar in
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                count += 1
+            }
+        }
+    }
+
+    private static func hasInlinePresentation(_ image: XMLElement) -> Bool {
+        let classNames = image.attribute(forName: "class")?.stringValue?
+            .lowercased()
+            .split(whereSeparator: { $0.isWhitespace }) ?? []
+        return classNames.contains("inline")
+    }
+
+    private static func resolvedResourceURL(_ raw: String, relativeTo chapterURL: URL) -> URL? {
+        let decoded = raw.removingPercentEncoding ?? raw
+        guard !decoded.isEmpty, !decoded.lowercased().hasPrefix("data:") else { return nil }
+        if let absolute = URL(string: decoded), absolute.isFileURL {
+            return absolute
+        }
+        let candidate = chapterURL.deletingLastPathComponent().appendingPathComponent(decoded).standardizedFileURL
+        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+    }
+
+    private static func pageProgression(in rootURL: URL) -> String {
+        guard let enumerator = FileManager.default.enumerator(at: rootURL, includingPropertiesForKeys: nil) else {
+            return "ltr"
+        }
+        for case let url as URL in enumerator where url.pathExtension.lowercased() == "opf" {
+            guard let data = try? Data(contentsOf: url),
+                  let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1)
+            else {
+                continue
+            }
+            if text.range(of: #"page-progression-direction\s*=\s*["']rtl["']"#, options: [.regularExpression, .caseInsensitive]) != nil {
+                return "rtl"
+            }
+            return "ltr"
+        }
+        return "ltr"
+    }
+
+    private static func htmlAttribute(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }
 
@@ -136,7 +1999,16 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
     private var audioDurationSeconds: Double?
     private var appleSpeechTask: SFSpeechRecognitionTask?
     private var isTranscribing = false
+    private var silenceTimer: Timer?
+    private var recordingStartedAt: Date?
+    private var lastSpeechAt: Date?
+    private var heardSpeech = false
     private(set) var latestAudioNoteID: String?
+    var onTranscriptionFinished: ((String?) -> Void)?
+    var isTranscriptionInProgress: Bool { isTranscribing }
+    var isUserAudioWorkActive: Bool {
+        recorder?.isRecording == true || isTranscribing
+    }
 
     private struct FunASRPaths {
         let python: URL
@@ -170,11 +2042,40 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
         }
     }
 
+    func beginVoiceFirstRecording() {
+        guard recorder?.isRecording != true, !isTranscribing else {
+            return
+        }
+        requestMicrophoneAndStart()
+    }
+
     func cancel() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
         recorder?.stop()
         recorder = nil
         appleSpeechTask?.cancel()
         appleSpeechTask = nil
+        if isTranscribing, let audioNoteID = latestAudioNoteID {
+            DispatchQueue.global(qos: .utility).async { [readerAPI] in
+                _ = readerAPI.updateAudioNote(
+                    audioNoteID: audioNoteID,
+                    annotationID: nil,
+                    provider: nil,
+                    transcript: nil,
+                    status: "failed",
+                    errorMessage: "用户取消了备注编辑"
+                )
+            }
+        }
+        isTranscribing = false
+    }
+
+    func prepareForSave() -> String? {
+        if recorder?.isRecording == true {
+            stopRecordingAndTranscribe()
+        }
+        return latestAudioNoteID
     }
 
     @objc func providerChanged(_ sender: NSPopUpButton) {
@@ -223,6 +2124,7 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
             let recorder = try AVAudioRecorder(url: url, settings: settings)
             recorder.delegate = self
             recorder.prepareToRecord()
+            recorder.isMeteringEnabled = true
             guard recorder.record() else {
                 updateStatus("录音启动失败，请检查麦克风输入设备。")
                 return
@@ -231,10 +2133,45 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
             self.audioURL = url
             self.audioDurationSeconds = nil
             self.recorder = recorder
+            self.recordingStartedAt = Date()
+            self.lastSpeechAt = nil
+            self.heardSpeech = false
+            self.silenceTimer?.invalidate()
+            self.silenceTimer = Timer.scheduledTimer(
+                withTimeInterval: 0.18,
+                repeats: true
+            ) { [weak self] _ in
+                self?.observeSpeechSilence()
+            }
             recordButton?.title = "停止并转写"
-            updateStatus("正在录音。说完后点“停止并转写”。")
+            updateStatus("正在录音。说完停顿后会自动转写并保存。")
         } catch {
             updateStatus("录音启动失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func observeSpeechSilence() {
+        guard let recorder, recorder.isRecording else {
+            silenceTimer?.invalidate()
+            silenceTimer = nil
+            return
+        }
+        recorder.updateMeters()
+        let now = Date()
+        let elapsed = now.timeIntervalSince(recordingStartedAt ?? now)
+        if recorder.averagePower(forChannel: 0) > -38 {
+            heardSpeech = true
+            lastSpeechAt = now
+            return
+        }
+        if heardSpeech,
+           elapsed >= 0.8,
+           now.timeIntervalSince(lastSpeechAt ?? now) >= 1.25 {
+            stopRecordingAndTranscribe()
+            return
+        }
+        if !heardSpeech, elapsed >= 12 {
+            stopRecordingAndTranscribe()
         }
     }
 
@@ -246,6 +2183,8 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
         }
 
         let duration = max(0, recorder.currentTime)
+        silenceTimer?.invalidate()
+        silenceTimer = nil
         recorder.stop()
         self.recorder = nil
         self.audioDurationSeconds = duration
@@ -256,6 +2195,7 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
         SpeechTranscriptionProvider.save(provider)
         updateStatus(provider == .appleSpeech ? "苹果转写中..." : "FunASR 转写中...")
         let audioNoteID = createPendingAudioNote(audioURL: audioURL, durationSeconds: duration, provider: provider.rawValue)
+        latestAudioNoteID = audioNoteID
 
         if provider == .appleSpeech {
             transcribeWithAppleSpeech(audioURL: audioURL, audioNoteID: audioNoteID)
@@ -550,6 +2490,7 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
         recordButton?.isEnabled = true
         recordButton?.title = "开始录音"
         updateStatus("已插入并记录语音笔记（\(displayProvider)）。")
+        onTranscriptionFinished?(audioNoteID)
     }
 
     private func failTranscription(_ message: String, audioNoteID: String? = nil) {
@@ -570,6 +2511,7 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
         recordButton?.isEnabled = true
         recordButton?.title = "开始录音"
         updateStatus(message)
+        onTranscriptionFinished?(audioNoteID)
     }
 
     private func updateStatus(_ text: String) {
@@ -578,20 +2520,45 @@ final class NoteSpeechController: NSObject, AVAudioRecorderDelegate {
 }
 
 final class ReaderAPIClient {
-    private let baseURL = URL(string: "http://127.0.0.1:18180")!
+    static let runtimeContract = "click.reader_runtime.v1"
+    static let minimumAPIRevision = 3
+
+    static func configuredBaseURL() -> URL {
+        let raw = ProcessInfo.processInfo.environment["SENTENCE_READER_API_BASE_URL"] ?? "http://127.0.0.1:18180"
+        return URL(string: raw) ?? URL(string: "http://127.0.0.1:18180")!
+    }
+
+    private let baseURL = ReaderAPIClient.configuredBaseURL()
     private let timeout: TimeInterval = 2.0
 
-    func health() -> Bool {
+    func health(requiredCapabilities: [String] = []) -> Bool {
         guard let json = request(method: "GET", path: "/health", body: nil) as? [String: Any] else {
             return false
         }
-        return json["ok"] as? Bool == true
+        guard json["ok"] as? Bool == true,
+              let runtime = json["runtime"] as? [String: Any],
+              runtime["contract"] as? String == Self.runtimeContract,
+              let revision = runtime["api_revision"] as? Int,
+              revision >= Self.minimumAPIRevision
+        else {
+            return false
+        }
+        let capabilities = Set(runtime["capabilities"] as? [String] ?? [])
+        return requiredCapabilities.allSatisfy { capabilities.contains($0) }
     }
 
-    func createBook(title: String, author: String?, bookHash: String, filePath: String?) -> String? {
+    func createBook(
+        title: String,
+        author: String?,
+        bookHash: String,
+        filePath: String?,
+        sourceKind: String = "epub",
+        fileHash: String? = nil,
+        byteSize: Int? = nil
+    ) -> String? {
         var body: [String: Any] = [
             "title": title,
-            "source_kind": "epub",
+            "source_kind": sourceKind,
             "book_hash": bookHash,
         ]
         if let author {
@@ -599,6 +2566,12 @@ final class ReaderAPIClient {
         }
         if let filePath {
             body["file_path"] = filePath
+        }
+        if let fileHash {
+            body["file_hash"] = fileHash
+        }
+        if let byteSize {
+            body["byte_size"] = byteSize
         }
         return (request(method: "POST", path: "/books", body: body) as? [String: Any])?["id"] as? String
     }
@@ -608,20 +2581,59 @@ final class ReaderAPIClient {
     }
 
     func libraryDashboard() -> [String: Any]? {
-        request(method: "GET", path: "/api/library/dashboard", body: nil) as? [String: Any]
+        request(
+            method: "GET",
+            path: "/api/library/dashboard",
+            body: nil,
+            timeoutInterval: 12
+        ) as? [String: Any]
+    }
+
+    func importBook(url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        let endpoint = baseURL.appendingPathComponent("api/library/import")
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = 150
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "filename": url.lastPathComponent,
+            "content_base64": data.base64EncodedString(),
+        ]
+        urlRequest.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: [String: Any]?
+        URLSession.shared.dataTask(with: urlRequest) { payload, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let payload
+            else { return }
+            result = try? JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + 151)
+        return result
     }
 
     func getPosition(bookID: String) -> [String: Any]? {
         request(method: "GET", path: "/books/\(bookID)/position", body: nil) as? [String: Any]
     }
 
-    func savePosition(bookID: String, chapterLocator: String, chapterIndex: Int, pageIndex: Int, totalPages: Int, pageRatio: Double) {
+    func savePosition(
+        bookID: String,
+        chapterLocator: String,
+        chapterIndex: Int,
+        pageIndex: Int,
+        totalPages: Int,
+        pageRatio: Double,
+        locator: [String: Any]? = nil
+    ) {
         let body: [String: Any] = [
             "chapter_locator": chapterLocator,
             "page_index": pageIndex,
             "total_pages": totalPages,
             "page_ratio": pageRatio,
-            "locator": [
+            "locator": locator ?? [
                 "chapterIndex": chapterIndex,
                 "chapterLocator": chapterLocator,
                 "pageIndex": pageIndex,
@@ -633,6 +2645,14 @@ final class ReaderAPIClient {
 
     func listAnnotations(bookID: String) -> [[String: Any]] {
         request(method: "GET", path: "/books/\(bookID)/annotations", body: nil) as? [[String: Any]] ?? []
+    }
+
+    func listAudioNotes(bookID: String) -> [[String: Any]] {
+        request(method: "GET", path: "/books/\(bookID)/audio-notes", body: nil) as? [[String: Any]] ?? []
+    }
+
+    func getAudioNote(audioNoteID: String) -> [String: Any]? {
+        request(method: "GET", path: "/audio-notes/\(audioNoteID)", body: nil) as? [String: Any]
     }
 
     func exportBook(bookID: String, outputDir: String?) -> [String: Any]? {
@@ -799,12 +2819,15 @@ final class ReaderAPIClient {
         return request(method: "PATCH", path: "/annotations/\(annotationID)", body: body) != nil
     }
 
-    func lookupWord(bookID: String, word: String, sentenceIndex: String?) -> [String: Any]? {
+    func lookupWord(bookID: String, word: String, sentenceIndex: String?, sentence: String? = nil) -> [String: Any]? {
         var components = URLComponents()
         components.path = "/books/\(bookID)/lookup"
         var queryItems = [URLQueryItem(name: "word", value: word)]
         if let sentenceIndex, !sentenceIndex.isEmpty {
             queryItems.append(URLQueryItem(name: "sentence_id", value: sentenceIndex))
+        }
+        if let sentence, !sentence.isEmpty {
+            queryItems.append(URLQueryItem(name: "sentence", value: sentence))
         }
         components.queryItems = queryItems
         return request(method: "GET", path: components.string ?? "/books/\(bookID)/lookup", body: nil) as? [String: Any]
@@ -957,7 +2980,13 @@ final class ReaderAPIClient {
         _ = request(method: "POST", path: "/books/\(bookID)/lookup-events", body: body)
     }
 
-    private func request(method: String, path: String, body: [String: Any]?) -> Any? {
+    private func request(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        timeoutInterval: TimeInterval? = nil
+    ) -> Any? {
+        let effectiveTimeout = timeoutInterval ?? timeout
         let url: URL
         if path.contains("?"), let fullURL = URL(string: baseURL.absoluteString + path) {
             url = fullURL
@@ -966,7 +2995,7 @@ final class ReaderAPIClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = timeout
+        request.timeoutInterval = effectiveTimeout
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -986,7 +3015,7 @@ final class ReaderAPIClient {
             output = try? JSONSerialization.jsonObject(with: data)
         }
         task.resume()
-        _ = semaphore.wait(timeout: .now() + timeout + 0.5)
+        _ = semaphore.wait(timeout: .now() + effectiveTimeout + 0.5)
         return output
     }
 }
@@ -1365,21 +3394,3380 @@ private final class CognitiveDashboardWindowController: NSWindowController, NSTa
     }
 }
 
-private final class RuntimeEnvironmentWindowController: NSWindowController {
+private enum ClickTTSGate0Contract {
+    static let disclosureRevision = "edge-online-2026-07-v1"
+    static let disclosureDefaultsKey = "Click.EdgeTTS.Disclosure.edge-online-2026-07-v1"
+    static let expectedRuntimeID = "click-edge-tts-cpython311-macos-arm64-v1"
+    static let expectedPythonVersion = "3.11.15"
+    static let expectedEdgeTTSVersion = "7.2.8"
+    static let helperRelativePath = "helper/click_tts_helper.py"
+    static let pythonRelativePath = "python/bin/python3.11"
+    static let cacheNamespace = "reading-v2/probe-v1"
+    static let clientVersion = "click-gate0-v1"
+    static let defaultFixtureID = "gate0-probe-v1"
+
+    static let defaultCacheContext: [String: String] = [
+        "book_id": "gate0-probe",
+        "fixture_id": defaultFixtureID,
+        "chapter_locator": "probe-1",
+        "locator_range": "0:0",
+        "client_version": clientVersion,
+        "voice_cache_epoch": "1",
+        "prosody_revision": "1",
+        "normalizer_revision": "1",
+        "engine_revision": "1",
+    ]
+    static let cacheContext = defaultCacheContext
+
+    static func cacheContext(
+        fixtureID: String,
+        chapterLocator: String,
+        locatorRange: String
+    ) -> [String: String] {
+        var context = defaultCacheContext
+        context["fixture_id"] = fixtureID
+        context["chapter_locator"] = chapterLocator
+        context["locator_range"] = locatorRange
+        return context
+    }
+
+    static let synthesis: [String: String] = [
+        "rate": "+0%",
+        "volume": "+0%",
+        "pitch": "+0Hz",
+        "boundary": "SentenceBoundary",
+    ]
+
+    static var cacheRoot: URL {
+        let base = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base
+            .appendingPathComponent("Click", isDirectory: true)
+            .appendingPathComponent("ReaderTTS", isDirectory: true)
+            .appendingPathComponent(cacheNamespace, isDirectory: true)
+    }
+
+    static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func sha256File(
+        _ url: URL,
+        checkpoint: (() throws -> Void)? = nil
+    ) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            try checkpoint?()
+            let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
+            if data.isEmpty {
+                break
+            }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func canonicalJSON(_ object: [String: String]) throws -> Data {
+        try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
+    static func cacheIdentity(
+        text: String,
+        voice: String,
+        cacheContext: [String: String] = defaultCacheContext,
+        synthesisSettings: [String: String] = synthesis
+    ) throws -> (key: String, textHash: String) {
+        let textHash = sha256(Data(text.utf8))
+        let generationParamsHash = sha256(
+            try canonicalJSON(synthesisSettings)
+        )
+        var material = cacheContext
+        material["normalized_text_hash"] = textHash
+        material["backend_id"] = "edge_online"
+        material["voice_id"] = voice
+        material["edge_tts_client_version"] = expectedEdgeTTSVersion
+        material["generation_params_hash"] = generationParamsHash
+        return (sha256(try canonicalJSON(material)), textHash)
+    }
+
+    static func cacheURLs(for key: String) -> (audio: URL, metadata: URL, manifest: URL) {
+        let shard = cacheRoot.appendingPathComponent(String(key.prefix(2)), isDirectory: true)
+        return (
+            shard.appendingPathComponent("\(key).mp3"),
+            shard.appendingPathComponent("\(key).boundaries.json"),
+            shard.appendingPathComponent("\(key).manifest.json")
+        )
+    }
+
+    static func validateGoldenVector() -> Bool {
+        guard let identity = try? cacheIdentity(
+            text: "Click Gate 0 中英混排 test.",
+            voice: "zh-CN-YunjianNeural"
+        ) else {
+            return false
+        }
+        return identity.textHash == "becee1b4696910aeff85a1fee3b6b0036f1d5388bd97d099ed3ce37784e341fd"
+            && identity.key == "dc04ad55f650b91ac50dee394049a6a23fece10f23bc708f574c90fdf8731cd8"
+    }
+}
+
+private struct ClickTTSGate0CachedArtifact {
+    let cacheKey: String
+    let audioURL: URL
+    let metadataURL: URL
+    let manifestURL: URL
+    let source: String
+    let boundaryCount: Int
+    let generationMetrics: ClickTTSGate0GenerationMetrics
+}
+
+private enum ClickTTSGate0Cache {
+    private static func isDirectory(
+        _ url: URL,
+        privatePermissions: Bool
+    ) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ),
+        values.isDirectory == true,
+        values.isSymbolicLink != true
+        else {
+            return false
+        }
+        guard privatePermissions else {
+            return true
+        }
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let permissions = attributes[.posixPermissions] as? NSNumber
+        else {
+            return false
+        }
+        return permissions.intValue & 0o777 == 0o700
+    }
+
+    private static func privateCacheHierarchy(shard: URL) -> Bool {
+        let root = ClickTTSGate0Contract.cacheRoot.standardizedFileURL
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?.standardizedFileURL
+        guard let appSupport,
+              shard.standardizedFileURL.path.hasPrefix(root.path + "/"),
+              isDirectory(appSupport, privatePermissions: false)
+        else {
+            return false
+        }
+        let privateDirectories = [
+            appSupport.appendingPathComponent("Click", isDirectory: true),
+            appSupport.appendingPathComponent("Click/ReaderTTS", isDirectory: true),
+            appSupport.appendingPathComponent("Click/ReaderTTS/reading-v2", isDirectory: true),
+            root,
+            shard.standardizedFileURL,
+        ]
+        return privateDirectories.allSatisfy {
+            isDirectory($0, privatePermissions: true)
+        }
+    }
+
+    private static func isPrivateRegularFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ),
+        values.isRegularFile == true,
+        values.isSymbolicLink != true,
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+        let permissions = attributes[.posixPermissions] as? NSNumber
+        else {
+            return false
+        }
+        return permissions.intValue & 0o777 == 0o600
+    }
+
+    private static func looksLikeMP3(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: 4096)) ?? nil
+        guard let data, data.count >= 128 else {
+            return false
+        }
+        if data.starts(with: Data("ID3".utf8)) {
+            return true
+        }
+        let bytes = [UInt8](data)
+        guard bytes.count > 1 else {
+            return false
+        }
+        for index in 0..<(bytes.count - 1) {
+            if bytes[index] == 0xFF && (bytes[index + 1] & 0xE0) == 0xE0 {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func validBoundaries(_ value: Any) -> Int? {
+        guard let rows = value as? [[String: Any]], !rows.isEmpty else {
+            return nil
+        }
+        func strictInteger(_ value: Any?) -> Int? {
+            guard let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite,
+                  number.doubleValue.rounded(.towardZero) == number.doubleValue,
+                  number.doubleValue >= 0,
+                  number.doubleValue <= 9_000_000_000_000
+            else {
+                return nil
+            }
+            return number.intValue
+        }
+        var previousOffset = -1
+        for (ordinal, row) in rows.enumerated() {
+            guard row.count == 4,
+                  strictInteger(row["ordinal"]) == ordinal,
+                  let type = row["type"] as? String,
+                  ["SentenceBoundary", "WordBoundary"].contains(type),
+                  let offset = strictInteger(row["offset"]),
+                  let duration = strictInteger(row["duration"]),
+                  offset >= previousOffset,
+                  duration >= 0
+            else {
+                return nil
+            }
+            previousOffset = offset
+        }
+        return rows.count
+    }
+
+    static func load(
+        text: String,
+        voice: String,
+        cacheContext: [String: String] =
+            ClickTTSGate0Contract.defaultCacheContext,
+        synthesisSettings: [String: String] =
+            ClickTTSGate0Contract.synthesis
+    ) -> ClickTTSGate0CachedArtifact? {
+        guard ClickTTSGate0Contract.validateGoldenVector(),
+              let identity = try? ClickTTSGate0Contract.cacheIdentity(
+                text: text,
+                voice: voice,
+                cacheContext: cacheContext,
+                synthesisSettings: synthesisSettings
+              )
+        else {
+            return nil
+        }
+        let urls = ClickTTSGate0Contract.cacheURLs(for: identity.key)
+        let shard = urls.manifest.deletingLastPathComponent()
+        guard [urls.audio, urls.metadata, urls.manifest].allSatisfy(isPrivateRegularFile),
+              privateCacheHierarchy(shard: shard),
+              let manifestSize = try? urls.manifest.resourceValues(
+                forKeys: [.fileSizeKey]
+              ).fileSize,
+              manifestSize > 0,
+              manifestSize <= 128 * 1024,
+              let metadataSize = try? urls.metadata.resourceValues(
+                forKeys: [.fileSizeKey]
+              ).fileSize,
+              metadataSize > 0,
+              metadataSize <= 8 * 1024 * 1024,
+              let audioSize = try? urls.audio.resourceValues(
+                forKeys: [.fileSizeKey]
+              ).fileSize,
+              audioSize >= 128,
+              audioSize <= 256 * 1024 * 1024,
+              let manifestData = try? Data(
+                contentsOf: urls.manifest,
+                options: [.mappedIfSafe]
+              ),
+              let manifest = try? JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+              let metadataData = try? Data(
+                contentsOf: urls.metadata,
+                options: [.mappedIfSafe]
+              ),
+              let metadata = try? JSONSerialization.jsonObject(with: metadataData),
+              let boundaryCount = validBoundaries(metadata),
+              looksLikeMP3(urls.audio),
+              manifest["schema_version"] as? Int == 1,
+              manifest["cache_key"] as? String == identity.key,
+              manifest["backend_id"] as? String == "edge_online",
+              manifest["voice"] as? String == voice,
+              manifest["text_sha256"] as? String == identity.textHash,
+              manifest["fixture_id"] as? String == cacheContext["fixture_id"],
+              manifest["chapter_locator"] as? String == cacheContext["chapter_locator"],
+              manifest["locator_range"] as? String == cacheContext["locator_range"],
+              manifest["edge_tts_version"] as? String == ClickTTSGate0Contract.expectedEdgeTTSVersion,
+              manifest["audio_file"] as? String == urls.audio.lastPathComponent,
+              manifest["metadata_file"] as? String == urls.metadata.lastPathComponent,
+              (manifest["audio_bytes"] as? NSNumber)?.intValue == audioSize,
+              (manifest["boundary_count"] as? NSNumber)?.intValue == boundaryCount,
+              manifest["audio_sha256"] as? String == (try? ClickTTSGate0Contract.sha256File(urls.audio)),
+              manifest["metadata_sha256"] as? String == (try? ClickTTSGate0Contract.sha256File(urls.metadata))
+        else {
+            return nil
+        }
+        let generationMetrics = ClickTTSGate0GenerationMetrics(result: manifest)
+        guard let attemptCount = generationMetrics.attemptCount,
+              (1...3).contains(attemptCount),
+              let synthesisElapsedMS = generationMetrics.synthesisElapsedMS,
+              let audioDurationMS = generationMetrics.audioDurationMS,
+              audioDurationMS > 0,
+              let synthesisRTF = generationMetrics.synthesisRTF,
+              abs(synthesisRTF - (synthesisElapsedMS / audioDurationMS)) <= 0.000_001
+        else {
+            return nil
+        }
+        return ClickTTSGate0CachedArtifact(
+            cacheKey: identity.key,
+            audioURL: urls.audio,
+            metadataURL: urls.metadata,
+            manifestURL: urls.manifest,
+            source: "cache",
+            boundaryCount: boundaryCount,
+            generationMetrics: generationMetrics
+        )
+    }
+
+    @discardableResult
+    static func evict(_ artifact: ClickTTSGate0CachedArtifact) -> Bool {
+        let expected = ClickTTSGate0Contract.cacheURLs(for: artifact.cacheKey)
+        let expectedURLs = [expected.audio, expected.metadata, expected.manifest]
+        let artifactURLs = [
+            artifact.audioURL,
+            artifact.metadataURL,
+            artifact.manifestURL,
+        ]
+        guard zip(expectedURLs, artifactURLs).allSatisfy({
+            $0.0.standardizedFileURL == $0.1.standardizedFileURL
+        }),
+        privateCacheHierarchy(shard: expected.manifest.deletingLastPathComponent()),
+        artifactURLs.allSatisfy(isPrivateRegularFile)
+        else {
+            return false
+        }
+        var removedAll = true
+        for url in artifactURLs {
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                removedAll = false
+            }
+        }
+        return removedAll
+    }
+
+    static func cleanupPartials(ownedBy helperPID: Int32) {
+        let root = ClickTTSGate0Contract.cacheRoot
+        guard helperPID > 0,
+              isDirectory(root, privatePermissions: true),
+              let shards = try? FileManager.default.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+              )
+        else {
+            return
+        }
+        let pattern = "^[0-9a-f]{64}\\.(?:mp3|boundaries\\.json|manifest\\.json)"
+            + "\\.partial\\.\(helperPID)\\.[0-9a-f]{32}$"
+        for shard in shards {
+            guard shard.lastPathComponent.range(
+                of: "^[0-9a-f]{2}$",
+                options: .regularExpression
+            ) != nil,
+            privateCacheHierarchy(shard: shard),
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: shard,
+                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            )
+            else {
+                continue
+            }
+            for url in files {
+                guard url.lastPathComponent.range(
+                    of: pattern,
+                    options: .regularExpression
+                ) != nil,
+                let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                ),
+                values.isRegularFile == true,
+                values.isSymbolicLink != true
+                else {
+                    continue
+                }
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+}
+
+private struct ClickTTSGate0RuntimeLocation {
+    let root: URL
+    let python: URL
+    let helper: URL
+    let runtimeID: String
+}
+
+private enum ClickTTSGate0RuntimeVerifier {
+    private struct FileStamp: Equatable {
+        let relativePath: String
+        let size: Int
+        let mode: Int
+        let inode: UInt64
+        let modificationTime: TimeInterval
+    }
+
+    private struct ProcessVerification {
+        let rootPath: String
+        let manifestHash: String
+        let manifestStamp: FileStamp
+        let fileStamps: [String: FileStamp]
+        let declared: Set<String>
+    }
+
+    private static let processCacheLock = NSLock()
+    private static var processVerification: ProcessVerification?
+    private static let fullVerificationTimeLimit: TimeInterval = 15
+
+    private static func fail(_ message: String) -> NSError {
+        NSError(
+            domain: "Click.EdgeTTS.Runtime",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private static func checkpoint(
+        _ externalCheck: () throws -> Void,
+        deadline: TimeInterval
+    ) throws {
+        try externalCheck()
+        guard ProcessInfo.processInfo.systemUptime <= deadline else {
+            throw fail("私有语音运行时完整性校验超过 15 秒，已停止以避免持续占用 CPU")
+        }
+    }
+
+    private static func stamp(
+        _ url: URL,
+        relativePath: String
+    ) throws -> FileStamp {
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true
+        else {
+            throw fail("运行时文件类型不安全：\(relativePath)")
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = (attributes[.size] as? NSNumber)?.intValue,
+              let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue,
+              let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+              let modificationDate = attributes[.modificationDate] as? Date
+        else {
+            throw fail("无法读取运行时文件属性：\(relativePath)")
+        }
+        return FileStamp(
+            relativePath: relativePath,
+            size: size,
+            mode: permissions & 0o7777,
+            inode: inode,
+            modificationTime: modificationDate.timeIntervalSince1970
+        )
+    }
+
+    private static func verifiedLocation(root: URL) throws -> ClickTTSGate0RuntimeLocation {
+        let python = root.appendingPathComponent(ClickTTSGate0Contract.pythonRelativePath)
+        let helper = root.appendingPathComponent(ClickTTSGate0Contract.helperRelativePath)
+        guard FileManager.default.isExecutableFile(atPath: python.path),
+              FileManager.default.fileExists(atPath: helper.path)
+        else {
+            throw fail("Click 私有语音运行时入口缺失")
+        }
+        return ClickTTSGate0RuntimeLocation(
+            root: root,
+            python: python,
+            helper: helper,
+            runtimeID: ClickTTSGate0Contract.expectedRuntimeID
+        )
+    }
+
+    private static func verifyCachedProcessRuntime(
+        _ cached: ProcessVerification,
+        root: URL,
+        manifestURL: URL,
+        manifestData: Data,
+        externalCheck: () throws -> Void,
+        deadline: TimeInterval
+    ) throws -> ClickTTSGate0RuntimeLocation {
+        guard cached.rootPath == root.path,
+              ClickTTSGate0Contract.sha256(manifestData) == cached.manifestHash,
+              try stamp(
+                manifestURL,
+                relativePath: "runtime-manifest.json"
+              ) == cached.manifestStamp
+        else {
+            throw fail("Click 运行期间私有语音清单发生变化，已拒绝继续启动 helper")
+        }
+
+        for relative in cached.declared.sorted() {
+            try checkpoint(externalCheck, deadline: deadline)
+            guard let expected = cached.fileStamps[relative] else {
+                throw fail("进程内运行时快照不完整")
+            }
+            let fileURL = root.appendingPathComponent(relative).standardizedFileURL
+            guard fileURL.path.hasPrefix(root.path + "/"),
+                  try stamp(fileURL, relativePath: relative) == expected
+            else {
+                throw fail("Click 运行期间私有语音文件发生变化：\(relative)")
+            }
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw fail("无法枚举语音运行时")
+        }
+        var actual = Set<String>()
+        for case let url as URL in enumerator {
+            try checkpoint(externalCheck, deadline: deadline)
+            let values = try url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            if values.isSymbolicLink == true {
+                throw fail("运行时包含符号链接：\(url.lastPathComponent)")
+            }
+            if values.isRegularFile == true {
+                let canonicalURL = url
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL
+                guard canonicalURL.path.hasPrefix(root.path + "/") else {
+                    throw fail("运行时文件越出私有目录：\(url.lastPathComponent)")
+                }
+                let relative = String(canonicalURL.path.dropFirst(root.path.count + 1))
+                if relative != "runtime-manifest.json" {
+                    actual.insert(relative)
+                }
+            }
+        }
+        guard actual == cached.declared else {
+            throw fail("Click 运行期间私有语音文件树发生变化")
+        }
+        return try verifiedLocation(root: root)
+    }
+
+    static func locateAndVerify(
+        externalCheck: @escaping () throws -> Void = {}
+    ) throws -> ClickTTSGate0RuntimeLocation {
+        let deadline = ProcessInfo.processInfo.systemUptime + fullVerificationTimeLimit
+        try checkpoint(externalCheck, deadline: deadline)
+        guard ClickTTSGate0Contract.validateGoldenVector() else {
+            throw fail("缓存身份合同自检失败")
+        }
+        guard let resourceURL = Bundle.main.resourceURL else {
+            throw fail("Click 资源目录不存在")
+        }
+        let unresolvedRoot = resourceURL
+            .appendingPathComponent("ClickTTSRuntime", isDirectory: true)
+            .standardizedFileURL
+        let expectedUnresolvedRoot = resourceURL
+            .standardizedFileURL
+            .appendingPathComponent("ClickTTSRuntime", isDirectory: true)
+            .standardizedFileURL
+        guard unresolvedRoot.path == expectedUnresolvedRoot.path,
+              let rootValues = try? unresolvedRoot.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              rootValues.isDirectory == true,
+              rootValues.isSymbolicLink != true
+        else {
+            throw fail("Click 私有语音运行时不存在")
+        }
+        let root = unresolvedRoot
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let expectedRoot = expectedUnresolvedRoot
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard root.path == expectedRoot.path else {
+            throw fail("Click 私有语音运行时路径不一致")
+        }
+        let manifestURL = root.appendingPathComponent("runtime-manifest.json")
+        let data = try Data(contentsOf: manifestURL)
+        processCacheLock.lock()
+        let cached = processVerification
+        processCacheLock.unlock()
+        if let cached {
+            return try verifyCachedProcessRuntime(
+                cached,
+                root: root,
+                manifestURL: manifestURL,
+                manifestData: data,
+                externalCheck: externalCheck,
+                deadline: deadline
+            )
+        }
+        guard let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (manifest["schema_version"] as? NSNumber)?.intValue == 1,
+              manifest["runtime_id"] as? String == ClickTTSGate0Contract.expectedRuntimeID,
+              let pythonInfo = manifest["python"] as? [String: Any],
+              pythonInfo["version"] as? String == ClickTTSGate0Contract.expectedPythonVersion,
+              pythonInfo["executable"] as? String == ClickTTSGate0Contract.pythonRelativePath,
+              let provider = manifest["provider"] as? [String: Any],
+              provider["name"] as? String == "edge-tts",
+              provider["version"] as? String == ClickTTSGate0Contract.expectedEdgeTTSVersion,
+              provider["helper"] as? String == ClickTTSGate0Contract.helperRelativePath,
+              provider["ipc"] as? String == "jsonl-stdio",
+              let target = manifest["target"] as? [String: Any],
+              target["platform"] as? String == "macOS",
+              target["architecture"] as? String == "arm64",
+              let entries = manifest["files"] as? [[String: Any]],
+              !entries.isEmpty
+        else {
+            throw fail("Click 私有语音运行时清单不匹配")
+        }
+
+        var declared = Set<String>()
+        var fileStamps: [String: FileStamp] = [:]
+        for entry in entries {
+            try checkpoint(externalCheck, deadline: deadline)
+            guard let relative = entry["path"] as? String,
+                  !relative.isEmpty,
+                  !relative.hasPrefix("/"),
+                  !relative.split(separator: "/").contains(".."),
+                  let expectedHash = entry["sha256"] as? String,
+                  expectedHash.count == 64,
+                  let expectedSize = (entry["size"] as? NSNumber)?.intValue,
+                  let expectedMode = entry["mode"] as? String
+            else {
+                throw fail("运行时清单包含不安全路径")
+            }
+            let fileURL = root.appendingPathComponent(relative).standardizedFileURL
+            let fileStamp = try stamp(fileURL, relativePath: relative)
+            guard fileURL.path.hasPrefix(root.path + "/"),
+                  fileStamp.size == expectedSize,
+                  String(format: "%04o", fileStamp.mode) == expectedMode,
+                  try ClickTTSGate0Contract.sha256File(
+                    fileURL,
+                    checkpoint: {
+                        try checkpoint(externalCheck, deadline: deadline)
+                    }
+                  ) == expectedHash,
+                  declared.insert(relative).inserted
+            else {
+                throw fail("运行时完整性校验失败：\(relative)")
+            }
+            fileStamps[relative] = fileStamp
+        }
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw fail("无法枚举语音运行时")
+        }
+        var actual = Set<String>()
+        for case let url as URL in enumerator {
+            try checkpoint(externalCheck, deadline: deadline)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true {
+                throw fail("运行时包含符号链接：\(url.lastPathComponent)")
+            }
+            if values.isRegularFile == true {
+                let canonicalURL = url
+                    .resolvingSymlinksInPath()
+                    .standardizedFileURL
+                guard canonicalURL.path.hasPrefix(root.path + "/") else {
+                    throw fail("运行时文件越出私有目录：\(url.lastPathComponent)")
+                }
+                let relative = String(canonicalURL.path.dropFirst(root.path.count + 1))
+                if relative != "runtime-manifest.json" {
+                    actual.insert(relative)
+                }
+            }
+        }
+        guard actual == declared else {
+            throw fail("运行时文件树与签名清单不一致")
+        }
+        let verification = ProcessVerification(
+            rootPath: root.path,
+            manifestHash: ClickTTSGate0Contract.sha256(data),
+            manifestStamp: try stamp(
+                manifestURL,
+                relativePath: "runtime-manifest.json"
+            ),
+            fileStamps: fileStamps,
+            declared: declared
+        )
+        processCacheLock.lock()
+        processVerification = verification
+        processCacheLock.unlock()
+        return try verifiedLocation(root: root)
+    }
+}
+
+private struct ClickTTSGate0RequestContext {
+    let fixtureID: String
+    let chapterLocator: String
+    let locatorRange: String
+
+    static let custom = ClickTTSGate0RequestContext(
+        fixtureID: ClickTTSGate0Contract.defaultFixtureID,
+        chapterLocator: "probe-1",
+        locatorRange: "0:0"
+    )
+
+    var cacheContext: [String: String] {
+        ClickTTSGate0Contract.cacheContext(
+            fixtureID: fixtureID,
+            chapterLocator: chapterLocator,
+            locatorRange: locatorRange
+        )
+    }
+}
+
+private struct ClickTTSGate0FixtureSegment {
+    let fixtureID: String
+    let title: String
+    let text: String
+    let chapterLocator: String
+    let locatorRange: String
+
+    var requestContext: ClickTTSGate0RequestContext {
+        ClickTTSGate0RequestContext(
+            fixtureID: fixtureID,
+            chapterLocator: chapterLocator,
+            locatorRange: locatorRange
+        )
+    }
+}
+
+private struct ClickTTSGate0Fixture {
+    let title: String
+    let segments: [ClickTTSGate0FixtureSegment]
+}
+
+private enum ClickTTSGate0Fixtures {
+    private static let steadyParagraphs = [
+        "清晨的阅读从一个清楚的问题开始。我们先辨认作者提出的事实，再区分推论和判断，"
+            + "最后用自己的话复述关键关系。When the idea becomes clear, the reader pauses, "
+            + "checks the evidence, and then continues. 这样做不是追求速度，而是让每一段内容都能"
+            + "进入长期记忆，并且在需要时重新调用。",
+        "接下来把注意力放在结构上。标题说明方向，例子提供支撑，转折句提醒我们前面的假设"
+            + "可能需要修正。A useful reading system keeps context, sequence, and meaning together. "
+            + "如果一句话暂时难懂，就回到上一句寻找它所依赖的概念，而不是孤立地重复声音。",
+        "当一章接近结束时，我们检查三个问题：作者真正回答了什么，哪些证据仍然不足，以及"
+            + "下一章会沿着哪条线索继续。This short review creates a bridge to the next chapter. "
+            + "朗读可以保持连续，但判断仍然属于读者；声音负责传递文字，理解来自主动比较和思考。",
+    ]
+
+    private static let steadyText = Array(
+        repeating: steadyParagraphs,
+        count: 4
+    ).flatMap { $0 }.joined(separator: "\n\n")
+
+    static let choices: [ClickTTSGate0Fixture] = [
+        ClickTTSGate0Fixture(
+            title: "纯中文",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "zh_probe_v1",
+                    title: "纯中文",
+                    text: "今天的风很轻，窗边的树叶缓慢摇动。读者先听完整句话，再判断停顿是否自然，"
+                        + "数字一二三四五也应该清楚可辨。",
+                    chapterLocator: "fixture:zh_probe_v1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+        ClickTTSGate0Fixture(
+            title: "纯英文",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "en_probe_v1",
+                    title: "纯英文",
+                    text: "A careful reader listens for clear phrasing, natural pauses, and stable "
+                        + "volume. This short passage checks whether every English sentence remains "
+                        + "easy to follow from beginning to end.",
+                    chapterLocator: "fixture:en_probe_v1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+        ClickTTSGate0Fixture(
+            title: "中英混排",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "mixed_probe_v1",
+                    title: "中英混排",
+                    text: "现在开始检查中英混排。Click should read this English sentence clearly，"
+                        + "然后自然回到中文；版本号 version two and the number twenty four 也要保持连贯。",
+                    chapterLocator: "fixture:mixed_probe_v1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+        ClickTTSGate0Fixture(
+            title: "首块 20–45 秒",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "first_block_20_45s_v1",
+                    title: "首块",
+                    text: "朗读开始后，第一段声音应该尽快出现，同时保持完整句子的边界。我们先听一段"
+                        + "中文，确认语速、停顿和音量自然；then we continue with a short English "
+                        + "sentence to verify the transition。接着回到中文，检查标点附近没有重复、漏字"
+                        + "或突然加速。最后一句用于确认播放器拿到的是一个完整的小块，而不是尚未写完"
+                        + "的临时文件。",
+                    chapterLocator: "fixture:first_block_20_45s_v1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+        ClickTTSGate0Fixture(
+            title: "稳态 2–5 分钟",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "steady_block_2_5m_v1",
+                    title: "稳态块",
+                    text: steadyText,
+                    chapterLocator: "fixture:steady_block_2_5m_v1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+        ClickTTSGate0Fixture(
+            title: "逻辑章节 A → B",
+            segments: [
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "logical_chapter_a_v1",
+                    title: "章节 A",
+                    text: "第一章从海边的清晨开始。潮水退去后，沙地留下连续的纹路，像一张等待阅读"
+                        + "的地图。The observer records the first clue and keeps it for the next "
+                        + "chapter. 本章最后一句明确停在桥的这一边。",
+                    chapterLocator: "gate0-logical-book-v1/chapter-0",
+                    locatorRange: "0:full"
+                ),
+                ClickTTSGate0FixtureSegment(
+                    fixtureID: "logical_chapter_b_v1",
+                    title: "章节 B",
+                    text: "第二章从同一座桥的另一边继续，没有重复上一章的最后一句。新的线索指向山脚"
+                        + "的小路，the sequence must remain forward and complete。故事在这里结束，用于"
+                        + "确认章节边界之后没有漏读、倒序或无声跳转。",
+                    chapterLocator: "gate0-logical-book-v1/chapter-1",
+                    locatorRange: "0:full"
+                ),
+            ]
+        ),
+    ]
+}
+
+private struct ClickTTSGate0GenerationMetrics {
+    let attemptCount: Int?
+    let synthesisElapsedMS: Double?
+    let audioDurationMS: Double?
+    let synthesisRTF: Double?
+
+    private static func strictDouble(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue >= 0
+        else {
+            return nil
+        }
+        return number.doubleValue
+    }
+
+    init(result: [String: Any]?) {
+        let attempt = Self.strictDouble(result?["attempt_count"])
+        attemptCount = attempt.flatMap {
+            $0.rounded(.towardZero) == $0 && $0 <= 3
+                ? Int($0)
+                : nil
+        }
+        synthesisElapsedMS = Self.strictDouble(result?["synthesis_elapsed_ms"])
+        audioDurationMS = Self.strictDouble(result?["audio_duration_ms"])
+        if let reported = Self.strictDouble(result?["synthesis_rtf"]) {
+            synthesisRTF = reported
+        } else if let elapsed = synthesisElapsedMS,
+                  let duration = audioDurationMS,
+                  duration > 0 {
+            synthesisRTF = elapsed / duration
+        } else {
+            synthesisRTF = nil
+        }
+    }
+
+    func summary(
+        actualAudioDuration: TimeInterval?,
+        clientEndToEndElapsedMS: Double?
+    ) -> String {
+        var parts: [String] = []
+        if let attemptCount {
+            parts.append("尝试 \(attemptCount) 次")
+        }
+        if let synthesisElapsedMS {
+            parts.append(
+                String(format: "服务合成 %.2fs", synthesisElapsedMS / 1_000)
+            )
+        }
+        let verifiedActualDuration: Double?
+        if let actualAudioDuration,
+           actualAudioDuration.isFinite,
+           actualAudioDuration > 0 {
+            verifiedActualDuration = actualAudioDuration
+        } else {
+            verifiedActualDuration = nil
+        }
+        let durationSeconds = verifiedActualDuration
+            ?? audioDurationMS.map { $0 / 1_000 }
+        if let durationSeconds {
+            parts.append(String(format: "音频 %.1fs", durationSeconds))
+        }
+        if let clientEndToEndElapsedMS,
+           clientEndToEndElapsedMS.isFinite,
+           clientEndToEndElapsedMS >= 0 {
+            parts.append(
+                String(format: "端到端 %.2fs", clientEndToEndElapsedMS / 1_000)
+            )
+            if let verifiedActualDuration {
+                let standardRTF = clientEndToEndElapsedMS
+                    / (verifiedActualDuration * 1_000)
+                parts.append(String(format: "标准 RTF %.3f", standardRTF))
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+private final class ClickTTSGate0ProbeController: NSObject, AVAudioPlayerDelegate {
+    private enum Operation: String {
+        case synthesize
+        case listVoices = "list_voices"
+    }
+
+    private struct OwnedProcessSnapshot {
+        let pid: Int32
+        let pgid: Int32?
+    }
+
+    private struct CancellationSession {
+        let token: UUID
+        let snapshot: OwnedProcessSnapshot?
+        let semaphore: DispatchSemaphore
+    }
+
+    private struct PlaybackSession {
+        let artifact: ClickTTSGate0CachedArtifact
+        let text: String
+        let voice: String
+        let requestContext: ClickTTSGate0RequestContext
+        let parentWindow: NSWindow
+        let repairAttempted: Bool
+        let completion: ((String, Bool) -> Void)?
+        let playbackFinished: ((Bool) -> Void)?
+    }
+
+    private final class Gate2ANRunState {
+        private enum ArtifactCleanupState {
+            case idle
+            case claimed
+        }
+
+        enum ArtifactCleanupClaim {
+            case artifact(ClickTTSGate0CachedArtifact)
+            case noArtifact
+            case alreadyClaimed
+        }
+
+        let id = UUID()
+        let intentStartedUptime: TimeInterval
+        let deadlineUptime: TimeInterval
+        let fixtureID: String
+        let mutePlayback: Bool
+        let stopAfterFirstSound: Bool
+        let expectedSource: String
+        let evictAfterFirstSound: Bool
+        let holdHelperAfterReadyForTimeoutExercise: Bool
+        let event: ([String: Any]) -> Void
+        let completion: ([String: Any]) -> Void
+        private let statusLock = NSLock()
+        private var didFinish = false
+        private var didTimeOut = false
+        private var artifactCleanupState = ArtifactCleanupState.idle
+        private var storedArtifact: ClickTTSGate0CachedArtifact?
+        var deadlineWorkItem: DispatchWorkItem?
+        var firstSoundPollWorkItem: DispatchWorkItem?
+        var lastMessage = ""
+        var firstSoundObserved = false
+        var source = ""
+        var cacheKey = ""
+        var attemptCount: Int?
+        var synthesisElapsedMS: Double?
+        var audioDurationMS: Double?
+        var cacheMissVerified = false
+        var cacheHitVerified = false
+        var cacheEvicted = false
+
+        init(
+            intentStartedUptime: TimeInterval,
+            hardDeadlineSeconds: TimeInterval,
+            fixtureID: String,
+            mutePlayback: Bool,
+            stopAfterFirstSound: Bool,
+            expectedSource: String,
+            evictAfterFirstSound: Bool,
+            holdHelperAfterReadyForTimeoutExercise: Bool,
+            event: @escaping ([String: Any]) -> Void,
+            completion: @escaping ([String: Any]) -> Void
+        ) {
+            self.intentStartedUptime = intentStartedUptime
+            deadlineUptime = intentStartedUptime + hardDeadlineSeconds
+            self.fixtureID = fixtureID
+            self.mutePlayback = mutePlayback
+            self.stopAfterFirstSound = stopAfterFirstSound
+            self.expectedSource = expectedSource
+            self.evictAfterFirstSound = evictAfterFirstSound
+            self.holdHelperAfterReadyForTimeoutExercise =
+                holdHelperAfterReadyForTimeoutExercise
+            self.event = event
+            self.completion = completion
+        }
+
+        var canProceed: Bool {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            return !didFinish
+        }
+
+        var timedOut: Bool {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            return didTimeOut
+        }
+
+        @discardableResult
+        func markTimedOut() -> Bool {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            guard !didFinish, !didTimeOut else {
+                return false
+            }
+            didTimeOut = true
+            return true
+        }
+
+        @discardableResult
+        func beginFinish() -> Bool {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            guard !didFinish else {
+                return false
+            }
+            didFinish = true
+            return true
+        }
+
+        @discardableResult
+        func recordGeneratedArtifact(
+            _ artifact: ClickTTSGate0CachedArtifact,
+            source: String,
+            metrics: ClickTTSGate0GenerationMetrics
+        ) -> Bool {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            guard !didFinish,
+                  artifactCleanupState == .idle,
+                  storedArtifact == nil
+            else {
+                return false
+            }
+            storedArtifact = artifact
+            self.source = source
+            cacheKey = artifact.cacheKey
+            attemptCount = metrics.attemptCount
+            synthesisElapsedMS = metrics.synthesisElapsedMS
+            audioDurationMS = metrics.audioDurationMS
+            return true
+        }
+
+        func claimArtifactForCleanup() -> ArtifactCleanupClaim {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            guard artifactCleanupState == .idle else {
+                return .alreadyClaimed
+            }
+            artifactCleanupState = .claimed
+            guard let storedArtifact else {
+                return .noArtifact
+            }
+            return .artifact(storedArtifact)
+        }
+    }
+
+    private let worker = DispatchQueue(label: "local.click.edge-tts-gate0", qos: .utility)
+    private let cancellationLock = NSLock()
+    private let breakerLock = NSLock()
+    private let breakerWindow: TimeInterval = 5 * 60
+    private let breakerThreshold = 3
+    private var transientFailureDates: [Date] = []
+    private var breakerOpenUntil: Date?
+    private var cancellationToken: UUID?
+    private var cancellationRequested = false
+    private var cancellationProcessPID: Int32?
+    private var cancellationProcessPGID: Int32?
+    private var cancellationSemaphore: DispatchSemaphore?
+    private var process: Process?
+    private var stdinPipe: Pipe?
+    private var stdoutPipe: Pipe?
+    private var stderrPipe: Pipe?
+    private var stdoutBuffer = Data()
+    private var activeToken: UUID?
+    private var activeRequestID: String?
+    private var activeOperation: Operation?
+    private var activeText: String?
+    private var activeVoice: String?
+    private var activeRequestContext: ClickTTSGate0RequestContext?
+    private var activeParentWindow: NSWindow?
+    private var activeClientStartedUptime: TimeInterval?
+    private var activeRepairAttempted = false
+    private var activePlaybackFinished: ((Bool) -> Void)?
+    private var activeHelperPGID: Int32?
+    private var finalResult: [String: Any]?
+    private var finalErrorMessage: String?
+    private var completion: ((String, Bool) -> Void)?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private var forceKillWorkItem: DispatchWorkItem?
+    private var thermalMonitor: DispatchSourceTimer?
+    private var audioPlayer: AVAudioPlayer?
+    private var playbackSession: PlaybackSession?
+    private var isPrompting = false
+    private var gate2ANRunState: Gate2ANRunState?
+
+    private func beginCancellationSession(token: UUID) -> Bool {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        guard cancellationToken == nil else {
+            return false
+        }
+        cancellationToken = token
+        cancellationRequested = false
+        cancellationProcessPID = nil
+        cancellationProcessPGID = nil
+        cancellationSemaphore = DispatchSemaphore(value: 0)
+        return true
+    }
+
+    private func updateOwnedProcess(
+        token: UUID,
+        pid: Int32,
+        pgid: Int32? = nil
+    ) {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        guard cancellationToken == token else {
+            return
+        }
+        cancellationProcessPID = pid
+        if let pgid {
+            cancellationProcessPGID = pgid
+        }
+    }
+
+    private func isCancellationRequested(token: UUID) -> Bool {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        return cancellationToken == token && cancellationRequested
+    }
+
+    private func requestCancellation() -> CancellationSession? {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        guard let token = cancellationToken,
+              let semaphore = cancellationSemaphore
+        else {
+            return nil
+        }
+        cancellationRequested = true
+        let snapshot = cancellationProcessPID.map {
+            OwnedProcessSnapshot(pid: $0, pgid: cancellationProcessPGID)
+        }
+        return CancellationSession(
+            token: token,
+            snapshot: snapshot,
+            semaphore: semaphore
+        )
+    }
+
+    private func currentOwnedProcess(token: UUID) -> OwnedProcessSnapshot? {
+        cancellationLock.lock()
+        defer { cancellationLock.unlock() }
+        guard cancellationToken == token, let pid = cancellationProcessPID else {
+            return nil
+        }
+        return OwnedProcessSnapshot(pid: pid, pgid: cancellationProcessPGID)
+    }
+
+    private func endCancellationSession(token: UUID) {
+        cancellationLock.lock()
+        guard cancellationToken == token else {
+            cancellationLock.unlock()
+            return
+        }
+        let semaphore = cancellationSemaphore
+        cancellationToken = nil
+        cancellationRequested = false
+        cancellationProcessPID = nil
+        cancellationProcessPGID = nil
+        cancellationSemaphore = nil
+        cancellationLock.unlock()
+        semaphore?.signal()
+    }
+
+    private static func thermalBlockMessage() -> String? {
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious:
+            return "设备温控已到“严重”，Click 已阻止新的在线合成；请等待机器冷却，已有缓存仍可播放。"
+        case .critical:
+            return "设备温控已到“临界”，Click 已停止在线合成以避免继续发热；请等待机器冷却。"
+        default:
+            return nil
+        }
+    }
+
+    private static func networkRouteAppearsAvailable() -> Bool {
+        let monitor = NWPathMonitor()
+        let queue = DispatchQueue(label: "local.click.edge-tts-network-route")
+        let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var available = false
+        monitor.pathUpdateHandler = { path in
+            lock.lock()
+            available = path.status == .satisfied
+            lock.unlock()
+            semaphore.signal()
+        }
+        monitor.start(queue: queue)
+        _ = semaphore.wait(timeout: .now() + 0.75)
+        monitor.cancel()
+        lock.lock()
+        defer { lock.unlock() }
+        return available
+    }
+
+    private func breakerRemaining(now: Date = Date()) -> TimeInterval? {
+        breakerLock.lock()
+        defer { breakerLock.unlock() }
+        transientFailureDates.removeAll {
+            now.timeIntervalSince($0) >= breakerWindow
+        }
+        if let openUntil = breakerOpenUntil {
+            if openUntil > now {
+                return openUntil.timeIntervalSince(now)
+            }
+            breakerOpenUntil = nil
+            transientFailureDates.removeAll()
+        }
+        return nil
+    }
+
+    private func recordTransientFailure(
+        retryAfterMS: Double? = nil,
+        now: Date = Date()
+    ) {
+        breakerLock.lock()
+        defer { breakerLock.unlock() }
+        transientFailureDates.removeAll {
+            now.timeIntervalSince($0) >= breakerWindow
+        }
+        transientFailureDates.append(now)
+        if transientFailureDates.count >= breakerThreshold {
+            let serverDelay = max(0, (retryAfterMS ?? 0) / 1_000)
+            breakerOpenUntil = now.addingTimeInterval(max(breakerWindow, serverDelay))
+        }
+    }
+
+    private func openBreaker(
+        retryAfterMS: Double?,
+        now: Date = Date()
+    ) {
+        breakerLock.lock()
+        defer { breakerLock.unlock() }
+        let serverDelay = max(0, (retryAfterMS ?? 0) / 1_000)
+        breakerOpenUntil = now.addingTimeInterval(max(breakerWindow, serverDelay))
+    }
+
+    private func resetBreaker() {
+        breakerLock.lock()
+        transientFailureDates.removeAll()
+        breakerOpenUntil = nil
+        breakerLock.unlock()
+    }
+
+    private func breakerMessage() -> String? {
+        guard let remaining = breakerRemaining() else {
+            return nil
+        }
+        return "Microsoft 在线语音连续失败，Click 已暂停新请求约 \(max(1, Int(ceil(remaining / 60)))) 分钟；缓存播放不受影响。"
+    }
+
+    private static func nonnegativeNumber(_ value: Any?) -> Double? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue >= 0
+        else {
+            return nil
+        }
+        return number.doubleValue
+    }
+
+    private func startThermalMonitor(token: UUID) {
+        thermalMonitor?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: worker)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.activeToken == token else {
+                return
+            }
+            guard let message = Self.thermalBlockMessage() else {
+                return
+            }
+            self.finalErrorMessage = message
+            if self.process != nil {
+                self.terminateOwnedHelper(forceAfter: 1)
+            } else {
+                self.finish(token: token, message: message, success: false)
+            }
+        }
+        thermalMonitor = timer
+        timer.resume()
+    }
+
+    var disclosureAccepted: Bool {
+        let receipt = UserDefaults.standard.dictionary(
+            forKey: ClickTTSGate0Contract.disclosureDefaultsKey
+        )
+        return receipt?["revision"] as? String == ClickTTSGate0Contract.disclosureRevision
+            && receipt?["accepted"] as? Bool == true
+    }
+
+    func revokeDisclosure() {
+        cancel()
+        UserDefaults.standard.removeObject(
+            forKey: ClickTTSGate0Contract.disclosureDefaultsKey
+        )
+    }
+
+    func run(
+        text rawText: String,
+        voice: String,
+        parentWindow: NSWindow,
+        fixtureID: String = ClickTTSGate0Contract.defaultFixtureID,
+        chapterLocator: String = "probe-1",
+        locatorRange: String = "0:0",
+        playbackFinished: ((Bool) -> Void)? = nil,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        runInternal(
+            text: rawText,
+            voice: voice,
+            parentWindow: parentWindow,
+            fixtureID: fixtureID,
+            chapterLocator: chapterLocator,
+            locatorRange: locatorRange,
+            gate2ANState: nil,
+            playbackFinished: playbackFinished,
+            completion: completion
+        )
+    }
+
+    func runGate2ANAcceptance(
+        text rawText: String,
+        voice: String,
+        parentWindow: NSWindow,
+        fixtureID: String,
+        chapterLocator: String,
+        locatorRange: String,
+        intentStartedUptime: TimeInterval,
+        mutePlayback: Bool,
+        stopAfterFirstSound: Bool,
+        expectedSource: String = "online",
+        evictAfterFirstSound: Bool = true,
+        holdHelperAfterReadyForTimeoutExercise: Bool = false,
+        event: @escaping ([String: Any]) -> Void,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        guard ["online", "cache"].contains(expectedSource),
+              gate2ANRunState == nil,
+              activeToken == nil,
+              audioPlayer == nil
+        else {
+            completion([
+                "ok": false,
+                "status": "busy",
+                "error": "已有一个语音生成或播放任务正在运行",
+            ])
+            return
+        }
+        let state = Gate2ANRunState(
+            intentStartedUptime: intentStartedUptime,
+            hardDeadlineSeconds: 12,
+            fixtureID: fixtureID,
+            mutePlayback: mutePlayback,
+            stopAfterFirstSound: stopAfterFirstSound,
+            expectedSource: expectedSource,
+            evictAfterFirstSound: evictAfterFirstSound,
+            holdHelperAfterReadyForTimeoutExercise:
+                holdHelperAfterReadyForTimeoutExercise,
+            event: event,
+            completion: completion
+        )
+        gate2ANRunState = state
+        emitGate2ANEvent(
+            state,
+            [
+                "event": "preparing_published",
+                "elapsed_ms": max(
+                    0,
+                    (ProcessInfo.processInfo.systemUptime
+                        - intentStartedUptime) * 1_000
+                ),
+            ]
+        )
+        armGate2ANDeadline(state)
+        runInternal(
+            text: rawText,
+            voice: voice,
+            parentWindow: parentWindow,
+            fixtureID: fixtureID,
+            chapterLocator: chapterLocator,
+            locatorRange: locatorRange,
+            gate2ANState: state,
+            playbackFinished: { [weak self, weak state] success in
+                guard let self, let state else { return }
+                self.handleGate2ANPlaybackFinished(
+                    state,
+                    success: success
+                )
+            },
+            completion: { [weak state] message, _ in
+                state?.lastMessage = message
+            }
+        )
+    }
+
+    private func runInternal(
+        text rawText: String,
+        voice: String,
+        parentWindow: NSWindow,
+        fixtureID: String,
+        chapterLocator: String,
+        locatorRange: String,
+        gate2ANState: Gate2ANRunState?,
+        playbackFinished: ((Bool) -> Void)?,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestContext = ClickTTSGate0RequestContext(
+            fixtureID: fixtureID,
+            chapterLocator: chapterLocator,
+            locatorRange: locatorRange
+        )
+        guard !text.isEmpty else {
+            completion("请输入一段测试文字。", false)
+            playbackFinished?(false)
+            return
+        }
+        guard text.count <= 4_000 else {
+            completion("Gate 0 测试文字不能超过 4,000 个字符。", false)
+            playbackFinished?(false)
+            return
+        }
+        guard !isPrompting else {
+            completion("首次联网说明正在等待选择。", false)
+            playbackFinished?(false)
+            return
+        }
+        guard audioPlayer == nil else {
+            completion("已有一段 Gate 0 诊断音频正在播放；请先停止或等待播放结束。", false)
+            playbackFinished?(false)
+            return
+        }
+        worker.async { [weak self] in
+            guard let self else { return }
+            if let gate2ANState,
+               !self.gate2ANMayProceed(gate2ANState) {
+                return
+            }
+            guard self.activeToken == nil else {
+                DispatchQueue.main.async {
+                    completion("已有一个语音生成任务正在运行。", false)
+                    playbackFinished?(false)
+                }
+                return
+            }
+            if let cached = ClickTTSGate0Cache.load(
+                text: text,
+                voice: voice,
+                cacheContext: requestContext.cacheContext
+            ) {
+                if let gate2ANState {
+                    guard gate2ANState.expectedSource == "cache" else {
+                        DispatchQueue.main.async {
+                            self.finishGate2AN(
+                                gate2ANState,
+                                ok: false,
+                                status: "cache_hit",
+                                error: "Gate 2A-N 在线样本要求真实未缓存，但当前 cache key 已存在"
+                            )
+                        }
+                        return
+                    }
+                    gate2ANState.cacheHitVerified = true
+                    guard gate2ANState.recordGeneratedArtifact(
+                        cached,
+                        source: "cache",
+                        metrics: cached.generationMetrics
+                    ) else {
+                        DispatchQueue.main.async {
+                            self.finishGate2AN(
+                                gate2ANState,
+                                ok: false,
+                                status: "cache_identity_failed",
+                                error: "Gate 2A-N 缓存复播无法绑定唯一缓存身份"
+                            )
+                        }
+                        return
+                    }
+                    self.emitGate2ANEvent(
+                        gate2ANState,
+                        [
+                            "event": "cache_hit_verified",
+                            "elapsed_ms": max(
+                                0,
+                                (ProcessInfo.processInfo.systemUptime
+                                    - gate2ANState.intentStartedUptime) * 1_000
+                            ),
+                            "cache_key": cached.cacheKey,
+                        ]
+                    )
+                    DispatchQueue.main.async {
+                        let now = ProcessInfo.processInfo.systemUptime
+                        guard self.gate2ANRunState === gate2ANState,
+                              gate2ANState.canProceed,
+                              !gate2ANState.timedOut,
+                              now <= gate2ANState.deadlineUptime
+                        else {
+                            if gate2ANState.canProceed {
+                                if gate2ANState.markTimedOut() {
+                                    self.emitGate2ANTimeoutEvent(
+                                        gate2ANState
+                                    )
+                                }
+                                self.finishGate2ANAfterOptionalEviction(
+                                    gate2ANState,
+                                    ok: false,
+                                    status: "timed_out",
+                                    error: "缓存语音响应较慢，请重试",
+                                    artifactRequired: false
+                                )
+                            }
+                            return
+                        }
+                        self.play(
+                            cached,
+                            text: text,
+                            voice: voice,
+                            requestContext: requestContext,
+                            parentWindow: parentWindow,
+                            repairAttempted: false,
+                            metrics: cached.generationMetrics,
+                            clientStartedUptime:
+                                gate2ANState.intentStartedUptime,
+                            source: "cache",
+                            message: "正在从 Click 本地缓存播放；未启动在线 helper。",
+                            completion: completion,
+                            playbackFinished: playbackFinished
+                        )
+                    }
+                    return
+                }
+                DispatchQueue.main.async {
+                    self.play(
+                        cached,
+                        text: text,
+                        voice: voice,
+                        requestContext: requestContext,
+                        parentWindow: parentWindow,
+                        repairAttempted: false,
+                        metrics: cached.generationMetrics,
+                        clientStartedUptime: nil,
+                        source: "cache",
+                        message: "正在从 Click 本地缓存播放；未启动在线 helper。",
+                        completion: completion,
+                        playbackFinished: playbackFinished
+                    )
+                }
+                return
+            }
+            if let gate2ANState {
+                guard gate2ANState.expectedSource == "online" else {
+                    DispatchQueue.main.async {
+                        self.finishGate2AN(
+                            gate2ANState,
+                            ok: false,
+                            status: "cache_miss",
+                            error: "Gate 2A-N 缓存复播要求命中刚生成的精确 cache key"
+                        )
+                    }
+                    return
+                }
+                gate2ANState.cacheMissVerified = true
+                self.emitGate2ANEvent(
+                    gate2ANState,
+                    [
+                        "event": "online_cache_miss",
+                        "elapsed_ms": max(
+                            0,
+                            (ProcessInfo.processInfo.systemUptime
+                                - gate2ANState.intentStartedUptime) * 1_000
+                        ),
+                    ]
+                )
+            }
+            DispatchQueue.main.async {
+                if let gate2ANState,
+                   !self.gate2ANMayProceed(gate2ANState) {
+                    return
+                }
+                self.authorizeIfNeeded(
+                    text: text,
+                    voice: voice,
+                    requestContext: requestContext,
+                    parentWindow: parentWindow,
+                    repairAttempted: false,
+                    playbackFinished: playbackFinished,
+                    completion: completion
+                )
+            }
+        }
+    }
+
+    private func gate2ANMayProceed(_ state: Gate2ANRunState) -> Bool {
+        state.canProceed
+    }
+
+    private func emitGate2ANEvent(
+        _ state: Gate2ANRunState,
+        _ payload: [String: Any]
+    ) {
+        let publish = {
+            guard state.canProceed else {
+                return
+            }
+            state.event(payload)
+        }
+        if Thread.isMainThread {
+            publish()
+        } else {
+            DispatchQueue.main.async(execute: publish)
+        }
+    }
+
+    private func armGate2ANDeadline(_ state: Gate2ANRunState) {
+        precondition(Thread.isMainThread)
+        let remaining = max(
+            0,
+            state.deadlineUptime - ProcessInfo.processInfo.systemUptime
+        )
+        let item = DispatchWorkItem { [weak self, weak state] in
+            guard let self,
+                  let state,
+                  !state.firstSoundObserved,
+                  state.markTimedOut()
+            else {
+                return
+            }
+            self.emitGate2ANTimeoutEvent(state)
+            let cancellationStarted = self.cancel()
+            if !cancellationStarted {
+                self.finishGate2ANAfterOptionalEviction(
+                    state,
+                    ok: false,
+                    status: "timed_out",
+                    error: "在线语音响应较慢，请重试",
+                    artifactRequired: false
+                )
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                guard state.canProceed else {
+                    return
+                }
+                let helperReaped = self.cancelAndWait(timeout: 2)
+                guard helperReaped else {
+                    self.emitGate2ANEvent(
+                        state,
+                        [
+                            "event": "helper_reap_not_confirmed",
+                            "elapsed_ms": max(
+                                0,
+                                (ProcessInfo.processInfo.systemUptime
+                                    - state.intentStartedUptime) * 1_000
+                            ),
+                        ]
+                    )
+                    return
+                }
+                // The worker termination handler exclusively publishes the
+                // helper termination event, performs artifact cleanup, and
+                // closes the Gate 2 state.  Returning here avoids finishing
+                // ahead of those already-queued main-thread callbacks.
+            }
+        }
+        state.deadlineWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + remaining,
+            execute: item
+        )
+    }
+
+    private func emitGate2ANTimeoutEvent(_ state: Gate2ANRunState) {
+        let elapsedMS = max(
+            0,
+            (ProcessInfo.processInfo.systemUptime
+                - state.intentStartedUptime) * 1_000
+        )
+        emitGate2ANEvent(
+            state,
+            [
+                "event": "timed_out",
+                "elapsed_ms": elapsedMS,
+                "budget_ms": 12_000,
+                "message": "在线语音响应较慢，请重试",
+            ]
+        )
+    }
+
+    private func handleGate2ANPlaybackFinished(
+        _ state: Gate2ANRunState,
+        success: Bool
+    ) {
+        precondition(Thread.isMainThread)
+        guard state.canProceed else {
+            return
+        }
+        if state.timedOut {
+            finishGate2ANAfterOptionalEviction(
+                state,
+                ok: false,
+                status: "timed_out",
+                error: "在线语音响应较慢，请重试",
+                artifactRequired: false
+            )
+            return
+        }
+        guard success, state.firstSoundObserved else {
+            finishGate2AN(
+                state,
+                ok: false,
+                status: "failed",
+                error: state.lastMessage.isEmpty
+                    ? "原生播放器没有确认首声"
+                    : state.lastMessage
+            )
+            return
+        }
+        finishGate2ANAfterFirstSound(state)
+    }
+
+    private func finishGate2ANAfterFirstSound(
+        _ state: Gate2ANRunState
+    ) {
+        precondition(Thread.isMainThread)
+        if state.evictAfterFirstSound {
+            finishGate2ANAfterOptionalEviction(
+                state,
+                ok: true,
+                status: "first_sound",
+                error: nil,
+                artifactRequired: true
+            )
+        } else {
+            finishGate2AN(
+                state,
+                ok: true,
+                status: "first_sound",
+                error: nil
+            )
+        }
+    }
+
+    private func finishGate2ANAfterOptionalEviction(
+        _ state: Gate2ANRunState,
+        ok: Bool,
+        status: String,
+        error: String?,
+        artifactRequired: Bool
+    ) {
+        precondition(Thread.isMainThread)
+        guard state.canProceed else {
+            return
+        }
+        switch state.claimArtifactForCleanup() {
+        case .alreadyClaimed:
+            return
+        case .noArtifact:
+            guard artifactRequired == false else {
+                finishGate2AN(
+                    state,
+                    ok: false,
+                    status: "cleanup_failed",
+                    error: "Gate 2A-N 缺少可精确清理的测试缓存身份"
+                )
+                return
+            }
+            finishGate2AN(
+                state,
+                ok: ok,
+                status: status,
+                error: error
+            )
+        case .artifact(let artifact):
+            worker.async { [weak self, weak state] in
+            guard let self, let state, state.canProceed else {
+                return
+            }
+            let evicted = ClickTTSGate0Cache.evict(artifact)
+            DispatchQueue.main.async {
+                guard state.canProceed else {
+                    return
+                }
+                state.cacheEvicted = evicted
+                self.finishGate2AN(
+                    state,
+                    ok: evicted ? ok : false,
+                    status: evicted ? status : "cleanup_failed",
+                    error: evicted
+                        ? error
+                        : "Gate 2A-N 测试 cache key 未能被精确清理"
+                )
+            }
+        }
+        }
+    }
+
+    private func finishGate2AN(
+        _ state: Gate2ANRunState,
+        ok: Bool,
+        status: String,
+        error: String?
+    ) {
+        let finish = {
+            guard state.beginFinish() else {
+                return
+            }
+            state.deadlineWorkItem?.cancel()
+            state.firstSoundPollWorkItem?.cancel()
+            if self.gate2ANRunState === state {
+                self.gate2ANRunState = nil
+            }
+            var result: [String: Any] = [
+                "ok": ok,
+                "status": status,
+                "elapsed_ms": max(
+                    0,
+                    (ProcessInfo.processInfo.systemUptime
+                        - state.intentStartedUptime) * 1_000
+                ),
+                "cache_miss_verified": state.cacheMissVerified,
+                "cache_hit_verified": state.cacheHitVerified,
+                "cache_evicted": state.cacheEvicted,
+                "expected_source": state.expectedSource,
+                "source": state.source,
+                "cache_key": state.cacheKey,
+                "first_sound_observed": state.firstSoundObserved,
+                "timed_out": state.timedOut,
+                "timeout_exercise":
+                    state.holdHelperAfterReadyForTimeoutExercise,
+            ]
+            if let attemptCount = state.attemptCount {
+                result["attempt_count"] = attemptCount
+            }
+            if let synthesisElapsedMS = state.synthesisElapsedMS {
+                result["synthesis_elapsed_ms"] = synthesisElapsedMS
+            }
+            if let audioDurationMS = state.audioDurationMS {
+                result["audio_duration_ms"] = audioDurationMS
+            }
+            if let error {
+                result["error"] = error
+            }
+            state.completion(result)
+        }
+        if Thread.isMainThread {
+            finish()
+        } else {
+            DispatchQueue.main.async(execute: finish)
+        }
+    }
+
+    func listSelectedVoices(
+        parentWindow: NSWindow,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        withNetworkAuthorization(
+            parentWindow: parentWindow,
+            completion: completion
+        ) { [weak self] in
+            self?.beginVoiceList(completion: completion)
+        }
+    }
+
+    func authorizeContinuousReading(
+        parentWindow: NSWindow,
+        completion: @escaping (Bool) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        withNetworkAuthorization(
+            parentWindow: parentWindow,
+            completion: { _, success in
+                if !success {
+                    completion(false)
+                }
+            }
+        ) {
+            completion(true)
+        }
+    }
+
+    private func authorizeIfNeeded(
+        text: String,
+        voice: String,
+        requestContext: ClickTTSGate0RequestContext,
+        parentWindow: NSWindow,
+        repairAttempted: Bool,
+        playbackFinished: ((Bool) -> Void)?,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        withNetworkAuthorization(
+            parentWindow: parentWindow,
+            completion: completion,
+            declined: {
+                playbackFinished?(false)
+            }
+        ) { [weak self] in
+            self?.beginOnlineGeneration(
+                text: text,
+                voice: voice,
+                requestContext: requestContext,
+                parentWindow: parentWindow,
+                repairAttempted: repairAttempted,
+                playbackFinished: playbackFinished,
+                completion: completion
+            )
+        }
+    }
+
+    private func withNetworkAuthorization(
+        parentWindow: NSWindow,
+        completion: @escaping (String, Bool) -> Void,
+        declined: (() -> Void)? = nil,
+        authorized: @escaping () -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        if disclosureAccepted {
+            authorized()
+            return
+        }
+        guard !isPrompting else {
+            completion("首次联网说明正在等待选择。", false)
+            declined?()
+            return
+        }
+        isPrompting = true
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Microsoft Edge 在线语音"
+        alert.informativeText = [
+            "这不是离线合成。Click 会通过第三方 edge-tts 客户端，把你主动朗读的文字发送给 Microsoft 在线语音服务。",
+            "正式连续朗读会逐段预生成未来 60–90 分钟内容；如果持续听完整本书，实际全文可能最终被逐段发送。Microsoft 还会收到所选声音、源 IP 和必要的网络技术信息。",
+            "Click 不发送 EPUB 文件、笔记、标红或 Click 身份资料；生成的音频保存在本机私有缓存。当前部署不使用 Click 的 Azure subscription key，但不承诺永久免费、无限额或服务长期不变。",
+            "选择“取消”不会启动语音 helper，也不会发送这段文字。",
+        ].joined(separator: "\n\n")
+        alert.addButton(withTitle: "同意并继续")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: parentWindow) { [weak self] response in
+            guard let self else { return }
+            self.isPrompting = false
+            guard response == .alertFirstButtonReturn else {
+                completion("已取消；未启动语音 helper，也未发送正文。", false)
+                declined?()
+                return
+            }
+            UserDefaults.standard.set(
+                [
+                    "revision": ClickTTSGate0Contract.disclosureRevision,
+                    "accepted": true,
+                    "accepted_at": ISO8601DateFormatter().string(from: Date()),
+                ],
+                forKey: ClickTTSGate0Contract.disclosureDefaultsKey
+            )
+            authorized()
+        }
+    }
+
+    private func beginOnlineGeneration(
+        text: String,
+        voice: String,
+        requestContext: ClickTTSGate0RequestContext,
+        parentWindow: NSWindow,
+        repairAttempted: Bool,
+        playbackFinished: ((Bool) -> Void)?,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        if let message = Self.thermalBlockMessage() {
+            completion(message, false)
+            playbackFinished?(false)
+            return
+        }
+        if let message = breakerMessage() {
+            completion(message, false)
+            playbackFinished?(false)
+            return
+        }
+        beginOperation(
+            operation: .synthesize,
+            text: text,
+            voice: voice,
+            requestContext: requestContext,
+            parentWindow: parentWindow,
+            repairAttempted: repairAttempted,
+            playbackFinished: playbackFinished,
+            completion: completion
+        )
+    }
+
+    private func beginVoiceList(
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        if let message = Self.thermalBlockMessage() {
+            completion(message, false)
+            return
+        }
+        beginOperation(
+            operation: .listVoices,
+            text: nil,
+            voice: nil,
+            requestContext: nil,
+            parentWindow: nil,
+            repairAttempted: false,
+            playbackFinished: nil,
+            completion: completion
+        )
+    }
+
+    private func beginOperation(
+        operation: Operation,
+        text: String?,
+        voice: String?,
+        requestContext: ClickTTSGate0RequestContext?,
+        parentWindow: NSWindow?,
+        repairAttempted: Bool,
+        playbackFinished: ((Bool) -> Void)?,
+        completion: @escaping (String, Bool) -> Void
+    ) {
+        let clientStartedUptime: TimeInterval?
+        if operation == .synthesize,
+           let gate2ANRunState,
+           gate2ANRunState.canProceed {
+            clientStartedUptime = gate2ANRunState.intentStartedUptime
+        } else {
+            clientStartedUptime = operation == .synthesize
+                ? ProcessInfo.processInfo.systemUptime
+                : nil
+        }
+        let token = UUID()
+        guard beginCancellationSession(token: token) else {
+            completion("已有一个语音生成任务正在运行。", false)
+            playbackFinished?(false)
+            return
+        }
+        let requestID = operation == .listVoices
+            ? "voices-\(token.uuidString.lowercased())"
+            : "gate0-\(token.uuidString.lowercased())"
+        worker.async { [weak self] in
+            guard let self else { return }
+            guard self.activeToken == nil else {
+                self.endCancellationSession(token: token)
+                DispatchQueue.main.async {
+                    completion("已有一个语音生成任务正在运行。", false)
+                    playbackFinished?(false)
+                }
+                return
+            }
+            self.activeToken = token
+            self.activeRequestID = requestID
+            self.activeOperation = operation
+            self.activeText = text
+            self.activeVoice = voice
+            self.activeRequestContext = requestContext
+            self.activeParentWindow = parentWindow
+            self.activeClientStartedUptime = clientStartedUptime
+            self.activeRepairAttempted = repairAttempted
+            self.activePlaybackFinished = playbackFinished
+            self.completion = completion
+            self.finalResult = nil
+            self.finalErrorMessage = nil
+            self.startThermalMonitor(token: token)
+            DispatchQueue.main.async {
+                completion("正在校验 Click 私有语音运行时…", false)
+            }
+            do {
+                let runtime = try ClickTTSGate0RuntimeVerifier.locateAndVerify {
+                    if self.isCancellationRequested(token: token) {
+                        throw NSError(
+                            domain: "Click.EdgeTTS.Operation",
+                            code: 1,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: "在线语音生成已取消",
+                            ]
+                        )
+                    }
+                    if let message = Self.thermalBlockMessage() {
+                        throw NSError(
+                            domain: "Click.EdgeTTS.Operation",
+                            code: 2,
+                            userInfo: [NSLocalizedDescriptionKey: message]
+                        )
+                    }
+                }
+                guard self.activeToken == token,
+                      !self.isCancellationRequested(token: token)
+                else {
+                    self.finish(
+                        token: token,
+                        message: "在线语音生成已取消",
+                        success: false
+                    )
+                    return
+                }
+                try self.launchHelper(runtime: runtime, token: token)
+            } catch {
+                let failure = error as NSError
+                let message = failure.domain == "Click.EdgeTTS.Operation"
+                    ? failure.localizedDescription
+                    : "在线语音运行时不可用：\(failure.localizedDescription)"
+                self.finish(
+                    token: token,
+                    message: message,
+                    success: false
+                )
+            }
+        }
+    }
+
+    private func launchHelper(
+        runtime: ClickTTSGate0RuntimeLocation,
+        token: UUID
+    ) throws {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = runtime.python
+        process.arguments = [runtime.helper.path]
+        process.currentDirectoryURL = runtime.root
+        let environment = [
+            "HOME": NSHomeDirectory(),
+            "TMPDIR": NSTemporaryDirectory(),
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+            "CLICK_TTS_NETWORK_MODE": "direct-no-proxy",
+        ]
+        process.environment = environment
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errors
+        stdoutBuffer.removeAll(keepingCapacity: true)
+        stdoutPipe = output
+        stderrPipe = errors
+        stdinPipe = input
+        self.process = process
+
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            self?.worker.async {
+                self?.consumeStdout(data, token: token)
+            }
+        }
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
+        process.terminationHandler = { [weak self] terminated in
+            self?.worker.async {
+                self?.handleTermination(
+                    token: token,
+                    status: terminated.terminationStatus
+                )
+            }
+        }
+        try process.run()
+        updateOwnedProcess(token: token, pid: process.processIdentifier)
+        if isCancellationRequested(token: token) {
+            finalErrorMessage = "在线语音生成已取消"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        scheduleTimeout(token: token, seconds: 12, message: "语音 helper 启动超时")
+        DispatchQueue.main.async { [weak self] in
+            self?.completion?("Click 私有语音 helper 已启动，正在等待完整性握手…", false)
+        }
+    }
+
+    private func scheduleTimeout(
+        token: UUID,
+        seconds: TimeInterval,
+        message: String,
+        countsTowardBreaker: Bool = false
+    ) {
+        timeoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.activeToken == token else { return }
+            if countsTowardBreaker, self.activeOperation == .synthesize {
+                self.recordTransientFailure()
+            }
+            if countsTowardBreaker, let breaker = self.breakerMessage() {
+                self.finalErrorMessage = "\(message)；\(breaker)"
+            } else {
+                self.finalErrorMessage = message
+            }
+            self.terminateOwnedHelper(forceAfter: 1.5)
+        }
+        timeoutWorkItem = item
+        worker.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    private func consumeStdout(_ data: Data, token: UUID) {
+        guard activeToken == token else {
+            return
+        }
+        stdoutBuffer.append(data)
+        guard stdoutBuffer.count <= 1024 * 1024 else {
+            finalErrorMessage = "语音 helper 输出超过协议上限"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        while let newline = stdoutBuffer.firstIndex(of: 0x0A) {
+            let line = stdoutBuffer.prefix(upTo: newline)
+            stdoutBuffer.removeSubrange(...newline)
+            guard !line.isEmpty,
+                  line.count <= 256 * 1024,
+                  let object = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
+            else {
+                finalErrorMessage = "语音 helper 返回了无效协议"
+                terminateOwnedHelper(forceAfter: 1)
+                return
+            }
+            handleMessage(object, token: token)
+        }
+    }
+
+    private func handleMessage(_ message: [String: Any], token: UUID) {
+        guard activeToken == token else {
+            return
+        }
+        if message["type"] as? String == "ready" {
+            handleReady(message, token: token)
+            return
+        }
+        guard message["type"] as? String == "result",
+              let op = message["op"] as? String
+        else {
+            finalErrorMessage = "语音 helper 协议类型不匹配"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        if op == "startup" {
+            let error = message["error"] as? [String: Any]
+            let category = error?["category"] as? String ?? "unknown"
+            finalErrorMessage = category == "busy"
+                ? "已有另一个 Click 在线语音任务正在运行"
+                : "语音 helper 启动失败（\(category)）"
+            return
+        }
+        if op == "shutdown" {
+            return
+        }
+        guard op == activeOperation?.rawValue,
+              message["id"] as? String == activeRequestID
+        else {
+            return
+        }
+        if message["status"] as? String == "ok" {
+            if activeOperation == .synthesize {
+                resetBreaker()
+            }
+            finalResult = message
+            sendShutdown()
+            scheduleTimeout(token: token, seconds: 2, message: "语音 helper 完成后没有退出")
+        } else {
+            let error = message["error"] as? [String: Any]
+            let category = error?["category"] as? String ?? "unknown"
+            if category == "canceled", finalErrorMessage != nil {
+                sendShutdown()
+                scheduleTimeout(
+                    token: token,
+                    seconds: 2,
+                    message: finalErrorMessage ?? "在线语音生成已取消"
+                )
+                return
+            }
+            let retryAfterMS = Self.nonnegativeNumber(error?["retry_after_ms"])
+                ?? Self.nonnegativeNumber(message["retry_after_ms"])
+            if category == "circuit_open" {
+                openBreaker(retryAfterMS: retryAfterMS)
+            } else if [
+                "network_unavailable",
+                "timeout",
+                "rate_limited",
+                "service_unavailable",
+                "protocol_error",
+                "internal_error",
+            ].contains(category) {
+                recordTransientFailure(retryAfterMS: retryAfterMS)
+            }
+            let baseReadable: String
+            switch category {
+            case "network_unavailable", "timeout":
+                baseReadable = "未缓存内容需要联网"
+            case "rate_limited":
+                baseReadable = "Microsoft 在线语音暂时限流"
+            case "service_unavailable":
+                baseReadable = "Microsoft 在线语音暂时不可用"
+            case "protocol_error":
+                baseReadable = "Microsoft 在线语音返回异常，Click 已停止继续重试"
+            case "empty_audio", "invalid_boundary":
+                baseReadable = "Microsoft 在线语音没有返回可安全播放的完整音频"
+            case "runtime_version_mismatch":
+                baseReadable = "Click 私有语音运行时版本不匹配"
+            case "internal_error":
+                baseReadable = "Click 在线语音内部失败，已安全退出 helper"
+            case "invalid_voice_or_request":
+                baseReadable = "当前在线声音不可用"
+            case "disclosure_required":
+                baseReadable = "需要重新确认在线语音说明"
+            case "canceled":
+                baseReadable = "在线语音生成已取消"
+            case "circuit_open":
+                baseReadable = breakerMessage()
+                    ?? "Microsoft 在线语音连续失败，Click 已暂停新请求 5 分钟"
+            default:
+                baseReadable = "在线语音生成失败（\(category)）"
+            }
+            let pauseCategories = [
+                "network_unavailable",
+                "timeout",
+                "rate_limited",
+                "service_unavailable",
+            ]
+            let readable: String
+            if let retryAfterMS,
+               retryAfterMS > 0,
+               pauseCategories.contains(category) {
+                let minutes = max(1, Int(ceil(retryAfterMS / 60_000)))
+                readable = "\(baseReadable)；Click 已暂停在线重试约\(minutes)分钟；已有缓存不受影响"
+            } else {
+                readable = baseReadable
+            }
+            var metrics = ClickTTSGate0GenerationMetrics(result: message)
+                .summary(
+                    actualAudioDuration: nil,
+                    clientEndToEndElapsedMS: nil
+                )
+            if activeOperation == .listVoices,
+               let elapsed = Self.nonnegativeNumber(message["list_elapsed_ms"]) {
+                let listTiming = String(
+                    format: "核验 %.2fs",
+                    elapsed / 1_000
+                )
+                metrics = metrics.isEmpty
+                    ? listTiming
+                    : "\(metrics) · \(listTiming)"
+            }
+            finalErrorMessage = metrics.isEmpty
+                ? readable
+                : "\(readable) · \(metrics)"
+            sendShutdown()
+            scheduleTimeout(
+                token: token,
+                seconds: 2,
+                message: finalErrorMessage ?? readable
+            )
+        }
+    }
+
+    private func handleReady(_ message: [String: Any], token: UUID) {
+        guard let process,
+              process.isRunning,
+              (message["protocol_version"] as? NSNumber)?.intValue == 1,
+              message["helper_version"] as? String == "0.1.0",
+              message["edge_tts_version"] as? String == ClickTTSGate0Contract.expectedEdgeTTSVersion,
+              message["runtime_version_ok"] as? Bool == true,
+              message["disclosure_revision"] as? String == ClickTTSGate0Contract.disclosureRevision,
+              message["cache_namespace"] as? String == ClickTTSGate0Contract.cacheNamespace,
+              let network = message["network"] as? [String: Any],
+              network["hostname"] as? String == "speech.platform.bing.com",
+              network["protocol"] as? String == "wss",
+              (network["port"] as? NSNumber)?.intValue == 443,
+              network["proxy_mode"] as? String == "direct-no-proxy",
+              network["tls_verification"] as? Bool == true,
+              let pid = (message["pid"] as? NSNumber)?.int32Value,
+              let ppid = (message["ppid"] as? NSNumber)?.int32Value,
+              let pgid = (message["pgid"] as? NSNumber)?.int32Value,
+              pid == process.processIdentifier,
+              ppid == getpid(),
+              pgid == pid,
+              getpgid(pid) == pid,
+              let requestID = activeRequestID,
+              let operation = activeOperation
+        else {
+            finalErrorMessage = "语音 helper 进程归属握手失败"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        if let capabilities = message["capabilities"] as? [String: Any] {
+            let operations = capabilities["operations"] as? [String] ?? []
+            let breaker = capabilities["circuit_breaker"] as? [String: Any] ?? [:]
+            guard operations.contains(operation.rawValue),
+                  (capabilities["max_provider_attempts"] as? NSNumber)?.intValue == 3,
+                  (breaker["failure_threshold"] as? NSNumber)?.intValue == 3,
+                  (breaker["open_seconds"] as? NSNumber)?.intValue == 300
+            else {
+                finalErrorMessage = "语音 helper 能力声明与 Click Gate 0 合同不一致"
+                terminateOwnedHelper(forceAfter: 1)
+                return
+            }
+        } else if operation != .synthesize {
+            finalErrorMessage = "当前语音 helper 不支持实时声音核验"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        activeHelperPGID = pid
+        updateOwnedProcess(token: token, pid: pid, pgid: pid)
+        if let gate2ANRunState,
+           gate2ANRunState.canProceed {
+            emitGate2ANEvent(
+                gate2ANRunState,
+                [
+                    "event": "helper_ready",
+                    "elapsed_ms": max(
+                        0,
+                        (ProcessInfo.processInfo.systemUptime
+                            - gate2ANRunState.intentStartedUptime) * 1_000
+                    ),
+                    "helper_pid": Int(pid),
+                    "helper_pgid": Int(pgid),
+                ]
+            )
+        }
+        guard !isCancellationRequested(token: token) else {
+            finalErrorMessage = "在线语音生成已取消"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        if let thermalMessage = Self.thermalBlockMessage() {
+            finalErrorMessage = thermalMessage
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        timeoutWorkItem?.cancel()
+        if let gate2ANRunState,
+           gate2ANRunState.canProceed,
+           gate2ANRunState.holdHelperAfterReadyForTimeoutExercise {
+            emitGate2ANEvent(
+                gate2ANRunState,
+                [
+                    "event": "timeout_exercise_helper_held",
+                    "elapsed_ms": max(
+                        0,
+                        (ProcessInfo.processInfo.systemUptime
+                            - gate2ANRunState.intentStartedUptime) * 1_000
+                    ),
+                    "submitted_text": false,
+                ]
+            )
+            return
+        }
+        let request: [String: Any]
+        switch operation {
+        case .listVoices:
+            request = [
+                "type": "request",
+                "id": requestID,
+                "op": Operation.listVoices.rawValue,
+            ]
+        case .synthesize:
+            guard let text = activeText,
+                  let voice = activeVoice,
+                  let requestContext = activeRequestContext
+            else {
+                finalErrorMessage = "Click 缺少 Gate 0 诊断片段定位"
+                terminateOwnedHelper(forceAfter: 1)
+                return
+            }
+            request = [
+                "type": "request",
+                "id": requestID,
+                "op": Operation.synthesize.rawValue,
+                "text": text,
+                "voice": voice,
+                "cache_context": requestContext.cacheContext,
+                "synthesis": ClickTTSGate0Contract.synthesis,
+                "disclosure": [
+                    "revision": ClickTTSGate0Contract.disclosureRevision,
+                    "authorized": true,
+                ],
+            ]
+        }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: request,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ) else {
+            finalErrorMessage = "无法编码私有语音请求"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        if let thermalMessage = Self.thermalBlockMessage() {
+            finalErrorMessage = thermalMessage
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        do {
+            try stdinPipe?.fileHandleForWriting.write(contentsOf: data + Data([0x0A]))
+        } catch {
+            finalErrorMessage = "无法写入私有语音 IPC"
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        let timeout: TimeInterval = 65
+        let timeoutMessage = operation == .listVoices
+            ? "Microsoft 在线声音核验超时"
+            : "Microsoft 在线语音生成超时"
+        scheduleTimeout(
+            token: token,
+            seconds: timeout,
+            message: timeoutMessage,
+            countsTowardBreaker: operation == .synthesize
+        )
+        DispatchQueue.main.async { [weak self] in
+            let message = operation == .listVoices
+                ? "正在实时核验精选男声和女声；不会发送正文…"
+                : "正在生成测试语音；正文只通过私有 stdin 传递…"
+            self?.completion?(message, false)
+        }
+    }
+
+    private func sendShutdown() {
+        let request: [String: Any] = [
+            "type": "request",
+            "id": "shutdown-\(UUID().uuidString.lowercased())",
+            "op": "shutdown",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]) else {
+            terminateOwnedHelper(forceAfter: 1)
+            return
+        }
+        try? stdinPipe?.fileHandleForWriting.write(contentsOf: data + Data([0x0A]))
+    }
+
+    private func handleTermination(token: UUID, status: Int32) {
+        guard activeToken == token else {
+            return
+        }
+        timeoutWorkItem?.cancel()
+        forceKillWorkItem?.cancel()
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        let helperPID = process?.processIdentifier ?? 0
+        if let gate2ANRunState,
+           gate2ANRunState.canProceed,
+           helperPID > 0 {
+            emitGate2ANEvent(
+                gate2ANRunState,
+                [
+                    "event": "helper_terminated",
+                    "elapsed_ms": max(
+                        0,
+                        (ProcessInfo.processInfo.systemUptime
+                            - gate2ANRunState.intentStartedUptime) * 1_000
+                    ),
+                    "helper_pid": Int(helperPID),
+                    "exit_status": Int(status),
+                ]
+            )
+        }
+        if helperPID > 0 {
+            ClickTTSGate0Cache.cleanupPartials(ownedBy: helperPID)
+        }
+        if let gate2ANState = gate2ANRunState,
+           gate2ANState.timedOut,
+           let text = activeText,
+           let voice = activeVoice,
+           let requestContext = activeRequestContext,
+           gate2ANState.fixtureID == requestContext.fixtureID,
+           let cached = ClickTTSGate0Cache.load(
+               text: text,
+               voice: voice,
+               cacheContext: requestContext.cacheContext
+           ) {
+            let metrics = finalResult.map {
+                ClickTTSGate0GenerationMetrics(result: $0)
+            } ?? cached.generationMetrics
+            let source = finalResult?["source"] as? String
+                ?? cached.source
+            let recorded = gate2ANState.recordGeneratedArtifact(
+                cached,
+                source: source,
+                metrics: metrics
+            )
+            clearProcessState(keepingCompletion: false)
+            if !recorded, !gate2ANState.canProceed {
+                _ = ClickTTSGate0Cache.evict(cached)
+                return
+            }
+            DispatchQueue.main.async { [weak self, gate2ANState] in
+                guard let self else { return }
+                self.finishGate2ANAfterOptionalEviction(
+                    gate2ANState,
+                    ok: false,
+                    status: "timed_out",
+                    error: "在线语音响应较慢，请重试",
+                    artifactRequired: false
+                )
+            }
+            return
+        }
+        if let finalResult,
+           status == 0,
+           activeOperation == .listVoices {
+            let message = voiceListSummary(finalResult)
+            if message.success {
+                resetBreaker()
+            }
+            let callback = completion
+            clearProcessState(keepingCompletion: false)
+            DispatchQueue.main.async {
+                callback?(message.text, message.success)
+            }
+            return
+        }
+        if let finalResult,
+           status == 0,
+           let text = activeText,
+           let voice = activeVoice,
+           let requestContext = activeRequestContext,
+           let parentWindow = activeParentWindow,
+           let cached = ClickTTSGate0Cache.load(
+               text: text,
+               voice: voice,
+               cacheContext: requestContext.cacheContext
+           ),
+           finalResult["cache_key"] as? String == cached.cacheKey,
+           finalResult["fixture_id"] as? String == requestContext.fixtureID,
+           finalResult["chapter_locator"] as? String == requestContext.chapterLocator,
+           finalResult["locator_range"] as? String == requestContext.locatorRange
+        {
+            let repairAttempted = activeRepairAttempted
+            let playbackFinished = activePlaybackFinished
+            let callback = completion
+            let source = finalResult["source"] as? String
+            let metrics = source == "online"
+                ? ClickTTSGate0GenerationMetrics(result: finalResult)
+                : cached.generationMetrics
+            let clientStartedUptime = source == "online"
+                ? activeClientStartedUptime
+                : nil
+            let gate2ANState = gate2ANRunState.flatMap { state in
+                state.fixtureID == requestContext.fixtureID ? state : nil
+            }
+            if let gate2ANState,
+               !gate2ANState.recordGeneratedArtifact(
+                   cached,
+                   source: source ?? "",
+                   metrics: metrics
+               ) {
+                clearProcessState(keepingCompletion: false)
+                if !gate2ANState.canProceed {
+                    _ = ClickTTSGate0Cache.evict(cached)
+                }
+                return
+            }
+            let playbackMessage = source == "online"
+                ? "真实 Edge 在线语音已生成并缓存；helper 已退出，正在本地播放。"
+                : "helper 命中 Click 本地缓存；helper 已退出，正在本地播放。"
+            clearProcessState(keepingCompletion: true)
+            DispatchQueue.main.async { [weak self, gate2ANState] in
+                guard let self else { return }
+                if let gate2ANState {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    guard self.gate2ANRunState === gate2ANState,
+                          gate2ANState.canProceed,
+                          !gate2ANState.timedOut,
+                          now <= gate2ANState.deadlineUptime
+                    else {
+                        if gate2ANState.canProceed {
+                            if gate2ANState.markTimedOut() {
+                                self.emitGate2ANTimeoutEvent(gate2ANState)
+                            }
+                            self.finishGate2ANAfterOptionalEviction(
+                                gate2ANState,
+                                ok: false,
+                                status: "timed_out",
+                                error: "在线语音响应较慢，请重试",
+                                artifactRequired: false
+                            )
+                        }
+                        return
+                    }
+                }
+                self.play(
+                    cached,
+                    text: text,
+                    voice: voice,
+                    requestContext: requestContext,
+                    parentWindow: parentWindow,
+                    repairAttempted: repairAttempted,
+                    metrics: metrics,
+                    clientStartedUptime: clientStartedUptime,
+                    source: source ?? "",
+                    message: playbackMessage,
+                    completion: callback,
+                    playbackFinished: playbackFinished
+                )
+                self.completion = nil
+            }
+            return
+        }
+        let message = finalErrorMessage
+            ?? (status == 0 ? "语音 helper 未返回有效音频" : "语音 helper 异常退出（\(status)）")
+        finish(token: token, message: message, success: false)
+    }
+
+    private func clearProcessState(keepingCompletion: Bool) {
+        let finishedToken = activeToken
+        timeoutWorkItem?.cancel()
+        forceKillWorkItem?.cancel()
+        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        stdoutPipe = nil
+        stderrPipe = nil
+        process = nil
+        stdoutBuffer.removeAll(keepingCapacity: false)
+        activeToken = nil
+        activeRequestID = nil
+        activeOperation = nil
+        activeText = nil
+        activeVoice = nil
+        activeRequestContext = nil
+        activeParentWindow = nil
+        activeClientStartedUptime = nil
+        activeRepairAttempted = false
+        activePlaybackFinished = nil
+        activeHelperPGID = nil
+        finalResult = nil
+        finalErrorMessage = nil
+        timeoutWorkItem = nil
+        forceKillWorkItem = nil
+        thermalMonitor?.cancel()
+        thermalMonitor = nil
+        if !keepingCompletion {
+            completion = nil
+        }
+        if let finishedToken {
+            endCancellationSession(token: finishedToken)
+        }
+    }
+
+    private func finish(token: UUID, message: String, success: Bool) {
+        guard activeToken == token else {
+            return
+        }
+        let callback = completion
+        let playbackFinished = activePlaybackFinished
+        clearProcessState(keepingCompletion: false)
+        DispatchQueue.main.async {
+            callback?(message, success)
+            if !success {
+                playbackFinished?(false)
+            }
+        }
+    }
+
+    private func voiceListSummary(
+        _ result: [String: Any]
+    ) -> (text: String, success: Bool) {
+        let rows = result["voices"] as? [[String: Any]] ?? []
+        var byID: [String: Bool] = [:]
+        for row in rows {
+            guard let voiceID = row["voice_id"] as? String,
+                  let available = row["available"] as? Bool,
+                  byID[voiceID] == nil
+            else {
+                continue
+            }
+            byID[voiceID] = available
+        }
+        let male = byID["zh-CN-YunjianNeural"]
+        let female = byID["zh-CN-XiaoxiaoNeural"]
+        guard let male, let female else {
+            return ("在线声音核验返回不完整：没有同时确认云健和晓晓。", false)
+        }
+        let attemptNumber = Self.nonnegativeNumber(result["attempt_count"])
+        let attempt = attemptNumber.flatMap {
+            $0.rounded(.towardZero) == $0 && $0 <= 3
+                ? Int($0)
+                : nil
+        }
+        let elapsed = Self.nonnegativeNumber(result["list_elapsed_ms"])
+        var details = [
+            "云健（男声）\(male ? "可用" : "不可用")",
+            "晓晓（女声）\(female ? "可用" : "不可用")",
+        ]
+        if let attempt {
+            details.append("尝试 \(attempt) 次")
+        }
+        if let elapsed {
+            details.append(String(format: "核验 %.2fs", elapsed / 1_000))
+        }
+        return (
+            "实时声音核验完成：\(details.joined(separator: " · "))",
+            male && female
+        )
+    }
+
+    private func play(
+        _ artifact: ClickTTSGate0CachedArtifact,
+        text: String,
+        voice: String,
+        requestContext: ClickTTSGate0RequestContext,
+        parentWindow: NSWindow,
+        repairAttempted: Bool,
+        metrics: ClickTTSGate0GenerationMetrics,
+        clientStartedUptime: TimeInterval?,
+        source: String,
+        message: String,
+        completion: ((String, Bool) -> Void)?,
+        playbackFinished: ((Bool) -> Void)?
+    ) {
+        precondition(Thread.isMainThread)
+        if let gate2ANRunState,
+           gate2ANRunState.fixtureID == requestContext.fixtureID {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard gate2ANRunState.canProceed,
+                  !gate2ANRunState.timedOut,
+                  now <= gate2ANRunState.deadlineUptime
+            else {
+                if gate2ANRunState.canProceed {
+                    if gate2ANRunState.markTimedOut() {
+                        emitGate2ANTimeoutEvent(gate2ANRunState)
+                    }
+                    finishGate2ANAfterOptionalEviction(
+                        gate2ANRunState,
+                        ok: false,
+                        status: "timed_out",
+                        error: "在线语音响应较慢，请重试",
+                        artifactRequired: false
+                    )
+                }
+                return
+            }
+        }
+        let session = PlaybackSession(
+            artifact: artifact,
+            text: text,
+            voice: voice,
+            requestContext: requestContext,
+            parentWindow: parentWindow,
+            repairAttempted: repairAttempted,
+            completion: completion,
+            playbackFinished: playbackFinished
+        )
+        do {
+            let player = try AVAudioPlayer(contentsOf: artifact.audioURL)
+            player.delegate = self
+            if let gate2ANRunState,
+               gate2ANRunState.canProceed,
+               gate2ANRunState.fixtureID == requestContext.fixtureID {
+                player.volume = gate2ANRunState.mutePlayback ? 0 : 1
+            }
+            guard player.duration.isFinite,
+                  player.duration > 0,
+                  player.prepareToPlay()
+            else {
+                handlePlaybackFailure(
+                    session,
+                    detail: "缓存音频无法解码或启动播放"
+                )
+                return
+            }
+            if let gate2ANRunState,
+               gate2ANRunState.fixtureID == requestContext.fixtureID {
+                let now = ProcessInfo.processInfo.systemUptime
+                guard gate2ANRunState.canProceed,
+                      !gate2ANRunState.timedOut,
+                      now <= gate2ANRunState.deadlineUptime
+                else {
+                    if gate2ANRunState.canProceed {
+                        if gate2ANRunState.markTimedOut() {
+                            emitGate2ANTimeoutEvent(gate2ANRunState)
+                        }
+                        finishGate2ANAfterOptionalEviction(
+                            gate2ANRunState,
+                            ok: false,
+                            status: "timed_out",
+                            error: "在线语音响应较慢，请重试",
+                            artifactRequired: false
+                        )
+                    }
+                    return
+                }
+            }
+            guard player.play() else {
+                handlePlaybackFailure(
+                    session,
+                    detail: "缓存音频无法解码或启动播放"
+                )
+                return
+            }
+            audioPlayer = player
+            playbackSession = session
+            if let gate2ANRunState,
+               gate2ANRunState.canProceed,
+               gate2ANRunState.fixtureID == requestContext.fixtureID {
+                scheduleGate2ANFirstSoundPoll(
+                    gate2ANRunState,
+                    player: player,
+                    session: session
+                )
+            }
+            let clientEndToEndElapsedMS = clientStartedUptime.map {
+                max(
+                    0,
+                    (ProcessInfo.processInfo.systemUptime - $0) * 1_000
+                )
+            }
+            let metricSummary = metrics.summary(
+                actualAudioDuration: player.duration,
+                clientEndToEndElapsedMS: clientEndToEndElapsedMS
+            )
+            var details = [
+                "\(requestContext.chapterLocator) [\(requestContext.locatorRange)]",
+                "\(artifact.boundaryCount) 个边界",
+            ]
+            if !metricSummary.isEmpty {
+                details.append(metricSummary)
+            }
+            details.append(String(artifact.cacheKey.prefix(12)))
+            completion?("\(message) · \(details.joined(separator: " · "))", true)
+        } catch {
+            handlePlaybackFailure(
+                session,
+                detail: "缓存音频无法解码：\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func scheduleGate2ANFirstSoundPoll(
+        _ state: Gate2ANRunState,
+        player: AVAudioPlayer,
+        session: PlaybackSession
+    ) {
+        precondition(Thread.isMainThread)
+        state.firstSoundPollWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self, weak state, weak player] in
+            guard let self,
+                  let state,
+                  let player,
+                  state.canProceed,
+                  player === self.audioPlayer,
+                  !state.firstSoundObserved
+            else {
+                return
+            }
+            let now = ProcessInfo.processInfo.systemUptime
+            if player.isPlaying, player.currentTime > 0.01 {
+                let elapsedMS = max(
+                    0,
+                    (now - state.intentStartedUptime) * 1_000
+                )
+                guard elapsedMS <= 12_000 else {
+                    if state.markTimedOut() {
+                        self.emitGate2ANTimeoutEvent(state)
+                    }
+                    state.deadlineWorkItem?.cancel()
+                    player.stop()
+                    self.audioPlayer = nil
+                    self.playbackSession = nil
+                    self.finishGate2ANAfterOptionalEviction(
+                        state,
+                        ok: false,
+                        status: "timed_out",
+                        error: "在线语音响应较慢，请重试",
+                        artifactRequired: false
+                    )
+                    return
+                }
+                guard state.source == state.expectedSource else {
+                    state.deadlineWorkItem?.cancel()
+                    player.stop()
+                    self.audioPlayer = nil
+                    self.playbackSession = nil
+                    self.finishGate2ANAfterOptionalEviction(
+                        state,
+                        ok: false,
+                        status: "source_mismatch",
+                        error: "Gate 2A-N 首声来源与本轮预期不一致",
+                        artifactRequired: true
+                    )
+                    return
+                }
+                state.deadlineWorkItem?.cancel()
+                state.firstSoundObserved = true
+                var payload: [String: Any] = [
+                    "event": "first_sound",
+                    "elapsed_ms": elapsedMS,
+                    "is_playing": true,
+                    "player_current_time_seconds": player.currentTime,
+                    "source": state.source,
+                    "cache_key": state.cacheKey,
+                ]
+                if let attemptCount = state.attemptCount {
+                    payload["attempt_count"] = attemptCount
+                }
+                emitGate2ANEvent(state, payload)
+                if state.stopAfterFirstSound {
+                    player.stop()
+                    self.audioPlayer = nil
+                    self.playbackSession = nil
+                    self.finishGate2ANAfterFirstSound(state)
+                }
+                return
+            }
+            let next = DispatchWorkItem { [weak self, weak state, weak player] in
+                guard let self, let state, let player else {
+                    return
+                }
+                self.scheduleGate2ANFirstSoundPoll(
+                    state,
+                    player: player,
+                    session: session
+                )
+            }
+            state.firstSoundPollWorkItem = next
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 0.005,
+                execute: next
+            )
+        }
+        state.firstSoundPollWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.005,
+            execute: item
+        )
+    }
+
+    private func handlePlaybackFailure(
+        _ session: PlaybackSession,
+        detail: String
+    ) {
+        precondition(Thread.isMainThread)
+        audioPlayer?.stop()
+        audioPlayer = nil
+        playbackSession = nil
+        let gate2ANActive = gate2ANRunState?.canProceed == true
+            && gate2ANRunState?.fixtureID
+                == session.requestContext.fixtureID
+        worker.async { [weak self] in
+            guard let self else { return }
+            let evicted = ClickTTSGate0Cache.evict(session.artifact)
+            let networkAvailable = self.disclosureAccepted
+                && Self.networkRouteAppearsAvailable()
+            DispatchQueue.main.async {
+                guard evicted else {
+                    session.completion?(
+                        "\(detail)；为避免误删其他缓存，Click 未能安全淘汰当前 key。",
+                        false
+                    )
+                    session.playbackFinished?(false)
+                    return
+                }
+                if gate2ANActive {
+                    session.completion?(
+                        "\(detail)；Gate 2A-N 已精确淘汰当前测试 cache key，不执行隐藏重建。",
+                        false
+                    )
+                    session.playbackFinished?(false)
+                    return
+                }
+                guard !session.repairAttempted else {
+                    session.completion?(
+                        "\(detail)；已只淘汰当前 cache key 三件套，单次重建仍不可播放，不再循环。",
+                        false
+                    )
+                    session.playbackFinished?(false)
+                    return
+                }
+                guard self.disclosureAccepted else {
+                    session.completion?(
+                        "\(detail)；已只淘汰当前 cache key 三件套。尚未同意联网，因此没有自动重建。",
+                        false
+                    )
+                    session.playbackFinished?(false)
+                    return
+                }
+                guard networkAvailable else {
+                    session.completion?(
+                        "\(detail)；已只淘汰当前 cache key 三件套。当前没有可用网络路由，未启动重建。",
+                        false
+                    )
+                    session.playbackFinished?(false)
+                    return
+                }
+                session.completion?(
+                    "\(detail)；已只淘汰当前 cache key 三件套，正在执行唯一一次在线重建。",
+                    false
+                )
+                self.beginOnlineGeneration(
+                    text: session.text,
+                    voice: session.voice,
+                    requestContext: session.requestContext,
+                    parentWindow: session.parentWindow,
+                    repairAttempted: true,
+                    playbackFinished: session.playbackFinished,
+                    completion: session.completion ?? { _, _ in }
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    func cancel() -> Bool {
+        let hadPlayback = audioPlayer != nil || playbackSession != nil
+        let playbackFinished = playbackSession?.playbackFinished
+        audioPlayer?.stop()
+        audioPlayer = nil
+        playbackSession = nil
+        playbackFinished?(false)
+        guard let session = requestCancellation() else {
+            return hadPlayback
+        }
+        signalOwnedProcess(session.snapshot, signal: SIGTERM)
+        scheduleCancellation(session)
+        return true
+    }
+
+    @discardableResult
+    func cancelAndWait(timeout: TimeInterval) -> Bool {
+        precondition(Thread.isMainThread)
+        let playbackFinished = playbackSession?.playbackFinished
+        audioPlayer?.stop()
+        audioPlayer = nil
+        playbackSession = nil
+        playbackFinished?(false)
+        guard let session = requestCancellation() else {
+            return true
+        }
+        signalOwnedProcess(session.snapshot, signal: SIGTERM)
+        scheduleCancellation(session)
+        let total = max(0, timeout)
+        let reapReserve = min(0.25, total / 4)
+        let waitResult = session.semaphore.wait(
+            timeout: .now() + max(0, total - reapReserve)
+        )
+        guard waitResult == .timedOut else {
+            return true
+        }
+        let latest = currentOwnedProcess(token: session.token)
+        signalOwnedProcess(latest, signal: SIGKILL)
+        return session.semaphore.wait(timeout: .now() + reapReserve)
+            == .success
+    }
+
+    private func scheduleCancellation(_ session: CancellationSession) {
+        worker.async { [weak self] in
+            guard let self, self.activeToken == session.token else {
+                return
+            }
+            self.finalErrorMessage = "在线语音生成已取消"
+            if let process = self.process {
+                if process.isRunning {
+                    self.terminateOwnedHelper(forceAfter: 1.5)
+                }
+                // Process exists but has already exited: its installed
+                // termination handler exclusively owns reaping and cache
+                // cleanup. Clearing here would race and suppress that handler.
+                return
+            }
+            self.finish(
+                token: session.token,
+                message: "在线语音生成已取消",
+                success: false
+            )
+        }
+    }
+
+    private func signalOwnedProcess(
+        _ snapshot: OwnedProcessSnapshot?,
+        signal: Int32
+    ) {
+        guard let snapshot, snapshot.pid > 1 else {
+            return
+        }
+        let livePGID = getpgid(snapshot.pid)
+        let ownedPGID = snapshot.pgid
+            ?? (livePGID == snapshot.pid ? livePGID : nil)
+        if let pgid = ownedPGID {
+            guard pgid == snapshot.pid,
+                  livePGID == pgid
+            else {
+                return
+            }
+            _ = kill(-pgid, signal)
+            return
+        }
+        _ = kill(snapshot.pid, signal)
+    }
+
+    private func terminateOwnedHelper(forceAfter seconds: TimeInterval) {
+        guard let process else {
+            if let token = activeToken {
+                finish(
+                    token: token,
+                    message: finalErrorMessage ?? "在线语音生成已取消",
+                    success: false
+                )
+            }
+            return
+        }
+        // A launched Process that is no longer running is still awaiting its
+        // termination handler on `worker`; that handler owns final artifact
+        // and partial cleanup, so do not clear state here.
+        guard process.isRunning else {
+            return
+        }
+        let snapshot = OwnedProcessSnapshot(
+            pid: process.processIdentifier,
+            pgid: activeHelperPGID
+        )
+        signalOwnedProcess(snapshot, signal: SIGTERM)
+        forceKillWorkItem?.cancel()
+        let expectedPID = process.processIdentifier
+        let expectedPGID = activeHelperPGID
+        let item = DispatchWorkItem { [weak process] in
+            guard let process, process.isRunning,
+                  process.processIdentifier == expectedPID
+            else {
+                return
+            }
+            self.signalOwnedProcess(
+                OwnedProcessSnapshot(pid: expectedPID, pgid: expectedPGID),
+                signal: SIGKILL
+            )
+        }
+        forceKillWorkItem = item
+        worker.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    func audioPlayerDecodeErrorDidOccur(
+        _ player: AVAudioPlayer,
+        error: Error?
+    ) {
+        guard player === audioPlayer,
+              let session = playbackSession
+        else {
+            return
+        }
+        handlePlaybackFailure(
+            session,
+            detail: "播放中检测到缓存音频解码失败"
+                + (error.map { "：\($0.localizedDescription)" } ?? "")
+        )
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === audioPlayer else {
+            return
+        }
+        let session = playbackSession
+        audioPlayer = nil
+        playbackSession = nil
+        if flag {
+            session?.playbackFinished?(true)
+        } else if let session {
+            handlePlaybackFailure(
+                session,
+                detail: "缓存音频未能完整播放"
+            )
+        }
+    }
+}
+
+private final class RuntimeEnvironmentWindowController: NSWindowController, NSWindowDelegate {
     private let loadPreflightReport: () -> [String: Any]?
     private let saveFunASRPaths: (String, String) -> Bool
     private let saveSpeechProvider: (SpeechTranscriptionProvider) -> Void
     private let openPath: (String) -> Void
+    private let ttsProbeController: ClickTTSGate0ProbeController
     private let summaryLabel = NSTextField(labelWithString: "等待检查")
     private let detailTextView = NSTextView()
     private let guideTextView = NSTextView()
     private let speechProviderPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let funASRPythonField = NSTextField(string: "")
     private let funASRWorkerField = NSTextField(string: "")
+    private let ttsVoicePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let ttsFixturePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let ttsTextField = NSTextField(
+        string: "你好，Click 正在验证 Microsoft Edge 在线语音。This is a mixed-language test."
+    )
+    private let ttsStatusLabel = NSTextField(
+        wrappingLabelWithString: "尚未运行。缓存命中时只做本地播放；未命中时先显示联网说明。"
+    )
     private var latestReportPath = ""
     private var latestMarkdownPath = ""
     private var latestRuntimeConfigPath = ""
     private var latestGuideText = ""
+    private var activeFixtureRunID: UUID?
+    private var fixtureSegmentSummaries: [String] = []
 
     init(
         funasrPython: String,
@@ -1388,27 +6776,39 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         loadPreflightReport: @escaping () -> [String: Any]?,
         saveFunASRPaths: @escaping (String, String) -> Bool,
         saveSpeechProvider: @escaping (SpeechTranscriptionProvider) -> Void,
-        openPath: @escaping (String) -> Void
+        openPath: @escaping (String) -> Void,
+        ttsProbeController: ClickTTSGate0ProbeController
     ) {
         self.loadPreflightReport = loadPreflightReport
         self.saveFunASRPaths = saveFunASRPaths
         self.saveSpeechProvider = saveSpeechProvider
         self.openPath = openPath
+        self.ttsProbeController = ttsProbeController
         funASRPythonField.stringValue = funasrPython
         funASRWorkerField.stringValue = funasrWorker
         speechProviderPopup.addItems(withTitles: [SpeechTranscriptionProvider.funASR.title, SpeechTranscriptionProvider.appleSpeech.title])
         speechProviderPopup.selectItem(withTitle: speechProvider.title)
+        ttsVoicePopup.addItems(
+            withTitles: [
+                "云健（男声）· zh-CN-YunjianNeural",
+                "晓晓（女声）· zh-CN-XiaoxiaoNeural",
+            ]
+        )
+        ttsFixturePopup.addItems(
+            withTitles: ClickTTSGate0Fixtures.choices.map(\.title)
+        )
 
         let window = NSWindow(
-            contentRect: NSRect(x: 140, y: 120, width: 820, height: 680),
+            contentRect: NSRect(x: 140, y: 80, width: 860, height: 790),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "运行环境"
         super.init(window: window)
+        window.delegate = self
         window.contentView = makeContentView()
-        refreshPreflight(nil)
+        detailTextView.string = "点击“重新检查”时才运行 Reader 环境预检；测试在线语音不会顺带启动它。"
     }
 
     required init?(coder: NSCoder) {
@@ -1433,6 +6833,93 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         let pythonRow = labeledRow(label: "FunASR Python", field: funASRPythonField)
         let workerRow = labeledRow(label: "FunASR Worker", field: funASRWorkerField)
         let providerRow = popupRow(label: "语音识别", popup: speechProviderPopup)
+        ttsTextField.placeholderString = "输入仅用于 Gate 0 的在线语音测试文字"
+        let ttsTextRow = labeledRow(label: "测试文字", field: ttsTextField)
+        let ttsVoiceRow = popupRow(
+            label: "在线声音",
+            popup: ttsVoicePopup,
+            popupWidth: 280
+        )
+        let ttsFixtureRow = popupRow(
+            label: "诊断片段",
+            popup: ttsFixturePopup,
+            popupWidth: 280
+        )
+        ttsStatusLabel.font = NSFont(name: "Microsoft YaHei", size: 11)
+            ?? NSFont.systemFont(ofSize: 11)
+        ttsStatusLabel.textColor = .secondaryLabelColor
+
+        let ttsTestButton = NSButton(
+            title: "测试 Microsoft 在线语音",
+            target: self,
+            action: #selector(runTTSGate0Probe(_:))
+        )
+        ttsTestButton.bezelStyle = .rounded
+        let ttsVoiceListButton = NSButton(
+            title: "实时核验男/女声",
+            target: self,
+            action: #selector(listTTSGate0Voices(_:))
+        )
+        ttsVoiceListButton.bezelStyle = .rounded
+        let ttsFixtureButton = NSButton(
+            title: "运行所选 fixture",
+            target: self,
+            action: #selector(runTTSGate0Fixture(_:))
+        )
+        ttsFixtureButton.bezelStyle = .rounded
+        let ttsCancelButton = NSButton(
+            title: "停止",
+            target: self,
+            action: #selector(cancelTTSGate0Probe(_:))
+        )
+        ttsCancelButton.bezelStyle = .rounded
+        let ttsRevokeButton = NSButton(
+            title: "撤回联网同意",
+            target: self,
+            action: #selector(revokeTTSDisclosure(_:))
+        )
+        ttsRevokeButton.bezelStyle = .rounded
+        let ttsButtons = NSStackView(
+            views: [
+                ttsTestButton,
+                ttsVoiceListButton,
+                ttsFixtureButton,
+                ttsCancelButton,
+                ttsRevokeButton,
+                NSView(),
+            ]
+        )
+        ttsButtons.orientation = .horizontal
+        ttsButtons.alignment = .centerY
+        ttsButtons.spacing = 8
+        let ttsTitle = NSTextField(
+            labelWithString: "Microsoft Edge 在线语音 · Gate 0"
+        )
+        ttsTitle.font = NSFont(name: "Microsoft YaHei", size: 13)
+            ?? NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let ttsStack = NSStackView(
+            views: [
+                ttsTitle,
+                ttsTextRow,
+                ttsVoiceRow,
+                ttsFixtureRow,
+                ttsButtons,
+                ttsStatusLabel,
+            ]
+        )
+        ttsStack.orientation = .vertical
+        ttsStack.alignment = .leading
+        ttsStack.spacing = 7
+        let ttsBox = NSBox()
+        ttsBox.boxType = .custom
+        ttsBox.borderColor = .separatorColor
+        ttsBox.borderWidth = 1
+        ttsBox.cornerRadius = 8
+        ttsBox.contentViewMargins = NSSize(width: 12, height: 10)
+        guard let ttsContentView = ttsBox.contentView else {
+            fatalError("NSBox did not create a content view")
+        }
+        ttsContentView.addSubview(ttsStack)
 
         detailTextView.isEditable = false
         detailTextView.isSelectable = true
@@ -1486,12 +6973,43 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         buttonStack.alignment = .centerY
         buttonStack.spacing = 10
 
-        let stack = NSStackView(views: [topStack, summaryLabel, providerRow, pythonRow, workerRow, detailScroll, guideTitle, guideScroll, buttonStack])
+        let stack = NSStackView(
+            views: [
+                topStack,
+                summaryLabel,
+                providerRow,
+                pythonRow,
+                workerRow,
+                ttsBox,
+                detailScroll,
+                guideTitle,
+                guideScroll,
+                buttonStack,
+            ]
+        )
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
 
-        [stack, topStack, summaryLabel, providerRow, pythonRow, workerRow, detailScroll, guideTitle, guideScroll, buttonStack].forEach {
+        [
+            stack,
+            topStack,
+            summaryLabel,
+            providerRow,
+            pythonRow,
+            workerRow,
+            ttsBox,
+            ttsStack,
+            ttsTextRow,
+            ttsVoiceRow,
+            ttsFixtureRow,
+            ttsButtons,
+            ttsStatusLabel,
+            detailScroll,
+            guideTitle,
+            guideScroll,
+            buttonStack,
+        ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
         root.addSubview(stack)
@@ -1506,11 +7024,21 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
             providerRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             pythonRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
             workerRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            ttsBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            ttsStack.topAnchor.constraint(equalTo: ttsContentView.topAnchor),
+            ttsStack.leadingAnchor.constraint(equalTo: ttsContentView.leadingAnchor),
+            ttsStack.trailingAnchor.constraint(equalTo: ttsContentView.trailingAnchor),
+            ttsStack.bottomAnchor.constraint(equalTo: ttsContentView.bottomAnchor),
+            ttsTextRow.widthAnchor.constraint(equalTo: ttsStack.widthAnchor),
+            ttsVoiceRow.widthAnchor.constraint(equalTo: ttsStack.widthAnchor),
+            ttsFixtureRow.widthAnchor.constraint(equalTo: ttsStack.widthAnchor),
+            ttsButtons.widthAnchor.constraint(equalTo: ttsStack.widthAnchor),
+            ttsStatusLabel.widthAnchor.constraint(equalTo: ttsStack.widthAnchor),
             detailScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 250),
+            detailScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 130),
             guideTitle.widthAnchor.constraint(equalTo: stack.widthAnchor),
             guideScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            guideScroll.heightAnchor.constraint(equalToConstant: 130),
+            guideScroll.heightAnchor.constraint(equalToConstant: 90),
             buttonStack.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
 
@@ -1534,7 +7062,11 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         return stack
     }
 
-    private func popupRow(label: String, popup: NSPopUpButton) -> NSStackView {
+    private func popupRow(
+        label: String,
+        popup: NSPopUpButton,
+        popupWidth: CGFloat = 120
+    ) -> NSStackView {
         let title = NSTextField(labelWithString: label)
         title.font = NSFont(name: "Microsoft YaHei", size: 12) ?? NSFont.systemFont(ofSize: 12, weight: .medium)
         title.textColor = .secondaryLabelColor
@@ -1546,7 +7078,7 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         popup.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             title.widthAnchor.constraint(equalToConstant: 116),
-            popup.widthAnchor.constraint(equalToConstant: 120),
+            popup.widthAnchor.constraint(equalToConstant: popupWidth),
             popup.heightAnchor.constraint(equalToConstant: 26),
         ])
         return stack
@@ -1619,8 +7151,162 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
         openPath(path)
     }
 
+    @objc private func runTTSGate0Probe(_ sender: Any?) {
+        let voice = selectedTTSVoice()
+        guard let window else {
+            ttsStatusLabel.stringValue = "运行环境窗口不可用。"
+            return
+        }
+        ttsStatusLabel.textColor = .secondaryLabelColor
+        ttsProbeController.run(
+            text: ttsTextField.stringValue,
+            voice: voice,
+            parentWindow: window
+        ) { [weak self] message, success in
+            self?.ttsStatusLabel.stringValue = message
+            self?.ttsStatusLabel.textColor = success ? .systemGreen : .secondaryLabelColor
+        }
+    }
+
+    private func selectedTTSVoice() -> String {
+        let selected = ttsVoicePopup.titleOfSelectedItem ?? ""
+        return selected.contains("Xiaoxiao")
+            ? "zh-CN-XiaoxiaoNeural"
+            : "zh-CN-YunjianNeural"
+    }
+
+    @objc private func listTTSGate0Voices(_ sender: Any?) {
+        guard let window else {
+            ttsStatusLabel.stringValue = "运行环境窗口不可用。"
+            return
+        }
+        ttsStatusLabel.textColor = .secondaryLabelColor
+        ttsProbeController.listSelectedVoices(parentWindow: window) {
+            [weak self] message, success in
+            self?.ttsStatusLabel.stringValue = message
+            self?.ttsStatusLabel.textColor = success
+                ? .systemGreen
+                : .secondaryLabelColor
+        }
+    }
+
+    @objc private func runTTSGate0Fixture(_ sender: Any?) {
+        guard let window else {
+            ttsStatusLabel.stringValue = "运行环境窗口不可用。"
+            return
+        }
+        let index = ttsFixturePopup.indexOfSelectedItem
+        guard ClickTTSGate0Fixtures.choices.indices.contains(index) else {
+            ttsStatusLabel.stringValue = "请选择一个固定诊断片段。"
+            return
+        }
+        let runID = UUID()
+        activeFixtureRunID = runID
+        fixtureSegmentSummaries.removeAll()
+        runFixtureSegment(
+            ClickTTSGate0Fixtures.choices[index],
+            index: 0,
+            runID: runID,
+            voice: selectedTTSVoice(),
+            parentWindow: window
+        )
+    }
+
+    private func runFixtureSegment(
+        _ fixture: ClickTTSGate0Fixture,
+        index: Int,
+        runID: UUID,
+        voice: String,
+        parentWindow: NSWindow
+    ) {
+        guard activeFixtureRunID == runID else {
+            return
+        }
+        guard fixture.segments.indices.contains(index) else {
+            activeFixtureRunID = nil
+            ttsStatusLabel.stringValue = (
+                "\(fixture.title) 已按顺序播放完成。\n"
+                + fixtureSegmentSummaries.joined(separator: "\n")
+            )
+            ttsStatusLabel.textColor = .systemGreen
+            return
+        }
+        let segment = fixture.segments[index]
+        ttsStatusLabel.stringValue = (
+            "\(fixture.title) · 正在准备 \(segment.title) "
+            + "[\(segment.chapterLocator) / \(segment.locatorRange)]"
+        )
+        ttsStatusLabel.textColor = .secondaryLabelColor
+        ttsProbeController.run(
+            text: segment.text,
+            voice: voice,
+            parentWindow: parentWindow,
+            fixtureID: segment.fixtureID,
+            chapterLocator: segment.chapterLocator,
+            locatorRange: segment.locatorRange,
+            playbackFinished: { [weak self] playbackSucceeded in
+                guard let self, self.activeFixtureRunID == runID else {
+                    return
+                }
+                guard playbackSucceeded else {
+                    self.activeFixtureRunID = nil
+                    return
+                }
+                self.runFixtureSegment(
+                    fixture,
+                    index: index + 1,
+                    runID: runID,
+                    voice: voice,
+                    parentWindow: parentWindow
+                )
+            }
+        ) { [weak self] message, success in
+            guard let self, self.activeFixtureRunID == runID else {
+                return
+            }
+            if success {
+                let summary = "\(segment.title)：\(message)"
+                if self.fixtureSegmentSummaries.count == index {
+                    self.fixtureSegmentSummaries.append(summary)
+                } else if self.fixtureSegmentSummaries.indices.contains(index) {
+                    self.fixtureSegmentSummaries[index] = summary
+                }
+            }
+            let prior = self.fixtureSegmentSummaries
+                .prefix(index)
+                .joined(separator: "\n")
+            self.ttsStatusLabel.stringValue = prior.isEmpty
+                ? "\(segment.title)：\(message)"
+                : "\(prior)\n\(segment.title)：\(message)"
+            self.ttsStatusLabel.textColor = success
+                ? .systemGreen
+                : .secondaryLabelColor
+        }
+    }
+
+    @objc private func cancelTTSGate0Probe(_ sender: Any?) {
+        activeFixtureRunID = nil
+        ttsProbeController.cancel()
+        ttsStatusLabel.stringValue = "已要求停止；只回收本次记录的 Click TTS 进程组。"
+        ttsStatusLabel.textColor = .secondaryLabelColor
+    }
+
+    @objc private func revokeTTSDisclosure(_ sender: Any?) {
+        activeFixtureRunID = nil
+        ttsProbeController.revokeDisclosure()
+        ttsStatusLabel.stringValue = "已撤回联网同意；已有匹配缓存仍可本地播放。"
+        ttsStatusLabel.textColor = .systemOrange
+    }
+
     @objc private func closeWindow(_ sender: Any?) {
+        activeFixtureRunID = nil
+        ttsProbeController.cancel()
         close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        activeFixtureRunID = nil
+        ttsProbeController.cancel()
     }
 
     private func applyPreflightReport(_ report: [String: Any]) {
@@ -1740,9 +7426,9870 @@ private final class RuntimeEnvironmentWindowController: NSWindowController {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+struct ReadingChapterDescriptor: Codable, Equatable {
+    let index: Int
+    let locator: String
+    let title: String
+}
+
+struct DOMSourceRange: Codable, Equatable {
+    let nodePath: [Int]
+    let startUTF16: Int
+    let endUTF16: Int
+}
+
+struct RenderedReadingSentence: Codable, Equatable {
+    let sourcePath: String
+    let sourceOrdinal: Int
+    let text: String
+    let sourceRanges: [DOMSourceRange]
+    let rendererIndexes: [String]
+}
+
+struct ReadingSentence: Codable, Equatable {
+    let locator: String
+    let chapterIndex: Int
+    let chapterLocator: String
+    let index: Int
+    let sourcePath: String
+    let sourceOrdinal: Int
+    let text: String
+    let textHash: String
+    let sourceRanges: [DOMSourceRange]
+    let rendererIndexes: [String]
+}
+
+struct ReadingChapter: Codable, Equatable {
+    let descriptor: ReadingChapterDescriptor
+    let sentences: [ReadingSentence]
+}
+
+enum ReadingParagraphNavigator {
+    private struct ParagraphIdentity: Equatable {
+        let chapterIndex: Int
+        let sourcePath: String
+    }
+
+    static func adjacent(
+        in sentences: [ReadingSentence],
+        from locator: String,
+        direction: Int
+    ) -> ReadingSentence? {
+        guard direction == -1 || direction == 1,
+              let currentIndex = sentences.firstIndex(
+                where: { $0.locator == locator }
+              )
+        else {
+            return nil
+        }
+
+        let currentIdentity = identity(for: sentences[currentIndex])
+        if direction > 0 {
+            return sentences[(currentIndex + 1)...].first {
+                identity(for: $0) != currentIdentity
+            }
+        }
+
+        var targetIndex = currentIndex - 1
+        while targetIndex >= 0,
+              identity(for: sentences[targetIndex]) == currentIdentity {
+            targetIndex -= 1
+        }
+        guard targetIndex >= 0 else {
+            return nil
+        }
+        let targetIdentity = identity(for: sentences[targetIndex])
+        while targetIndex > 0,
+              identity(for: sentences[targetIndex - 1])
+                == targetIdentity {
+            targetIndex -= 1
+        }
+        return sentences[targetIndex]
+    }
+
+    private static func identity(
+        for sentence: ReadingSentence
+    ) -> ParagraphIdentity {
+        ParagraphIdentity(
+            chapterIndex: sentence.chapterIndex,
+            sourcePath: sentence.sourcePath
+        )
+    }
+}
+
+struct ReadingDocument: Codable, Equatable {
+    static let schemaVersion = 1
+    static let normalizerRevision = "click-reading-document-v2"
+
+    let schemaVersion: Int
+    let bookID: String
+    let bookHash: String
+    let title: String
+    let normalizerRevision: String
+    let chapters: [ReadingChapterDescriptor]
+    let revision: String
+
+    static func make(
+        bookID: String,
+        bookHash: String,
+        title: String,
+        chapters: [ReadingChapterDescriptor]
+    ) -> ReadingDocument {
+        let revisionInput = (
+            [
+                String(schemaVersion),
+                normalizerRevision,
+                bookID,
+                bookHash,
+                title,
+            ]
+            + chapters.flatMap { [
+                String($0.index),
+                $0.locator,
+                $0.title,
+            ] }
+        ).joined(separator: "\u{1f}")
+        return ReadingDocument(
+            schemaVersion: schemaVersion,
+            bookID: bookID,
+            bookHash: bookHash,
+            title: title,
+            normalizerRevision: normalizerRevision,
+            chapters: chapters,
+            revision: ReadingIdentity.sha256(revisionInput)
+        )
+    }
+}
+
+private enum ReadingIdentity {
+    static func sha256(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    static func sentenceLocator(
+        document: ReadingDocument,
+        chapterLocator: String,
+        sourcePath: String,
+        sourceOrdinal: Int,
+        normalizedText: String
+    ) -> String {
+        let textHash = sha256(normalizedText)
+        let identity = [
+            document.normalizerRevision,
+            chapterLocator,
+            sourcePath,
+            String(sourceOrdinal),
+            textHash,
+        ].joined(separator: "\u{1f}")
+        return "sr:v1:\(sha256(identity))"
+    }
+}
+
+private enum ReadingTextNormalizer {
+    static func normalize(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\u{00a0}", with: " ")
+            .replacingOccurrences(
+                of: #"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u061C\u200B\u200E\u200F\u202A-\u202E\u2060-\u206F\uFEFF]"#,
+                with: "",
+                options: .regularExpression
+            )
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum ReadingChapterEdge: String, Codable, Equatable {
+    case start
+    case end
+}
+
+enum ReadingTextNavigation: Equatable {
+    case sentence(ReadingSentence)
+    case requiresChapter(index: Int, edge: ReadingChapterEdge)
+    case startOfDocument
+    case endOfDocument
+    case unavailable
+}
+
+enum ReadingTextProviderError: Error, CustomStringConvertible {
+    case invalidChapterIndex(Int)
+    case invalidChapterDescriptor(Int)
+    case invalidSentence(String)
+    case duplicateSourceIdentity(String)
+    case duplicateLocator(String)
+
+    var description: String {
+        switch self {
+        case let .invalidChapterIndex(index):
+            return "invalid chapter index \(index)"
+        case let .invalidChapterDescriptor(index):
+            return "chapter descriptor index mismatch at \(index)"
+        case let .invalidSentence(reason):
+            return "invalid rendered sentence: \(reason)"
+        case let .duplicateSourceIdentity(identity):
+            return "duplicate rendered source identity: \(identity)"
+        case let .duplicateLocator(locator):
+            return "duplicate sentence locator: \(locator)"
+        }
+    }
+}
+
+protocol ReadingTextProvider: AnyObject {
+    var document: ReadingDocument { get }
+    func chapter(at index: Int) -> ReadingChapter?
+    func sentence(at locator: String) -> ReadingSentence?
+    func previous(before locator: String) -> ReadingTextNavigation
+    func next(after locator: String) -> ReadingTextNavigation
+    func setPinnedSentenceLocator(_ locator: String?)
+    func setPinnedChapterIndex(_ index: Int?)
+}
+
+final class EPUBReadingTextProvider: ReadingTextProvider {
+    let document: ReadingDocument
+
+    private let maximumCachedChapters: Int
+    private var cachedChapters: [Int: ReadingChapter] = [:]
+    private var cacheOrder: [Int] = []
+    private var pinnedChapterIndex: Int?
+
+    init(document: ReadingDocument, maximumCachedChapters: Int = 3) {
+        self.document = document
+        self.maximumCachedChapters = max(2, maximumCachedChapters)
+    }
+
+    @discardableResult
+    func installRenderedChapter(
+        descriptorIndex: Int,
+        records: [RenderedReadingSentence]
+    ) throws -> ReadingChapter {
+        guard document.chapters.indices.contains(descriptorIndex) else {
+            throw ReadingTextProviderError.invalidChapterIndex(descriptorIndex)
+        }
+        let descriptor = document.chapters[descriptorIndex]
+        guard descriptor.index == descriptorIndex else {
+            throw ReadingTextProviderError.invalidChapterDescriptor(descriptorIndex)
+        }
+
+        var sourceIdentities = Set<String>()
+        var locators = Set<String>()
+        let sentences = try records.enumerated().map { sentenceIndex, record -> ReadingSentence in
+            let sourcePath = record.sourcePath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = ReadingTextNormalizer.normalize(record.text)
+            guard !sourcePath.isEmpty else {
+                throw ReadingTextProviderError.invalidSentence("empty source path")
+            }
+            guard record.sourceOrdinal >= 0 else {
+                throw ReadingTextProviderError.invalidSentence("negative source ordinal")
+            }
+            guard !text.isEmpty else {
+                throw ReadingTextProviderError.invalidSentence("empty normalized text")
+            }
+            guard !record.rendererIndexes.isEmpty,
+                  record.rendererIndexes.allSatisfy({
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  })
+            else {
+                throw ReadingTextProviderError.invalidSentence("missing renderer index")
+            }
+            guard record.sourceRanges.allSatisfy({
+                !$0.nodePath.isEmpty
+                    && $0.nodePath.allSatisfy { $0 >= 0 }
+                    && $0.startUTF16 >= 0
+                    && $0.endUTF16 > $0.startUTF16
+            }) else {
+                throw ReadingTextProviderError.invalidSentence("invalid UTF-16 source range")
+            }
+
+            let sourceIdentity = "\(sourcePath)#\(record.sourceOrdinal)"
+            guard sourceIdentities.insert(sourceIdentity).inserted else {
+                throw ReadingTextProviderError.duplicateSourceIdentity(sourceIdentity)
+            }
+            let locator = ReadingIdentity.sentenceLocator(
+                document: document,
+                chapterLocator: descriptor.locator,
+                sourcePath: sourcePath,
+                sourceOrdinal: record.sourceOrdinal,
+                normalizedText: text
+            )
+            guard locators.insert(locator).inserted else {
+                throw ReadingTextProviderError.duplicateLocator(locator)
+            }
+            return ReadingSentence(
+                locator: locator,
+                chapterIndex: descriptorIndex,
+                chapterLocator: descriptor.locator,
+                index: sentenceIndex,
+                sourcePath: sourcePath,
+                sourceOrdinal: record.sourceOrdinal,
+                text: text,
+                textHash: ReadingIdentity.sha256(text),
+                sourceRanges: record.sourceRanges,
+                rendererIndexes: record.rendererIndexes
+            )
+        }
+        let chapter = ReadingChapter(descriptor: descriptor, sentences: sentences)
+        cachedChapters[descriptorIndex] = chapter
+        touchCache(descriptorIndex)
+        evictIfNeeded()
+        return chapter
+    }
+
+    func chapter(at index: Int) -> ReadingChapter? {
+        guard let chapter = cachedChapters[index] else {
+            return nil
+        }
+        touchCache(index)
+        return chapter
+    }
+
+    func sentence(at locator: String) -> ReadingSentence? {
+        locate(locator)?.sentence
+    }
+
+    func previous(before locator: String) -> ReadingTextNavigation {
+        guard let located = locate(locator) else {
+            return .unavailable
+        }
+        if located.sentenceIndex > 0 {
+            return .sentence(located.chapter.sentences[located.sentenceIndex - 1])
+        }
+        let previousIndex = located.chapter.descriptor.index - 1
+        guard document.chapters.indices.contains(previousIndex) else {
+            return .startOfDocument
+        }
+        guard let previousChapter = cachedChapters[previousIndex] else {
+            return .requiresChapter(index: previousIndex, edge: .end)
+        }
+        guard let sentence = previousChapter.sentences.last else {
+            return .requiresChapter(index: previousIndex, edge: .end)
+        }
+        touchCache(previousIndex)
+        return .sentence(sentence)
+    }
+
+    func next(after locator: String) -> ReadingTextNavigation {
+        guard let located = locate(locator) else {
+            return .unavailable
+        }
+        let nextSentenceIndex = located.sentenceIndex + 1
+        if located.chapter.sentences.indices.contains(nextSentenceIndex) {
+            return .sentence(located.chapter.sentences[nextSentenceIndex])
+        }
+        let nextChapterIndex = located.chapter.descriptor.index + 1
+        guard document.chapters.indices.contains(nextChapterIndex) else {
+            return .endOfDocument
+        }
+        guard let nextChapter = cachedChapters[nextChapterIndex] else {
+            return .requiresChapter(index: nextChapterIndex, edge: .start)
+        }
+        guard let sentence = nextChapter.sentences.first else {
+            return .requiresChapter(index: nextChapterIndex, edge: .start)
+        }
+        touchCache(nextChapterIndex)
+        return .sentence(sentence)
+    }
+
+    func setPinnedSentenceLocator(_ locator: String?) {
+        guard let locator else {
+            pinnedChapterIndex = nil
+            evictIfNeeded()
+            return
+        }
+        guard let located = locate(locator) else {
+            return
+        }
+        pinnedChapterIndex = located.chapter.descriptor.index
+        evictIfNeeded()
+    }
+
+    func setPinnedChapterIndex(_ index: Int?) {
+        guard let index else {
+            pinnedChapterIndex = nil
+            evictIfNeeded()
+            return
+        }
+        guard document.chapters.indices.contains(index) else {
+            return
+        }
+        pinnedChapterIndex = index
+        evictIfNeeded()
+    }
+
+    private func locate(_ locator: String) -> (
+        chapter: ReadingChapter,
+        sentenceIndex: Int,
+        sentence: ReadingSentence
+    )? {
+        for chapterIndex in cacheOrder.reversed() {
+            guard let chapter = cachedChapters[chapterIndex],
+                  let sentenceIndex = chapter.sentences.firstIndex(where: { $0.locator == locator })
+            else {
+                continue
+            }
+            touchCache(chapterIndex)
+            return (chapter, sentenceIndex, chapter.sentences[sentenceIndex])
+        }
+        return nil
+    }
+
+    private func touchCache(_ index: Int) {
+        cacheOrder.removeAll { $0 == index }
+        cacheOrder.append(index)
+    }
+
+    private func evictIfNeeded() {
+        while cacheOrder.count > maximumCachedChapters {
+            guard let evictionOffset = cacheOrder.firstIndex(where: {
+                $0 != pinnedChapterIndex
+            }) else {
+                return
+            }
+            let evicted = cacheOrder.remove(at: evictionOffset)
+            cachedChapters[evicted] = nil
+        }
+    }
+}
+
+enum ReadingAudioSessionState: String, Codable, Equatable {
+    case idle
+    case preparing
+    case playing
+    case paused
+    case recoverableError
+    case completed
+    case stopped
+}
+
+enum ReadingTTSSurfaceMode: String, Equatable {
+    case reading
+    case listening
+}
+
+struct ReadingJumpIdentity: Equatable {
+    let sessionID: String
+    let documentRevision: String
+}
+
+final class ReadingAudioSession {
+    private(set) var state: ReadingAudioSessionState = .idle
+    private(set) var surfaceMode: ReadingTTSSurfaceMode = .reading
+    private(set) var sessionID: String?
+    private(set) var documentRevision: String?
+    private(set) var currentLocator: String?
+    private var pinnedProvider: ReadingTextProvider?
+
+    var isJumpEligible: Bool {
+        switch state {
+        case .preparing, .playing, .paused, .recoverableError:
+            return sessionID != nil && documentRevision != nil && currentLocator != nil
+        case .idle, .completed, .stopped:
+            return false
+        }
+    }
+
+    var jumpIdentity: ReadingJumpIdentity? {
+        guard isJumpEligible,
+              let sessionID,
+              let documentRevision
+        else {
+            return nil
+        }
+        return ReadingJumpIdentity(
+            sessionID: sessionID,
+            documentRevision: documentRevision
+        )
+    }
+
+    func bind(to document: ReadingDocument) {
+        releasePinnedChapter()
+        state = .idle
+        surfaceMode = .reading
+        sessionID = nil
+        documentRevision = document.revision
+        currentLocator = nil
+    }
+
+    @discardableResult
+    func activate(
+        at locator: String,
+        provider: ReadingTextProvider
+    ) -> Bool {
+        guard documentRevision == provider.document.revision,
+              provider.sentence(at: locator) != nil
+        else {
+            return false
+        }
+        sessionID = UUID().uuidString
+        currentLocator = locator
+        state = .preparing
+        surfaceMode = .reading
+        pinCurrentChapter(using: provider)
+        return true
+    }
+
+    func markPlaying() {
+        guard isJumpEligible else {
+            return
+        }
+        state = .playing
+    }
+
+    func pause() {
+        guard isJumpEligible else {
+            return
+        }
+        state = .paused
+    }
+
+    func markRecoverableError() {
+        guard isJumpEligible else {
+            return
+        }
+        state = .recoverableError
+    }
+
+    func markCompleted() {
+        guard isJumpEligible else {
+            return
+        }
+        releasePinnedChapter()
+        state = .completed
+        surfaceMode = .reading
+    }
+
+    func stop() {
+        releasePinnedChapter()
+        state = .stopped
+        surfaceMode = .reading
+        sessionID = nil
+        currentLocator = nil
+    }
+
+    func setSurfaceMode(_ mode: ReadingTTSSurfaceMode) {
+        guard sessionID != nil else {
+            surfaceMode = .reading
+            return
+        }
+        surfaceMode = mode
+    }
+
+    @discardableResult
+    func seek(
+        to locator: String,
+        provider: ReadingTextProvider
+    ) -> Bool {
+        guard isJumpEligible,
+              documentRevision == provider.document.revision,
+              provider.sentence(at: locator) != nil
+        else {
+            return false
+        }
+        currentLocator = locator
+        pinCurrentChapter(using: provider)
+        return true
+    }
+
+    @discardableResult
+    func seek(
+        to sentence: ReadingSentence,
+        provider: ReadingTextProvider
+    ) -> Bool {
+        guard isJumpEligible,
+              documentRevision == provider.document.revision
+        else {
+            return false
+        }
+        currentLocator = sentence.locator
+        provider.setPinnedChapterIndex(sentence.chapterIndex)
+        pinnedProvider = provider
+        return true
+    }
+
+    func previous(using provider: ReadingTextProvider) -> ReadingTextNavigation {
+        guard isJumpEligible,
+              documentRevision == provider.document.revision,
+              let currentLocator
+        else {
+            return .unavailable
+        }
+        let navigation = provider.previous(before: currentLocator)
+        if case let .sentence(sentence) = navigation {
+            self.currentLocator = sentence.locator
+            pinCurrentChapter(using: provider)
+        }
+        return navigation
+    }
+
+    func next(using provider: ReadingTextProvider) -> ReadingTextNavigation {
+        guard isJumpEligible,
+              documentRevision == provider.document.revision,
+              let currentLocator
+        else {
+            return .unavailable
+        }
+        let navigation = provider.next(after: currentLocator)
+        switch navigation {
+        case let .sentence(sentence):
+            self.currentLocator = sentence.locator
+            pinCurrentChapter(using: provider)
+        case .endOfDocument:
+            releasePinnedChapter()
+            state = .completed
+        default:
+            break
+        }
+        return navigation
+    }
+
+    func matches(_ identity: ReadingJumpIdentity) -> Bool {
+        jumpIdentity == identity
+    }
+
+    private func pinCurrentChapter(using provider: ReadingTextProvider) {
+        guard let currentLocator else {
+            return
+        }
+        if let pinnedProvider, pinnedProvider !== provider {
+            pinnedProvider.setPinnedSentenceLocator(nil)
+        }
+        provider.setPinnedSentenceLocator(currentLocator)
+        pinnedProvider = provider
+    }
+
+    private func releasePinnedChapter() {
+        pinnedProvider?.setPinnedSentenceLocator(nil)
+        pinnedProvider = nil
+    }
+}
+
+enum ReadingSpeechBlockKind: String, Codable, Equatable {
+    case first
+    case steady
+}
+
+struct ReadingSpeechBlockPolicy: Equatable {
+    static let revision = "click-reader-tts-block-policy-v2"
+    static let standard = ReadingSpeechBlockPolicy()
+
+    let firstMinimumMS: Int
+    let firstMaximumMS: Int
+    let steadyMinimumMS: Int
+    let steadyMaximumMS: Int
+
+    init(
+        firstMinimumMS: Int = 20_000,
+        firstMaximumMS: Int = 45_000,
+        steadyMinimumMS: Int = 120_000,
+        steadyMaximumMS: Int = 150_000
+    ) {
+        self.firstMinimumMS = firstMinimumMS
+        self.firstMaximumMS = firstMaximumMS
+        self.steadyMinimumMS = steadyMinimumMS
+        self.steadyMaximumMS = steadyMaximumMS
+    }
+
+    func limits(for kind: ReadingSpeechBlockKind) -> (
+        minimumMS: Int,
+        maximumMS: Int
+    ) {
+        switch kind {
+        case .first:
+            return (firstMinimumMS, firstMaximumMS)
+        case .steady:
+            return (steadyMinimumMS, steadyMaximumMS)
+        }
+    }
+
+    func estimatedDurationMS(for text: String) -> Int {
+        let spokenScalars = text.unicodeScalars.reduce(into: 0) { count, scalar in
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                count += 1
+            }
+        }
+        return max(400, spokenScalars * 230)
+    }
+}
+
+struct ReadingSpeechBlock: Equatable {
+    let blockID: String
+    let kind: ReadingSpeechBlockKind
+    let policyRevision: String
+    let documentRevision: String
+    let bookID: String
+    let bookHash: String
+    let chapterIndex: Int
+    let chapterLocator: String
+    let startSentenceIndex: Int
+    let endSentenceIndex: Int
+    let sentences: [ReadingSentence]
+    let normalizedTextHash: String
+    let orderedSentenceIdentityHash: String
+    let locatorRange: String
+    let estimatedDurationMS: Int
+
+    var text: String {
+        sentences.map(\.text).joined(separator: "\n")
+    }
+}
+
+enum ReadingSpeechBlockBuilderError: Error, CustomStringConvertible {
+    case invalidPolicy
+    case chapterMismatch
+    case invalidStart
+    case emptyBlock
+
+    var description: String {
+        switch self {
+        case .invalidPolicy:
+            return "invalid speech block policy"
+        case .chapterMismatch:
+            return "speech block chapter does not belong to the document"
+        case .invalidStart:
+            return "speech block start is outside the chapter"
+        case .emptyBlock:
+            return "speech block has no sentences"
+        }
+    }
+}
+
+enum ReadingSpeechBlockBuilder {
+    static func makeBlock(
+        document: ReadingDocument,
+        chapter: ReadingChapter,
+        startSentenceIndex: Int,
+        kind: ReadingSpeechBlockKind,
+        policy: ReadingSpeechBlockPolicy = .standard
+    ) throws -> ReadingSpeechBlock {
+        let limits = policy.limits(for: kind)
+        guard limits.minimumMS > 0,
+              limits.maximumMS >= limits.minimumMS
+        else {
+            throw ReadingSpeechBlockBuilderError.invalidPolicy
+        }
+        guard document.chapters.indices.contains(chapter.descriptor.index),
+              document.chapters[chapter.descriptor.index]
+                == chapter.descriptor
+        else {
+            throw ReadingSpeechBlockBuilderError.chapterMismatch
+        }
+        guard chapter.sentences.indices.contains(startSentenceIndex) else {
+            throw ReadingSpeechBlockBuilderError.invalidStart
+        }
+
+        var selected: [ReadingSentence] = []
+        var estimatedDurationMS = 0
+        for sentence in chapter.sentences[startSentenceIndex...] {
+            let nextDuration = policy.estimatedDurationMS(for: sentence.text)
+            if !selected.isEmpty,
+               estimatedDurationMS >= limits.minimumMS,
+               estimatedDurationMS + nextDuration > limits.maximumMS {
+                break
+            }
+            selected.append(sentence)
+            estimatedDurationMS += nextDuration
+            if estimatedDurationMS >= limits.maximumMS {
+                break
+            }
+        }
+        guard let first = selected.first, let last = selected.last else {
+            throw ReadingSpeechBlockBuilderError.emptyBlock
+        }
+
+        let text = selected.map(\.text).joined(separator: "\n")
+        let normalizedTextHash = ReadingIdentity.sha256(text)
+        let orderedSentenceIdentityHash = ReadingIdentity.sha256(
+            selected.flatMap { [$0.locator, $0.textHash] }
+                .joined(separator: "\u{1f}")
+        )
+        let locatorRange = [
+            first.locator,
+            last.locator,
+            String(selected.count),
+            orderedSentenceIdentityHash,
+        ].joined(separator: ":")
+        let blockID = ReadingIdentity.sha256(
+            [
+                ReadingSpeechBlockPolicy.revision,
+                kind.rawValue,
+                document.revision,
+                chapter.descriptor.locator,
+                locatorRange,
+                normalizedTextHash,
+            ].joined(separator: "\u{1f}")
+        )
+        return ReadingSpeechBlock(
+            blockID: blockID,
+            kind: kind,
+            policyRevision: ReadingSpeechBlockPolicy.revision,
+            documentRevision: document.revision,
+            bookID: document.bookID,
+            bookHash: document.bookHash,
+            chapterIndex: chapter.descriptor.index,
+            chapterLocator: chapter.descriptor.locator,
+            startSentenceIndex: first.index,
+            endSentenceIndex: last.index,
+            sentences: selected,
+            normalizedTextHash: normalizedTextHash,
+            orderedSentenceIdentityHash: orderedSentenceIdentityHash,
+            locatorRange: locatorRange,
+            estimatedDurationMS: estimatedDurationMS
+        )
+    }
+}
+
+struct ReadingSpeechSynthesisProfile: Equatable {
+    let voiceID: String
+    let rate: String
+    let volume: String
+    let pitch: String
+    let voiceCacheEpoch: String
+    let prosodyRevision: String
+    let boundary = "SentenceBoundary"
+}
+
+struct ReadingSpeechEngineIdentity: Equatable {
+    var backendID: String
+    var edgeTTSVersion: String
+    var runtimeID: String
+    var runtimeManifestSHA256: String
+    var helperSHA256: String
+    var engineRevision: String
+
+    static let product = ReadingSpeechEngineIdentity(
+        backendID: "edge_online",
+        edgeTTSVersion: ClickTTSGate0Contract.expectedEdgeTTSVersion,
+        runtimeID: ClickTTSGate0Contract.expectedRuntimeID,
+        runtimeManifestSHA256:
+            "e4c558c222f759a0730f398b2afe91bc7381e90f75a81443d502b6828ac7eb9b",
+        helperSHA256:
+            "a3de7a2adf43f6f6dc707dc8dccf7d4484f3f32fb74021cdfbdd3c31c21fb1a9",
+        engineRevision: "click-edge-online-engine-v1"
+    )
+}
+
+struct ReadingSpeechGenerationRequest: Equatable {
+    static let cacheSchemaRevision = "reading-v2-blocks-v1"
+
+    let block: ReadingSpeechBlock
+    let profile: ReadingSpeechSynthesisProfile
+    let engineIdentity: ReadingSpeechEngineIdentity
+    let keyMaterial: [String: String]
+    let cacheKey: String
+
+    init(
+        block: ReadingSpeechBlock,
+        profile: ReadingSpeechSynthesisProfile,
+        engineIdentity: ReadingSpeechEngineIdentity = .product
+    ) {
+        self.block = block
+        self.profile = profile
+        self.engineIdentity = engineIdentity
+        let material = [
+            "backend_id": engineIdentity.backendID,
+            "block_kind": block.kind.rawValue,
+            "block_policy_revision": block.policyRevision,
+            "book_hash": block.bookHash,
+            "book_id": block.bookID,
+            "cache_schema_revision": Self.cacheSchemaRevision,
+            "chapter_locator": block.chapterLocator,
+            "document_revision": block.documentRevision,
+            "edge_tts_client_version": engineIdentity.edgeTTSVersion,
+            "engine_revision": engineIdentity.engineRevision,
+            "helper_sha256": engineIdentity.helperSHA256,
+            "locator_range": block.locatorRange,
+            "normalizer_revision": ReadingDocument.normalizerRevision,
+            "normalized_text_hash": block.normalizedTextHash,
+            "ordered_sentence_identity_hash":
+                block.orderedSentenceIdentityHash,
+            "pitch": profile.pitch,
+            "prosody_revision": profile.prosodyRevision,
+            "rate": profile.rate,
+            "runtime_id": engineIdentity.runtimeID,
+            "runtime_manifest_sha256":
+                engineIdentity.runtimeManifestSHA256,
+            "voice_cache_epoch": profile.voiceCacheEpoch,
+            "voice_id": profile.voiceID,
+            "volume": profile.volume,
+        ]
+        keyMaterial = material
+        let data = (try? JSONSerialization.data(
+            withJSONObject: material,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )) ?? Data()
+        cacheKey = ClickTTSGate0Contract.sha256(data)
+    }
+
+    var helperCacheContext: [String: String] {
+        [
+            "book_id": block.documentRevision,
+            "fixture_id": "gate2b-blocks-v1",
+            "chapter_locator":
+                "ch:\(ReadingIdentity.sha256(block.chapterLocator))",
+            "locator_range": "lr:\(block.blockID)",
+            "client_version": engineIdentity.runtimeID,
+            "voice_cache_epoch": profile.voiceCacheEpoch,
+            "prosody_revision": profile.prosodyRevision,
+            "normalizer_revision": ReadingDocument.normalizerRevision,
+            "engine_revision": [
+                engineIdentity.engineRevision,
+                String(engineIdentity.runtimeManifestSHA256.prefix(16)),
+                Self.cacheSchemaRevision,
+            ].joined(separator: "-"),
+        ]
+    }
+
+    var helperSynthesis: [String: String] {
+        [
+            "rate": profile.rate,
+            "volume": profile.volume,
+            "pitch": profile.pitch,
+            "boundary": profile.boundary,
+        ]
+    }
+}
+
+struct SpeechEngineBoundary: Equatable {
+    let ordinal: Int
+    let type: String
+    let offset: Int
+    let duration: Int
+}
+
+struct SpeechEngineOutput {
+    let audioURL: URL
+    let boundaries: [SpeechEngineBoundary]
+    let audioDurationMS: Int
+    let providerCacheKey: String
+    let source: String
+    let attemptCount: Int
+    let synthesisElapsedMS: Int
+    let discardStaging: (() -> Void)?
+
+    init(
+        audioURL: URL,
+        boundaries: [SpeechEngineBoundary],
+        audioDurationMS: Int,
+        providerCacheKey: String,
+        source: String,
+        attemptCount: Int,
+        synthesisElapsedMS: Int,
+        discardStaging: (() -> Void)? = nil
+    ) {
+        self.audioURL = audioURL
+        self.boundaries = boundaries
+        self.audioDurationMS = audioDurationMS
+        self.providerCacheKey = providerCacheKey
+        self.source = source
+        self.attemptCount = attemptCount
+        self.synthesisElapsedMS = synthesisElapsedMS
+        self.discardStaging = discardStaging
+    }
+}
+
+struct ReadingSpeechCachedBlock {
+    let cacheKey: String
+    let audioURL: URL
+    let manifestURL: URL
+    let source: String
+    let audioDurationMS: Int
+    let sentenceCount: Int
+    let boundaries: [SpeechEngineBoundary]
+    let providerAttemptCount: Int?
+    let synthesisElapsedMS: Int?
+
+    init(
+        cacheKey: String,
+        audioURL: URL,
+        manifestURL: URL,
+        source: String,
+        audioDurationMS: Int,
+        sentenceCount: Int,
+        boundaries: [SpeechEngineBoundary],
+        providerAttemptCount: Int? = nil,
+        synthesisElapsedMS: Int? = nil
+    ) {
+        self.cacheKey = cacheKey
+        self.audioURL = audioURL
+        self.manifestURL = manifestURL
+        self.source = source
+        self.audioDurationMS = audioDurationMS
+        self.sentenceCount = sentenceCount
+        self.boundaries = boundaries
+        self.providerAttemptCount = providerAttemptCount
+        self.synthesisElapsedMS = synthesisElapsedMS
+    }
+}
+
+enum ReadingSpeechGenerationError: Error, CustomStringConvertible, Equatable {
+    case cacheMissRequiresNetwork
+    case canceled
+    case thermalBlocked
+    case runtimeUnavailable
+    case runtimeIdentityMismatch
+    case helperProtocol
+    case helperFailed(String)
+    case timedOut
+    case invalidArtifact
+    case cacheCommit
+
+    var description: String {
+        switch self {
+        case .cacheMissRequiresNetwork:
+            return "uncached speech requires network authorization"
+        case .canceled:
+            return "speech generation was canceled"
+        case .thermalBlocked:
+            return "speech generation is paused by thermal state"
+        case .runtimeUnavailable:
+            return "speech runtime is unavailable"
+        case .runtimeIdentityMismatch:
+            return "speech runtime identity does not match the Click executable"
+        case .helperProtocol:
+            return "speech helper protocol failed"
+        case let .helperFailed(category):
+            return "speech helper failed: \(category)"
+        case .timedOut:
+            return "speech generation timed out"
+        case .invalidArtifact:
+            return "speech artifact is invalid"
+        case .cacheCommit:
+            return "speech cache commit failed"
+        }
+    }
+}
+
+protocol SpeechEngine: AnyObject {
+    func synthesize(
+        _ request: ReadingSpeechGenerationRequest
+    ) throws -> SpeechEngineOutput
+    func cancel()
+}
+
+protocol ReadingSpeechCaching: AnyObject {
+    func load(
+        _ request: ReadingSpeechGenerationRequest
+    ) -> ReadingSpeechCachedBlock?
+    func commit(
+        _ output: SpeechEngineOutput,
+        for request: ReadingSpeechGenerationRequest
+    ) throws -> ReadingSpeechCachedBlock
+}
+
+enum ReadingV2AudioCacheCommitPoint: Equatable {
+    case afterAudioPartial
+    case afterManifestPartial
+    case afterAudioRename
+    case afterManifestRename
+}
+
+final class ReadingV2AudioCache: ReadingSpeechCaching {
+    private static let manifestSchema =
+        "click.reader.tts.boundary-manifest.v1"
+    private static let maximumAudioBytes = 256 * 1024 * 1024
+    private static let maximumManifestBytes = 4 * 1024 * 1024
+    private static let maximumBoundaryOverlapTicks = 1_000_000
+    static let maximumTotalBytes = 512 * 1024 * 1024
+
+    struct Inventory: Equatable {
+        let validEntryCount: Int
+        let totalBytes: Int
+        let protectedEntryCount: Int
+    }
+
+    private struct InventoryEntry {
+        let cacheKey: String
+        let audioURL: URL
+        let manifestURL: URL
+        let bytes: Int
+        let lastAccess: Date
+    }
+
+    let root: URL
+    private let fileManager = FileManager.default
+    private let operationLock = NSRecursiveLock()
+    private let audioValidator: (URL) -> Bool
+    private let audioDurationReader: ((URL) -> Int?)?
+    private let commitFault: ((ReadingV2AudioCacheCommitPoint) throws -> Void)?
+
+    init(
+        root: URL? = nil,
+        audioValidator: ((URL) -> Bool)? = nil,
+        commitFault: ((ReadingV2AudioCacheCommitPoint) throws -> Void)? = nil
+    ) {
+        if let root {
+            self.root = root.standardizedFileURL
+        } else {
+            let applicationSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(
+                    "Library/Application Support",
+                    isDirectory: true
+                )
+            self.root = applicationSupport
+                .appendingPathComponent("Click", isDirectory: true)
+                .appendingPathComponent("ReaderTTS", isDirectory: true)
+                .appendingPathComponent("reading-v2", isDirectory: true)
+                .appendingPathComponent("blocks-v1", isDirectory: true)
+                .standardizedFileURL
+        }
+        if let audioValidator {
+            self.audioValidator = audioValidator
+            audioDurationReader = nil
+        } else {
+            self.audioValidator = { url in
+                Self.measuredAudioDurationMS(url) != nil
+            }
+            audioDurationReader = Self.measuredAudioDurationMS
+        }
+        self.commitFault = commitFault
+    }
+
+    private static func measuredAudioDurationMS(
+        _ url: URL
+    ) -> Int? {
+        guard let player = try? AVAudioPlayer(contentsOf: url),
+              player.duration.isFinite,
+              player.duration > 0
+        else {
+            return nil
+        }
+        let milliseconds = player.duration * 1_000
+        guard milliseconds.isFinite,
+              milliseconds > 0,
+              milliseconds <= Double(Int.max)
+        else {
+            return nil
+        }
+        return Int(milliseconds.rounded())
+    }
+
+    private func verifiedAudioDurationMS(
+        _ url: URL,
+        declaredMS: Int
+    ) -> Int? {
+        guard declaredMS > 0 else {
+            return nil
+        }
+        guard let audioDurationReader else {
+            return audioValidator(url) ? declaredMS : nil
+        }
+        guard let measuredMS = audioDurationReader(url),
+              abs(measuredMS - declaredMS) <= 100
+        else {
+            return nil
+        }
+        return measuredMS
+    }
+
+    private func urls(
+        for cacheKey: String
+    ) -> (shard: URL, audio: URL, manifest: URL) {
+        let shard = root.appendingPathComponent(
+            String(cacheKey.prefix(2)),
+            isDirectory: true
+        )
+        return (
+            shard,
+            shard.appendingPathComponent("\(cacheKey).mp3"),
+            shard.appendingPathComponent(
+                "\(cacheKey).boundary-manifest.json"
+            )
+        )
+    }
+
+    private func directoryIsPrivate(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ),
+        values.isDirectory == true,
+        values.isSymbolicLink != true,
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+        let permissions = attributes[.posixPermissions] as? NSNumber
+        else {
+            return false
+        }
+        return permissions.intValue & 0o777 == 0o700
+    }
+
+    private func regularFileIsPrivate(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ),
+        values.isRegularFile == true,
+        values.isSymbolicLink != true,
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+        let permissions = attributes[.posixPermissions] as? NSNumber
+        else {
+            return false
+        }
+        return permissions.intValue & 0o777 == 0o600
+    }
+
+    private func ensurePrivateDirectory(_ url: URL) throws {
+        let values = try? url.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        if values == nil {
+            try fileManager.createDirectory(
+                at: url,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } else {
+            guard values?.isDirectory == true,
+                  values?.isSymbolicLink != true
+            else {
+                throw ReadingSpeechGenerationError.cacheCommit
+            }
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: url.path
+            )
+        }
+        guard directoryIsPrivate(url) else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+    }
+
+    private func ensurePrivateHierarchy(shard: URL) throws {
+        if root.path.hasSuffix(
+            "/Click/ReaderTTS/reading-v2/blocks-v1"
+        ) {
+            let blocks = root
+            let reading = blocks.deletingLastPathComponent()
+            let readerTTS = reading.deletingLastPathComponent()
+            let click = readerTTS.deletingLastPathComponent()
+            for directory in [click, readerTTS, reading, blocks] {
+                try ensurePrivateDirectory(directory)
+            }
+        } else {
+            try ensurePrivateDirectory(root)
+        }
+        guard shard.deletingLastPathComponent().standardizedFileURL.path
+                == root.path,
+              shard.path.hasPrefix(root.path + "/")
+        else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+        try ensurePrivateDirectory(shard)
+    }
+
+    private func writePrivateCopy(
+        from source: URL,
+        to destination: URL
+    ) throws {
+        guard fileManager.createFile(
+            atPath: destination.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+        let input = try FileHandle(forReadingFrom: source)
+        let output = try FileHandle(forWritingTo: destination)
+        defer {
+            try? input.close()
+            try? output.close()
+        }
+        while true {
+            let data = try input.read(upToCount: 1024 * 1024) ?? Data()
+            if data.isEmpty {
+                break
+            }
+            try output.write(contentsOf: data)
+        }
+        try output.synchronize()
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destination.path
+        )
+        guard regularFileIsPrivate(destination) else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+    }
+
+    private func writePrivateData(
+        _ data: Data,
+        to destination: URL
+    ) throws {
+        guard data.count > 0,
+              data.count <= Self.maximumManifestBytes,
+              fileManager.createFile(
+                atPath: destination.path,
+                contents: data,
+                attributes: [.posixPermissions: 0o600]
+              )
+        else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+        let handle = try FileHandle(forWritingTo: destination)
+        try handle.synchronize()
+        try handle.close()
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destination.path
+        )
+        guard regularFileIsPrivate(destination) else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+    }
+
+    private func fsyncDirectory(_ url: URL) {
+        let descriptor = open(url.path, O_RDONLY)
+        guard descriptor >= 0 else {
+            return
+        }
+        _ = fsync(descriptor)
+        close(descriptor)
+    }
+
+    private func removeCommitMarker(_ url: URL) throws {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return
+        }
+        let values = try url.resourceValues(
+            forKeys: [
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+            ]
+        )
+        guard values.isDirectory != true,
+              values.isRegularFile == true || values.isSymbolicLink == true
+        else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+        try fileManager.removeItem(at: url)
+    }
+
+    private func safeRename(_ source: URL, _ destination: URL) throws {
+        guard rename(source.path, destination.path) == 0 else {
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+    }
+
+    private func strictInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              number.doubleValue >= 0,
+              number.doubleValue <= 9_000_000_000_000
+        else {
+            return nil
+        }
+        return number.intValue
+    }
+
+    private func touch(
+        audioURL: URL,
+        manifestURL: URL
+    ) {
+        let now = Date()
+        for url in [audioURL, manifestURL] {
+            try? fileManager.setAttributes(
+                [.modificationDate: now],
+                ofItemAtPath: url.path
+            )
+        }
+    }
+
+    private func inventoryEntries() -> [InventoryEntry] {
+        guard directoryIsPrivate(root),
+              let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                    .contentModificationDateKey,
+                    .fileSizeKey,
+                ],
+                options: [.skipsHiddenFiles]
+              )
+        else {
+            return []
+        }
+        var result: [InventoryEntry] = []
+        for case let manifestURL as URL in enumerator {
+            let suffix = ".boundary-manifest.json"
+            let name = manifestURL.lastPathComponent
+            guard name.hasSuffix(suffix) else {
+                continue
+            }
+            let cacheKey = String(name.dropLast(suffix.count))
+            guard cacheKey.range(
+                of: "^[0-9a-f]{64}$",
+                options: .regularExpression
+            ) != nil,
+            regularFileIsPrivate(manifestURL)
+            else {
+                continue
+            }
+            let audioURL = manifestURL.deletingLastPathComponent()
+                .appendingPathComponent("\(cacheKey).mp3")
+            guard regularFileIsPrivate(audioURL),
+                  let manifestValues = try? manifestURL.resourceValues(
+                    forKeys: [
+                        .contentModificationDateKey,
+                        .fileSizeKey,
+                    ]
+                  ),
+                  let audioValues = try? audioURL.resourceValues(
+                    forKeys: [
+                        .contentModificationDateKey,
+                        .fileSizeKey,
+                    ]
+                  ),
+                  let manifestBytes = manifestValues.fileSize,
+                  let audioBytes = audioValues.fileSize,
+                  manifestBytes > 0,
+                  manifestBytes <= Self.maximumManifestBytes,
+                  audioBytes >= 128,
+                  audioBytes <= Self.maximumAudioBytes
+            else {
+                continue
+            }
+            let lastAccess = max(
+                manifestValues.contentModificationDate
+                    ?? Date.distantPast,
+                audioValues.contentModificationDate
+                    ?? Date.distantPast
+            )
+            result.append(
+                InventoryEntry(
+                    cacheKey: cacheKey,
+                    audioURL: audioURL,
+                    manifestURL: manifestURL,
+                    bytes: manifestBytes + audioBytes,
+                    lastAccess: lastAccess
+                )
+            )
+        }
+        return result
+    }
+
+    func inventory(
+        protectedCacheKeys: Set<String> = []
+    ) -> Inventory {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        let entries = inventoryEntries()
+        return Inventory(
+            validEntryCount: entries.count,
+            totalBytes: entries.reduce(0) { $0 + $1.bytes },
+            protectedEntryCount: entries.filter {
+                protectedCacheKeys.contains($0.cacheKey)
+            }.count
+        )
+    }
+
+    @discardableResult
+    func enforceLRU(
+        protectedCacheKeys: Set<String>,
+        maximumBytes: Int = ReadingV2AudioCache.maximumTotalBytes
+    ) -> [String] {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard maximumBytes >= 0 else {
+            return []
+        }
+        var entries = inventoryEntries()
+        var totalBytes = entries.reduce(0) { $0 + $1.bytes }
+        guard totalBytes > maximumBytes else {
+            return []
+        }
+        entries.sort {
+            if $0.lastAccess == $1.lastAccess {
+                return $0.cacheKey < $1.cacheKey
+            }
+            return $0.lastAccess < $1.lastAccess
+        }
+        var removed: [String] = []
+        for entry in entries {
+            guard totalBytes > maximumBytes,
+                  !protectedCacheKeys.contains(entry.cacheKey)
+            else {
+                continue
+            }
+            do {
+                try fileManager.removeItem(at: entry.manifestURL)
+                try fileManager.removeItem(at: entry.audioURL)
+                totalBytes = max(0, totalBytes - entry.bytes)
+                removed.append(entry.cacheKey)
+            } catch {
+                continue
+            }
+        }
+        return removed
+    }
+
+    @discardableResult
+    func cleanupAbandonedPartials() -> Int {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard directoryIsPrivate(root),
+              let enumerator = fileManager.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                ],
+                options: [.skipsHiddenFiles]
+              )
+        else {
+            return 0
+        }
+        var removed = 0
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent.contains(".partial."),
+                  url.path.hasPrefix(root.path + "/"),
+                  let values = try? url.resourceValues(
+                    forKeys: [
+                        .isRegularFileKey,
+                        .isSymbolicLinkKey,
+                    ]
+                  ),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true
+            else {
+                continue
+            }
+            if (try? fileManager.removeItem(at: url)) != nil {
+                removed += 1
+            }
+        }
+        return removed
+    }
+
+    private func validatedBoundaryRows(
+        output: SpeechEngineOutput,
+        request: ReadingSpeechGenerationRequest,
+        audioDurationMS: Int
+    ) throws -> [[String: Any]] {
+        guard audioDurationMS > 0,
+              output.boundaries.count == request.block.sentences.count
+        else {
+            throw ReadingSpeechGenerationError.invalidArtifact
+        }
+        let maximumOffset = audioDurationMS * 10_000
+        var previousEnd = 0
+        return try output.boundaries.indices.map { ordinal in
+            let sentence = request.block.sentences[ordinal]
+            let boundary = output.boundaries[ordinal]
+            let rawEndResult = boundary.offset.addingReportingOverflow(
+                boundary.duration
+            )
+            guard boundary.ordinal == ordinal,
+                  boundary.type == "SentenceBoundary",
+                  boundary.offset >= previousEnd,
+                  boundary.duration > 0,
+                  !rawEndResult.overflow,
+                  rawEndResult.partialValue > boundary.offset,
+                  rawEndResult.partialValue <= maximumOffset
+            else {
+                throw ReadingSpeechGenerationError.invalidArtifact
+            }
+            var normalizedEnd = rawEndResult.partialValue
+            if output.boundaries.indices.contains(ordinal + 1) {
+                let nextOffset = output.boundaries[ordinal + 1].offset
+                let overlap = max(0, normalizedEnd - nextOffset)
+                guard nextOffset > boundary.offset,
+                      overlap <= Self.maximumBoundaryOverlapTicks
+                else {
+                    throw ReadingSpeechGenerationError.invalidArtifact
+                }
+                normalizedEnd = min(normalizedEnd, nextOffset)
+            }
+            guard normalizedEnd > boundary.offset else {
+                throw ReadingSpeechGenerationError.invalidArtifact
+            }
+            previousEnd = normalizedEnd
+            return [
+                "ordinal": ordinal,
+                "type": boundary.type,
+                "offset": boundary.offset,
+                "duration": normalizedEnd - boundary.offset,
+                "locator": sentence.locator,
+                "text_sha256": sentence.textHash,
+            ]
+        }
+    }
+
+    private func manifest(
+        output: SpeechEngineOutput,
+        request: ReadingSpeechGenerationRequest,
+        audioURL: URL,
+        audioDurationMS: Int,
+        rows: [[String: Any]]
+    ) throws -> [String: Any] {
+        let attributes = try fileManager.attributesOfItem(
+            atPath: audioURL.path
+        )
+        guard let audioBytes = (attributes[.size] as? NSNumber)?.intValue,
+              audioBytes >= 128,
+              audioBytes <= Self.maximumAudioBytes
+        else {
+            throw ReadingSpeechGenerationError.invalidArtifact
+        }
+        return [
+            "schema": Self.manifestSchema,
+            "cache_key": request.cacheKey,
+            "cache_key_material": request.keyMaterial,
+            "audio_file": "\(request.cacheKey).mp3",
+            "audio_sha256": try ClickTTSGate0Contract.sha256File(audioURL),
+            "audio_bytes": audioBytes,
+            "audio_duration_ms": audioDurationMS,
+            "block_id": request.block.blockID,
+            "block_kind": request.block.kind.rawValue,
+            "block_policy_revision": request.block.policyRevision,
+            "document_revision": request.block.documentRevision,
+            "chapter_locator": request.block.chapterLocator,
+            "locator_range": request.block.locatorRange,
+            "normalized_text_hash": request.block.normalizedTextHash,
+            "ordered_sentence_identity_hash":
+                request.block.orderedSentenceIdentityHash,
+            "sentences": rows,
+            "provider": [
+                "cache_key": output.providerCacheKey,
+                "source": output.source,
+                "attempt_count": output.attemptCount,
+                "synthesis_elapsed_ms": output.synthesisElapsedMS,
+            ],
+        ]
+    }
+
+    func load(
+        _ request: ReadingSpeechGenerationRequest
+    ) -> ReadingSpeechCachedBlock? {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard request.cacheKey.range(
+            of: "^[0-9a-f]{64}$",
+            options: .regularExpression
+        ) != nil
+        else {
+            return nil
+        }
+        let paths = urls(for: request.cacheKey)
+        guard directoryIsPrivate(root),
+              directoryIsPrivate(paths.shard),
+              regularFileIsPrivate(paths.audio),
+              regularFileIsPrivate(paths.manifest),
+              let audioSize = try? fileManager.attributesOfItem(
+                atPath: paths.audio.path
+              )[.size] as? NSNumber,
+              audioSize.intValue >= 128,
+              audioSize.intValue <= Self.maximumAudioBytes,
+              let manifestSize = try? fileManager.attributesOfItem(
+                atPath: paths.manifest.path
+              )[.size] as? NSNumber,
+              manifestSize.intValue > 0,
+              manifestSize.intValue <= Self.maximumManifestBytes,
+              let data = try? Data(
+                contentsOf: paths.manifest,
+                options: [.mappedIfSafe]
+              ),
+              let object = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              Set(object.keys) == Set([
+                  "schema",
+                  "cache_key",
+                  "cache_key_material",
+                  "audio_file",
+                  "audio_sha256",
+                  "audio_bytes",
+                  "audio_duration_ms",
+                  "block_id",
+                  "block_kind",
+                  "block_policy_revision",
+                  "document_revision",
+                  "chapter_locator",
+                  "locator_range",
+                  "normalized_text_hash",
+                  "ordered_sentence_identity_hash",
+                  "sentences",
+                  "provider",
+              ]),
+              object["schema"] as? String == Self.manifestSchema,
+              object["cache_key"] as? String == request.cacheKey,
+              object["cache_key_material"] as? [String: String]
+                == request.keyMaterial,
+              object["audio_file"] as? String
+                == paths.audio.lastPathComponent,
+              object["audio_sha256"] as? String
+                == (try? ClickTTSGate0Contract.sha256File(paths.audio)),
+              strictInteger(object["audio_bytes"]) == audioSize.intValue,
+              let audioDurationMS = strictInteger(
+                  object["audio_duration_ms"]
+              ),
+              audioDurationMS > 0,
+              let verifiedAudioDurationMS =
+                verifiedAudioDurationMS(
+                    paths.audio,
+                    declaredMS: audioDurationMS
+                ),
+              object["block_id"] as? String == request.block.blockID,
+              object["block_kind"] as? String
+                == request.block.kind.rawValue,
+              object["block_policy_revision"] as? String
+                == request.block.policyRevision,
+              object["document_revision"] as? String
+                == request.block.documentRevision,
+              object["chapter_locator"] as? String
+                == request.block.chapterLocator,
+              object["locator_range"] as? String
+                == request.block.locatorRange,
+              object["normalized_text_hash"] as? String
+                == request.block.normalizedTextHash,
+              object["ordered_sentence_identity_hash"] as? String
+                == request.block.orderedSentenceIdentityHash,
+              let rows = object["sentences"] as? [[String: Any]],
+              rows.count == request.block.sentences.count
+        else {
+            return nil
+        }
+
+        let maximumOffset = verifiedAudioDurationMS * 10_000
+        var previousEnd = 0
+        var cachedBoundaries: [SpeechEngineBoundary] = []
+        for (ordinal, pair) in zip(
+            request.block.sentences,
+            rows
+        ).enumerated() {
+            let sentence = pair.0
+            let row = pair.1
+            guard Set(row.keys) == Set([
+                "ordinal",
+                "type",
+                "offset",
+                "duration",
+                "locator",
+                "text_sha256",
+            ]),
+            strictInteger(row["ordinal"]) == ordinal,
+            row["type"] as? String == "SentenceBoundary",
+            row["locator"] as? String == sentence.locator,
+            row["text_sha256"] as? String == sentence.textHash,
+            let offset = strictInteger(row["offset"]),
+            let duration = strictInteger(row["duration"]),
+            duration > 0,
+            offset >= previousEnd,
+            offset + duration <= maximumOffset
+            else {
+                return nil
+            }
+            previousEnd = offset + duration
+            cachedBoundaries.append(
+                SpeechEngineBoundary(
+                    ordinal: ordinal,
+                    type: "SentenceBoundary",
+                    offset: offset,
+                    duration: duration
+                )
+            )
+        }
+        guard let provider = object["provider"] as? [String: Any],
+              Set(provider.keys) == Set([
+                  "cache_key",
+                  "source",
+                  "attempt_count",
+                  "synthesis_elapsed_ms",
+              ]),
+              let providerCacheKey = provider["cache_key"] as? String,
+              providerCacheKey.range(
+                of: "^[0-9a-f]{64}$",
+                options: .regularExpression
+              ) != nil,
+              let source = provider["source"] as? String,
+              ["online", "cache", "probe"].contains(source),
+              let attemptCount = strictInteger(provider["attempt_count"]),
+              (0...3).contains(attemptCount),
+              let synthesisElapsedMS = strictInteger(
+                provider["synthesis_elapsed_ms"]
+              )
+        else {
+            return nil
+        }
+        let cached = ReadingSpeechCachedBlock(
+            cacheKey: request.cacheKey,
+            audioURL: paths.audio,
+            manifestURL: paths.manifest,
+            source: "cache",
+            audioDurationMS: verifiedAudioDurationMS,
+            sentenceCount: rows.count,
+            boundaries: cachedBoundaries,
+            providerAttemptCount: attemptCount,
+            synthesisElapsedMS: synthesisElapsedMS
+        )
+        touch(audioURL: paths.audio, manifestURL: paths.manifest)
+        return cached
+    }
+
+    func commit(
+        _ output: SpeechEngineOutput,
+        for request: ReadingSpeechGenerationRequest
+    ) throws -> ReadingSpeechCachedBlock {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        guard request.cacheKey.range(
+            of: "^[0-9a-f]{64}$",
+            options: .regularExpression
+        ) != nil,
+        regularFileIsPrivate(output.audioURL),
+        let verifiedAudioDurationMS =
+            verifiedAudioDurationMS(
+                output.audioURL,
+                declaredMS: output.audioDurationMS
+            )
+        else {
+            throw ReadingSpeechGenerationError.invalidArtifact
+        }
+        let rows = try validatedBoundaryRows(
+            output: output,
+            request: request,
+            audioDurationMS: verifiedAudioDurationMS
+        )
+        let paths = urls(for: request.cacheKey)
+        try ensurePrivateHierarchy(shard: paths.shard)
+        let token = "\(getpid()).\(UUID().uuidString.lowercased())"
+        let partialAudio = paths.audio.appendingPathExtension(
+            "partial.\(token)"
+        )
+        let partialManifest = paths.manifest.appendingPathExtension(
+            "partial.\(token)"
+        )
+        defer {
+            for url in [partialAudio, partialManifest] {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+        do {
+            try writePrivateCopy(
+                from: output.audioURL,
+                to: partialAudio
+            )
+            try commitFault?(.afterAudioPartial)
+            let value = try manifest(
+                output: output,
+                request: request,
+                audioURL: partialAudio,
+                audioDurationMS: verifiedAudioDurationMS,
+                rows: rows
+            )
+            let data = try JSONSerialization.data(
+                withJSONObject: value,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )
+            try writePrivateData(data, to: partialManifest)
+            try commitFault?(.afterManifestPartial)
+
+            try removeCommitMarker(paths.manifest)
+            fsyncDirectory(paths.shard)
+            try safeRename(partialAudio, paths.audio)
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: paths.audio.path
+            )
+            try commitFault?(.afterAudioRename)
+            try safeRename(partialManifest, paths.manifest)
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: paths.manifest.path
+            )
+            fsyncDirectory(paths.shard)
+            try commitFault?(.afterManifestRename)
+        } catch {
+            throw error
+        }
+        guard let cached = load(request) else {
+            try? removeCommitMarker(paths.manifest)
+            throw ReadingSpeechGenerationError.cacheCommit
+        }
+        return ReadingSpeechCachedBlock(
+            cacheKey: cached.cacheKey,
+            audioURL: cached.audioURL,
+            manifestURL: cached.manifestURL,
+            source: output.source,
+            audioDurationMS: cached.audioDurationMS,
+            sentenceCount: cached.sentenceCount,
+            boundaries: cached.boundaries,
+            providerAttemptCount: output.attemptCount,
+            synthesisElapsedMS: output.synthesisElapsedMS
+        )
+    }
+}
+
+private final class EdgeTTSHelperMessageBuffer {
+    struct Snapshot {
+        let messages: [[String: Any]]
+        let terminated: Bool
+        let terminationStatus: Int32?
+        let invalid: Bool
+    }
+
+    private let condition = NSCondition()
+    private var buffer = Data()
+    private var messages: [[String: Any]] = []
+    private var terminated = false
+    private var terminationStatus: Int32?
+    private var invalid = false
+
+    func append(_ data: Data) {
+        condition.lock()
+        defer {
+            condition.broadcast()
+            condition.unlock()
+        }
+        guard !invalid else {
+            return
+        }
+        buffer.append(data)
+        guard buffer.count <= 1024 * 1024 else {
+            invalid = true
+            return
+        }
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let line = buffer.prefix(upTo: newline)
+            buffer.removeSubrange(...newline)
+            guard !line.isEmpty,
+                  line.count <= 256 * 1024,
+                  let object = try? JSONSerialization.jsonObject(
+                    with: Data(line)
+                  ) as? [String: Any]
+            else {
+                invalid = true
+                return
+            }
+            messages.append(object)
+        }
+    }
+
+    func markTerminated(status: Int32) {
+        condition.lock()
+        terminated = true
+        terminationStatus = status
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait(until deadline: Date) -> Snapshot {
+        condition.lock()
+        while messages.isEmpty, !terminated, !invalid {
+            if !condition.wait(until: deadline) {
+                break
+            }
+        }
+        let drained = messages
+        messages.removeAll(keepingCapacity: true)
+        let snapshot = Snapshot(
+            messages: drained,
+            terminated: terminated,
+            terminationStatus: terminationStatus,
+            invalid: invalid
+        )
+        condition.unlock()
+        return snapshot
+    }
+}
+
+struct EdgeTTSOnlineEngineSnapshot {
+    let helperStartCount: Int
+    let maximumConcurrentHelpers: Int
+    let activeHelperPID: Int32?
+    let lastHelperPID: Int32?
+}
+
+final class EdgeTTSOnlineEngine: SpeechEngine {
+    typealias EventHandler = ([String: Any]) -> Void
+
+    private let lock = NSLock()
+    private let eventHandler: EventHandler?
+    private var activeProcess: Process?
+    private var activePGID: Int32?
+    private var cancellationRequested = false
+    private var helperStartCount = 0
+    private var activeHelperCount = 0
+    private var maximumConcurrentHelpers = 0
+    private var lastHelperPID: Int32?
+
+    init(eventHandler: EventHandler? = nil) {
+        self.eventHandler = eventHandler
+    }
+
+    func snapshot() -> EdgeTTSOnlineEngineSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return EdgeTTSOnlineEngineSnapshot(
+            helperStartCount: helperStartCount,
+            maximumConcurrentHelpers: maximumConcurrentHelpers,
+            activeHelperPID: activeProcess?.isRunning == true
+                ? activeProcess?.processIdentifier
+                : nil,
+            lastHelperPID: lastHelperPID
+        )
+    }
+
+    private func emit(_ event: [String: Any]) {
+        eventHandler?(event)
+    }
+
+    private func isCanceled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    private func begin(_ process: Process) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeProcess == nil, !cancellationRequested else {
+            if cancellationRequested {
+                throw ReadingSpeechGenerationError.canceled
+            }
+            throw ReadingSpeechGenerationError.helperFailed("busy")
+        }
+        activeProcess = process
+        activePGID = nil
+        helperStartCount += 1
+        activeHelperCount += 1
+        maximumConcurrentHelpers = max(
+            maximumConcurrentHelpers,
+            activeHelperCount
+        )
+        lastHelperPID = process.processIdentifier
+    }
+
+    private func setVerifiedPGID(
+        _ pgid: Int32,
+        for process: Process
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeProcess === process,
+              process.processIdentifier == pgid,
+              getpgid(process.processIdentifier) == pgid
+        else {
+            return false
+        }
+        activePGID = pgid
+        return true
+    }
+
+    private func end(_ process: Process) {
+        lock.lock()
+        guard activeProcess === process else {
+            lock.unlock()
+            return
+        }
+        activeProcess = nil
+        activePGID = nil
+        cancellationRequested = false
+        activeHelperCount = max(0, activeHelperCount - 1)
+        lock.unlock()
+    }
+
+    private func signal(
+        process: Process,
+        pgid: Int32?,
+        value: Int32
+    ) {
+        let pid = process.processIdentifier
+        guard pid > 0 else {
+            return
+        }
+        if let pgid,
+           pgid == pid,
+           getpgid(pid) == pgid {
+            _ = kill(-pgid, value)
+        } else {
+            _ = kill(pid, value)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let process = activeProcess
+        let pgid = activePGID
+        lock.unlock()
+        guard let process else {
+            return
+        }
+        signal(process: process, pgid: pgid, value: SIGTERM)
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + 2
+        ) { [weak self, weak process] in
+            guard let self, let process, process.isRunning else {
+                return
+            }
+            self.signal(process: process, pgid: pgid, value: SIGKILL)
+        }
+    }
+
+    private func terminateAndWait(
+        _ process: Process,
+        pgid: Int32?,
+        grace: TimeInterval
+    ) {
+        guard process.isRunning else {
+            return
+        }
+        signal(process: process, pgid: pgid, value: SIGTERM)
+        let deadline = Date().addingTimeInterval(grace)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            signal(process: process, pgid: pgid, value: SIGKILL)
+            let killDeadline = Date().addingTimeInterval(1)
+            while process.isRunning, Date() < killDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+    }
+
+    private func write(
+        _ object: [String: Any],
+        to handle: FileHandle
+    ) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        try handle.write(contentsOf: data + Data([0x0A]))
+    }
+
+    private func strictInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite,
+              number.doubleValue.rounded(.towardZero) == number.doubleValue,
+              number.doubleValue >= 0,
+              number.doubleValue <= 9_000_000_000_000
+        else {
+            return nil
+        }
+        return number.intValue
+    }
+
+    private func validReady(
+        _ message: [String: Any],
+        process: Process
+    ) -> Int32? {
+        guard message["type"] as? String == "ready",
+              strictInteger(message["protocol_version"]) == 1,
+              message["helper_version"] as? String == "0.1.0",
+              message["edge_tts_version"] as? String
+                == ClickTTSGate0Contract.expectedEdgeTTSVersion,
+              message["runtime_version_ok"] as? Bool == true,
+              message["disclosure_revision"] as? String
+                == ClickTTSGate0Contract.disclosureRevision,
+              message["cache_namespace"] as? String
+                == ClickTTSGate0Contract.cacheNamespace,
+              strictInteger(message["pid"])
+                == Int(process.processIdentifier),
+              strictInteger(message["ppid"]) == Int(getpid()),
+              let pgidValue = strictInteger(message["pgid"]),
+              pgidValue == Int(process.processIdentifier),
+              let capabilities = message["capabilities"]
+                as? [String: Any],
+              let operations = capabilities["operations"] as? [String],
+              operations.contains("synthesize"),
+              operations.contains("cancel"),
+              operations.contains("shutdown"),
+              strictInteger(capabilities["max_provider_attempts"]) == 3,
+              let network = message["network"] as? [String: Any],
+              network["hostname"] as? String
+                == "speech.platform.bing.com",
+              network["protocol"] as? String == "wss",
+              strictInteger(network["port"]) == 443,
+              network["proxy_mode"] as? String == "direct-no-proxy",
+              network["tls_verification"] as? Bool == true
+        else {
+            return nil
+        }
+        return Int32(pgidValue)
+    }
+
+    private func parseBoundaries(
+        _ url: URL
+    ) throws -> [SpeechEngineBoundary] {
+        guard let data = try? Data(
+            contentsOf: url,
+            options: [.mappedIfSafe]
+        ),
+        let rows = try? JSONSerialization.jsonObject(with: data)
+            as? [[String: Any]],
+        !rows.isEmpty
+        else {
+            throw ReadingSpeechGenerationError.invalidArtifact
+        }
+        return try rows.enumerated().map { ordinal, row in
+            guard Set(row.keys) == Set([
+                "ordinal",
+                "type",
+                "offset",
+                "duration",
+            ]),
+            strictInteger(row["ordinal"]) == ordinal,
+            let type = row["type"] as? String,
+            let offset = strictInteger(row["offset"]),
+            let duration = strictInteger(row["duration"])
+            else {
+                throw ReadingSpeechGenerationError.invalidArtifact
+            }
+            return SpeechEngineBoundary(
+                ordinal: ordinal,
+                type: type,
+                offset: offset,
+                duration: duration
+            )
+        }
+    }
+
+    func synthesize(
+        _ request: ReadingSpeechGenerationRequest
+    ) throws -> SpeechEngineOutput {
+        defer {
+            lock.lock()
+            if activeProcess == nil {
+                cancellationRequested = false
+            }
+            lock.unlock()
+        }
+        if isCanceled() {
+            throw ReadingSpeechGenerationError.canceled
+        }
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious, .critical:
+            throw ReadingSpeechGenerationError.thermalBlocked
+        default:
+            break
+        }
+        let runtime: ClickTTSGate0RuntimeLocation
+        do {
+            runtime = try ClickTTSGate0RuntimeVerifier.locateAndVerify {
+                if self.isCanceled() {
+                    throw ReadingSpeechGenerationError.canceled
+                }
+            }
+            let manifestURL = runtime.root.appendingPathComponent(
+                "runtime-manifest.json"
+            )
+            guard runtime.runtimeID == request.engineIdentity.runtimeID,
+                  try ClickTTSGate0Contract.sha256File(manifestURL)
+                    == request.engineIdentity.runtimeManifestSHA256,
+                  try ClickTTSGate0Contract.sha256File(runtime.helper)
+                    == request.engineIdentity.helperSHA256
+            else {
+                throw ReadingSpeechGenerationError.runtimeIdentityMismatch
+            }
+        } catch let error as ReadingSpeechGenerationError {
+            throw error
+        } catch {
+            throw ReadingSpeechGenerationError.runtimeUnavailable
+        }
+
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        let errors = Pipe()
+        let state = EdgeTTSHelperMessageBuffer()
+        process.executableURL = runtime.python
+        process.arguments = [runtime.helper.path]
+        process.currentDirectoryURL = runtime.root
+        process.environment = [
+            "HOME": NSHomeDirectory(),
+            "TMPDIR": NSTemporaryDirectory(),
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+            "NO_PROXY": "*",
+            "no_proxy": "*",
+            "CLICK_TTS_NETWORK_MODE": "direct-no-proxy",
+        ]
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errors
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                state.append(data)
+            }
+        }
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
+        process.terminationHandler = { terminated in
+            state.markTerminated(status: terminated.terminationStatus)
+        }
+
+        do {
+            try process.run()
+            do {
+                try begin(process)
+            } catch {
+                terminateAndWait(process, pgid: nil, grace: 1)
+                throw error
+            }
+        } catch let error as ReadingSpeechGenerationError {
+            throw error
+        } catch {
+            throw ReadingSpeechGenerationError.runtimeUnavailable
+        }
+        let pid = process.processIdentifier
+        emit([
+            "event": "helper_started",
+            "pid": Int(pid),
+            "cache_key": request.cacheKey,
+        ])
+        defer {
+            output.fileHandleForReading.readabilityHandler = nil
+            errors.fileHandleForReading.readabilityHandler = nil
+            try? input.fileHandleForWriting.close()
+            try? output.fileHandleForReading.close()
+            try? errors.fileHandleForReading.close()
+            if process.isRunning {
+                lock.lock()
+                let pgid = activePGID
+                lock.unlock()
+                terminateAndWait(process, pgid: pgid, grace: 2)
+            }
+            let status = process.terminationStatus
+            end(process)
+            ClickTTSGate0Cache.cleanupPartials(ownedBy: pid)
+            emit([
+                "event": "helper_terminated",
+                "pid": Int(pid),
+                "status": Int(status),
+                "cache_key": request.cacheKey,
+            ])
+        }
+
+        let requestID = "reading-\(request.cacheKey.prefix(24))"
+        let deadline = Date().addingTimeInterval(70)
+        var ready = false
+        var result: [String: Any]?
+        var helperPGID: Int32?
+        var shutdownSent = false
+        while Date() < deadline {
+            if isCanceled(), !process.isRunning {
+                break
+            }
+            let snapshot = state.wait(
+                until: min(
+                    deadline,
+                    Date().addingTimeInterval(0.1)
+                )
+            )
+            if snapshot.invalid {
+                throw ReadingSpeechGenerationError.helperProtocol
+            }
+            for message in snapshot.messages {
+                if message["type"] as? String == "ready" {
+                    guard !ready,
+                          let pgid = validReady(
+                              message,
+                              process: process
+                          ),
+                          setVerifiedPGID(pgid, for: process)
+                    else {
+                        throw ReadingSpeechGenerationError.helperProtocol
+                    }
+                    helperPGID = pgid
+                    ready = true
+                    emit([
+                        "event": "helper_ready",
+                        "pid": Int(pid),
+                        "pgid": Int(pgid),
+                        "cache_key": request.cacheKey,
+                    ])
+                    if isCanceled() {
+                        cancel()
+                        continue
+                    }
+                    try write(
+                        [
+                            "type": "request",
+                            "id": requestID,
+                            "op": "synthesize",
+                            "text": request.block.text,
+                            "voice": request.profile.voiceID,
+                            "cache_context": request.helperCacheContext,
+                            "synthesis": request.helperSynthesis,
+                            "disclosure": [
+                                "revision":
+                                    ClickTTSGate0Contract
+                                        .disclosureRevision,
+                                "authorized": true,
+                            ],
+                        ],
+                        to: input.fileHandleForWriting
+                    )
+                    emit([
+                        "event": "generation_submitted",
+                        "pid": Int(pid),
+                        "cache_key": request.cacheKey,
+                        "character_count": request.block.text.count,
+                    ])
+                    continue
+                }
+                guard message["type"] as? String == "result",
+                      let op = message["op"] as? String
+                else {
+                    throw ReadingSpeechGenerationError.helperProtocol
+                }
+                if op == "startup" {
+                    let error = message["error"] as? [String: Any]
+                    throw ReadingSpeechGenerationError.helperFailed(
+                        error?["category"] as? String ?? "startup"
+                    )
+                }
+                if op == "synthesize" {
+                    guard ready,
+                          message["id"] as? String == requestID,
+                          result == nil
+                    else {
+                        throw ReadingSpeechGenerationError.helperProtocol
+                    }
+                    result = message
+                    if !shutdownSent {
+                        try write(
+                            [
+                                "type": "request",
+                                "id":
+                                    "shutdown-\(request.cacheKey.prefix(20))",
+                                "op": "shutdown",
+                            ],
+                            to: input.fileHandleForWriting
+                        )
+                        shutdownSent = true
+                    }
+                } else if op != "shutdown" {
+                    throw ReadingSpeechGenerationError.helperProtocol
+                }
+            }
+            if snapshot.terminated {
+                break
+            }
+        }
+
+        if isCanceled() {
+            terminateAndWait(process, pgid: helperPGID, grace: 2)
+            throw ReadingSpeechGenerationError.canceled
+        }
+        guard let result else {
+            terminateAndWait(process, pgid: helperPGID, grace: 2)
+            if Date() >= deadline {
+                throw ReadingSpeechGenerationError.timedOut
+            }
+            throw ReadingSpeechGenerationError.helperProtocol
+        }
+        if process.isRunning {
+            let exitDeadline = Date().addingTimeInterval(3)
+            while process.isRunning, Date() < exitDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        if process.isRunning {
+            terminateAndWait(process, pgid: helperPGID, grace: 1)
+            throw ReadingSpeechGenerationError.helperProtocol
+        }
+        guard result["status"] as? String == "ok" else {
+            let error = result["error"] as? [String: Any]
+            throw ReadingSpeechGenerationError.helperFailed(
+                error?["category"] as? String ?? "unknown"
+            )
+        }
+        guard let artifact = ClickTTSGate0Cache.load(
+            text: request.block.text,
+            voice: request.profile.voiceID,
+            cacheContext: request.helperCacheContext,
+            synthesisSettings: request.helperSynthesis
+        ),
+        result["cache_key"] as? String == artifact.cacheKey,
+        let source = result["source"] as? String,
+        ["online", "cache"].contains(source),
+        let attemptCount = strictInteger(result["attempt_count"]),
+        (0...3).contains(attemptCount),
+        let synthesisElapsedMS = strictInteger(
+            result["synthesis_elapsed_ms"]
+        ),
+        let audioDurationMS = strictInteger(result["audio_duration_ms"]),
+        audioDurationMS > 0
+        else {
+            throw ReadingSpeechGenerationError.invalidArtifact
+        }
+        let boundaries = try parseBoundaries(artifact.metadataURL)
+        return SpeechEngineOutput(
+            audioURL: artifact.audioURL,
+            boundaries: boundaries,
+            audioDurationMS: audioDurationMS,
+            providerCacheKey: artifact.cacheKey,
+            source: source,
+            attemptCount: attemptCount,
+            synthesisElapsedMS: synthesisElapsedMS,
+            discardStaging: {
+                _ = ClickTTSGate0Cache.evict(artifact)
+            }
+        )
+    }
+}
+
+enum ReadingSpeechRequestPolicy {
+    case networkAuthorized
+    case cacheOnly
+}
+
+struct TTSGenerationTicket: Hashable {
+    fileprivate let id: UUID
+    fileprivate let cacheKey: String
+}
+
+struct TTSGenerationCoordinatorSnapshot {
+    let activeCacheKey: String?
+    let queuedCacheKeys: [String]
+    let startedFlightCacheKeys: [String]
+    let startedFlightCount: Int
+    let startedFlightHistoryTruncated: Bool
+    let maximumConcurrentFlightCount: Int
+
+    var activeCount: Int {
+        activeCacheKey == nil ? 0 : 1
+    }
+
+    var queuedCount: Int {
+        queuedCacheKeys.count
+    }
+}
+
+final class TTSGenerationCoordinator {
+    typealias Completion = (
+        Result<ReadingSpeechCachedBlock, Error>
+    ) -> Void
+
+    private final class Flight {
+        let request: ReadingSpeechGenerationRequest
+        let sequence: UInt64
+        var waitersByTicket: [UUID: Completion]
+
+        init(
+            request: ReadingSpeechGenerationRequest,
+            sequence: UInt64,
+            ticket: UUID,
+            completion: @escaping Completion
+        ) {
+            self.request = request
+            self.sequence = sequence
+            waitersByTicket = [ticket: completion]
+        }
+    }
+
+    private let engine: SpeechEngine
+    private let cache: ReadingSpeechCaching
+    private let callbackQueue: DispatchQueue
+    private let stateQueue = DispatchQueue(
+        label: "local.click.reader-tts-generation-state",
+        qos: .utility
+    )
+    private let workerQueue = DispatchQueue(
+        label: "local.click.reader-tts-generation-worker",
+        qos: .utility
+    )
+    private static let maximumObservedFlightKeys = 1_024
+    private let observationLock = NSLock()
+    private var observedActiveCacheKey: String?
+    private var observedQueuedCacheKeys: [String] = []
+    private var observedStartedFlightCacheKeys: [String] = []
+    private var observedStartedFlightCount = 0
+    private var observedStartedFlightHistoryTruncated = false
+    private var observedMaximumConcurrentFlightCount = 0
+    private var active: Flight?
+    private var queued: [Flight] = []
+    private var sequence: UInt64 = 0
+    private var startedFlightCacheKeys: [String] = []
+    private var startedFlightCount = 0
+    private var startedFlightHistoryTruncated = false
+    private var maximumConcurrentFlightCount = 0
+    private var idleWaiters: [DispatchSemaphore] = []
+
+    init(
+        engine: SpeechEngine,
+        cache: ReadingSpeechCaching,
+        callbackQueue: DispatchQueue = .main
+    ) {
+        self.engine = engine
+        self.cache = cache
+        self.callbackQueue = callbackQueue
+    }
+
+    @discardableResult
+    func request(
+        _ request: ReadingSpeechGenerationRequest,
+        policy: ReadingSpeechRequestPolicy = .networkAuthorized,
+        completion: @escaping Completion
+    ) -> TTSGenerationTicket {
+        let ticket = TTSGenerationTicket(
+            id: UUID(),
+            cacheKey: request.cacheKey
+        )
+        stateQueue.async {
+            if let cached = self.cache.load(request) {
+                self.callbackQueue.async {
+                    completion(.success(cached))
+                }
+                return
+            }
+            guard policy == .networkAuthorized else {
+                self.callbackQueue.async {
+                    completion(
+                        .failure(
+                            ReadingSpeechGenerationError
+                                .cacheMissRequiresNetwork
+                        )
+                    )
+                }
+                return
+            }
+            if let active = self.active,
+               active.request.cacheKey == request.cacheKey {
+                active.waitersByTicket[ticket.id] = completion
+                return
+            }
+            if let existing = self.queued.first(
+                where: { $0.request.cacheKey == request.cacheKey }
+            ) {
+                existing.waitersByTicket[ticket.id] = completion
+                return
+            }
+            self.sequence &+= 1
+            let flight = Flight(
+                request: request,
+                sequence: self.sequence,
+                ticket: ticket.id,
+                completion: completion
+            )
+            if request.block.kind == .first,
+               let firstSteady = self.queued.firstIndex(
+                   where: { $0.request.block.kind == .steady }
+               ) {
+                self.queued.insert(flight, at: firstSteady)
+            } else {
+                self.queued.append(flight)
+            }
+            self.startNextIfNeeded()
+            self.refreshObservation()
+        }
+        return ticket
+    }
+
+    func cancel(_ ticket: TTSGenerationTicket) {
+        stateQueue.sync {
+            if let active = self.active,
+               active.request.cacheKey == ticket.cacheKey,
+               let completion = active.waitersByTicket.removeValue(
+                   forKey: ticket.id
+               ) {
+                self.callbackQueue.async {
+                    completion(
+                        .failure(ReadingSpeechGenerationError.canceled)
+                    )
+                }
+                if active.waitersByTicket.isEmpty {
+                    self.engine.cancel()
+                }
+                return
+            }
+            guard let index = self.queued.firstIndex(
+                where: { $0.request.cacheKey == ticket.cacheKey }
+            ) else {
+                return
+            }
+            let flight = self.queued[index]
+            if let completion = flight.waitersByTicket.removeValue(
+                forKey: ticket.id
+            ) {
+                self.callbackQueue.async {
+                    completion(
+                        .failure(ReadingSpeechGenerationError.canceled)
+                    )
+                }
+            }
+            if flight.waitersByTicket.isEmpty {
+                self.queued.remove(at: index)
+                self.refreshObservation()
+            }
+            self.signalIdleIfNeeded()
+        }
+    }
+
+    func cancelAllAndWait(timeout: TimeInterval) -> Bool {
+        let deadline = DispatchTime.now() + max(0, timeout)
+        let waiter = DispatchSemaphore(value: 0)
+        observationLock.lock()
+        let hasActiveFlight = observedActiveCacheKey != nil
+        observationLock.unlock()
+        if hasActiveFlight {
+            engine.cancel()
+        }
+        stateQueue.async {
+            for flight in self.queued {
+                for completion in flight.waitersByTicket.values {
+                    self.callbackQueue.async {
+                        completion(
+                            .failure(
+                                ReadingSpeechGenerationError.canceled
+                            )
+                        )
+                    }
+                }
+            }
+            self.queued.removeAll()
+            if let active = self.active {
+                for completion in active.waitersByTicket.values {
+                    self.callbackQueue.async {
+                        completion(
+                            .failure(
+                                ReadingSpeechGenerationError.canceled
+                            )
+                        )
+                    }
+                }
+                active.waitersByTicket.removeAll()
+                self.engine.cancel()
+            }
+            self.refreshObservation()
+            if self.active == nil, self.queued.isEmpty {
+                waiter.signal()
+            } else {
+                self.idleWaiters.append(waiter)
+            }
+        }
+        return waiter.wait(timeout: deadline) == .success
+    }
+
+    func waitUntilIdle(timeout: TimeInterval) -> Bool {
+        let waiter = DispatchSemaphore(value: 0)
+        let deadline = DispatchTime.now() + max(0, timeout)
+        stateQueue.async {
+            if self.active == nil, self.queued.isEmpty {
+                waiter.signal()
+            } else {
+                self.idleWaiters.append(waiter)
+            }
+        }
+        return waiter.wait(timeout: deadline) == .success
+    }
+
+    func snapshot() -> TTSGenerationCoordinatorSnapshot {
+        observationLock.lock()
+        defer { observationLock.unlock() }
+        return TTSGenerationCoordinatorSnapshot(
+            activeCacheKey: observedActiveCacheKey,
+            queuedCacheKeys: observedQueuedCacheKeys,
+            startedFlightCacheKeys:
+                observedStartedFlightCacheKeys,
+            startedFlightCount: observedStartedFlightCount,
+            startedFlightHistoryTruncated:
+                observedStartedFlightHistoryTruncated,
+            maximumConcurrentFlightCount:
+                observedMaximumConcurrentFlightCount
+        )
+    }
+
+    func resetObservationHistoryIfIdle() -> Bool {
+        stateQueue.sync {
+            guard active == nil, queued.isEmpty else {
+                return false
+            }
+            startedFlightCacheKeys.removeAll(
+                keepingCapacity: true
+            )
+            startedFlightCount = 0
+            startedFlightHistoryTruncated = false
+            maximumConcurrentFlightCount = 0
+            refreshObservation()
+            return true
+        }
+    }
+
+    private func startNextIfNeeded() {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        guard active == nil, !queued.isEmpty else {
+            return
+        }
+        let flight = queued.removeFirst()
+        active = flight
+        startedFlightCount += 1
+        startedFlightCacheKeys.append(flight.request.cacheKey)
+        if startedFlightCacheKeys.count
+            > Self.maximumObservedFlightKeys {
+            startedFlightCacheKeys.removeFirst(
+                startedFlightCacheKeys.count
+                    - Self.maximumObservedFlightKeys
+            )
+            startedFlightHistoryTruncated = true
+        }
+        maximumConcurrentFlightCount = max(
+            maximumConcurrentFlightCount,
+            active == nil ? 0 : 1
+        )
+        workerQueue.async {
+            let result: Result<ReadingSpeechCachedBlock, Error>
+            let mayProceed = self.stateQueue.sync {
+                self.active === flight
+                    && !flight.waitersByTicket.isEmpty
+            }
+            if !mayProceed {
+                result = .failure(
+                    ReadingSpeechGenerationError.canceled
+                )
+            } else if let cached = self.cache.load(flight.request) {
+                result = .success(cached)
+            } else {
+                do {
+                    let output = try self.engine.synthesize(
+                        flight.request
+                    )
+                    defer { output.discardStaging?() }
+                    result = .success(
+                        try self.cache.commit(
+                            output,
+                            for: flight.request
+                        )
+                    )
+                } catch {
+                    result = .failure(error)
+                }
+            }
+            self.stateQueue.async {
+                self.finish(flight, result: result)
+            }
+        }
+    }
+
+    private func finish(
+        _ flight: Flight,
+        result: Result<ReadingSpeechCachedBlock, Error>
+    ) {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        guard active === flight else {
+            return
+        }
+        active = nil
+        let completions = flight.waitersByTicket.values
+        for completion in completions {
+            callbackQueue.async {
+                completion(result)
+            }
+        }
+        startNextIfNeeded()
+        refreshObservation()
+        signalIdleIfNeeded()
+    }
+
+    private func refreshObservation() {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        observationLock.lock()
+        observedActiveCacheKey = active?.request.cacheKey
+        observedQueuedCacheKeys = queued.map {
+            $0.request.cacheKey
+        }
+        observedStartedFlightCacheKeys =
+            startedFlightCacheKeys
+        observedStartedFlightCount = startedFlightCount
+        observedStartedFlightHistoryTruncated =
+            startedFlightHistoryTruncated
+        observedMaximumConcurrentFlightCount =
+            maximumConcurrentFlightCount
+        observationLock.unlock()
+    }
+
+    private func signalIdleIfNeeded() {
+        dispatchPrecondition(condition: .onQueue(stateQueue))
+        guard active == nil, queued.isEmpty else {
+            return
+        }
+        let waiters = idleWaiters
+        idleWaiters.removeAll()
+        for waiter in waiters {
+            waiter.signal()
+        }
+    }
+}
+
+struct NativeAudioPlaybackItem {
+    let request: ReadingSpeechGenerationRequest
+    let cached: ReadingSpeechCachedBlock
+    private let cache: ReadingV2AudioCache
+
+    init?(
+        request: ReadingSpeechGenerationRequest,
+        cache: ReadingV2AudioCache
+    ) {
+        guard let cached = cache.load(request) else {
+            return nil
+        }
+        self.request = request
+        self.cached = cached
+        self.cache = cache
+    }
+
+    fileprivate func freshlyValidated() -> NativeAudioPlaybackItem? {
+        NativeAudioPlaybackItem(
+            request: request,
+            cache: cache
+        )
+    }
+}
+
+enum NativeAudioPlaybackRate: String, CaseIterable, Codable, Equatable {
+    case x08 = "0.8"
+    case x10 = "1.0"
+    case x12 = "1.2"
+    case x15 = "1.5"
+    case x20 = "2.0"
+
+    var multiplier: Float {
+        switch self {
+        case .x08: return 0.8
+        case .x10: return 1.0
+        case .x12: return 1.2
+        case .x15: return 1.5
+        case .x20: return 2.0
+        }
+    }
+}
+
+enum NativeAudioPlayerState: String, Codable, Equatable {
+    case idle
+    case preparing
+    case buffering
+    case playing
+    case paused
+    case completed
+    case stopped
+    case recoverableError
+}
+
+enum NativeAudioPlayerEventKind: String, Codable, Equatable {
+    case preparing
+    case buffering
+    case blockStarted
+    case sentenceBoundary
+    case blockFinished
+    case paused
+    case sentenceBoundaryPaused
+    case chapterBoundaryPaused
+    case resumed
+    case rateChanged
+    case completed
+    case stopped
+    case failed
+}
+
+struct NativeAudioPlayerEvent {
+    let sessionGeneration: UUID
+    let kind: NativeAudioPlayerEventKind
+    let blockIndex: Int?
+    let cacheKey: String?
+    let locator: String?
+    let playerTimeSeconds: TimeInterval?
+    let handoffGapMS: Double?
+    let rate: NativeAudioPlaybackRate
+    let errorCategory: String?
+}
+
+struct NativeAudioPlayerSnapshot {
+    let sessionGeneration: UUID
+    let state: NativeAudioPlayerState
+    let currentBlockIndex: Int?
+    let currentTimeSeconds: TimeInterval
+    let rate: NativeAudioPlaybackRate
+    let emittedLocatorCount: Int
+    let decoderStartCount: Int
+    let playerStartCount: Int
+    let maximumConcurrentPlaying: Int
+}
+
+enum NativeAudioPlayerError: Error, CustomStringConvertible, Equatable {
+    case invalidSequence
+    case missingCommittedArtifact
+    case decodeFailed
+    case playbackFailed
+    case handoffExceeded
+
+    var category: String {
+        switch self {
+        case .invalidSequence: return "invalid_sequence"
+        case .missingCommittedArtifact: return "missing_committed_artifact"
+        case .decodeFailed: return "decode_failed"
+        case .playbackFailed: return "playback_failed"
+        case .handoffExceeded: return "handoff_exceeded"
+        }
+    }
+
+    var description: String {
+        category
+    }
+}
+
+final class NativeAudioPlayer: NSObject, AVAudioPlayerDelegate {
+    typealias EventHandler = (NativeAudioPlayerEvent) -> Void
+
+    private struct SentenceEndPauseTarget: Equatable {
+        let blockIndex: Int
+        let boundaryOrdinal: Int
+        let endSeconds: TimeInterval
+    }
+
+    private static let boundaryTickSeconds: TimeInterval = 0.05
+    private static let maximumHandoffSeconds: TimeInterval = 0.300
+    private static let audioDurationToleranceSeconds: TimeInterval = 0.100
+
+    private let eventHandler: EventHandler
+    private(set) var state: NativeAudioPlayerState = .idle
+    private var items: [NativeAudioPlaybackItem] = []
+    private var currentPlayer: AVAudioPlayer?
+    private var preparedNextPlayer: AVAudioPlayer?
+    private var currentBlockIndex: Int?
+    private var boundaryCursor = 0
+    private var expectedLocators: [String] = []
+    private var emittedLocatorCount = 0
+    private var boundaryTimer: DispatchSourceTimer?
+    private var blockStartedEmitted = false
+    private var pendingHandoffReferenceUptime: TimeInterval?
+    private var projectedCurrentEndUptime: TimeInterval?
+    private var rate: NativeAudioPlaybackRate = .x10
+    private var volume: Float = 1
+    private var decoderStartCount = 0
+    private var playerStartCount = 0
+    private var maximumConcurrentPlaying = 0
+    private var completionEmitted = false
+    private var pauseRequested = false
+    private var sentenceEndPauseTarget: SentenceEndPauseTarget?
+    private var sentenceEndPauseTimer: DispatchSourceTimer?
+    private var pauseBeforeNextChapterRequested = false
+    private var acceptsAppends = false
+    private var sessionGeneration = UUID()
+
+    init(eventHandler: @escaping EventHandler) {
+        self.eventHandler = eventHandler
+        super.init()
+    }
+
+    static func handoffIsAcceptable(milliseconds: Double) -> Bool {
+        milliseconds.isFinite
+            && milliseconds >= 0
+            && milliseconds <= maximumHandoffSeconds * 1_000
+    }
+
+    deinit {
+        boundaryTimer?.setEventHandler {}
+        boundaryTimer?.cancel()
+        currentPlayer?.delegate = nil
+        preparedNextPlayer?.delegate = nil
+        currentPlayer?.stop()
+        preparedNextPlayer?.stop()
+    }
+
+    static func validate(
+        items: [NativeAudioPlaybackItem]
+    ) throws -> [NativeAudioPlaybackItem] {
+        guard !items.isEmpty else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        let validatedItems = items.compactMap {
+            $0.freshlyValidated()
+        }
+        guard validatedItems.count == items.count else {
+            throw NativeAudioPlayerError.missingCommittedArtifact
+        }
+        let documentRevision =
+            validatedItems[0].request.block.documentRevision
+        guard !documentRevision.isEmpty,
+              !validatedItems[0].request.block.chapterLocator.isEmpty
+        else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        var previousEndSentenceIndex: Int?
+        var previousChapterIndex: Int?
+        var previousChapterLocator: String?
+        var previousBoundaryEnd = 0
+        var locators = Set<String>()
+        for item in validatedItems {
+            let block = item.request.block
+            let cached = item.cached
+            guard block.documentRevision == documentRevision,
+                  !block.chapterLocator.isEmpty,
+                  cached.cacheKey == item.request.cacheKey,
+                  ["cache", "online"].contains(cached.source),
+                  cached.audioDurationMS > 0,
+                  cached.sentenceCount == block.sentences.count,
+                  cached.boundaries.count == block.sentences.count,
+                  block.startSentenceIndex
+                    == block.sentences.first?.index,
+                  block.endSentenceIndex
+                    == block.sentences.last?.index,
+                  block.startSentenceIndex <= block.endSentenceIndex
+            else {
+                throw NativeAudioPlayerError.invalidSequence
+            }
+            if let previousEndSentenceIndex,
+               let previousChapterIndex,
+               let previousChapterLocator {
+                if block.chapterIndex == previousChapterIndex {
+                    guard block.chapterLocator == previousChapterLocator,
+                          block.startSentenceIndex
+                            == previousEndSentenceIndex + 1
+                    else {
+                        throw NativeAudioPlayerError.invalidSequence
+                    }
+                } else {
+                    guard block.chapterIndex == previousChapterIndex + 1,
+                          block.chapterLocator != previousChapterLocator,
+                          block.startSentenceIndex == 0
+                    else {
+                        throw NativeAudioPlayerError.invalidSequence
+                    }
+                }
+            }
+            previousEndSentenceIndex = block.endSentenceIndex
+            previousChapterIndex = block.chapterIndex
+            previousChapterLocator = block.chapterLocator
+            previousBoundaryEnd = 0
+            let maximumOffset = cached.audioDurationMS * 10_000
+            for (ordinal, pair) in zip(
+                block.sentences,
+                cached.boundaries
+            ).enumerated() {
+                let sentence = pair.0
+                let boundary = pair.1
+                let end = boundary.offset + boundary.duration
+                guard boundary.ordinal == ordinal,
+                      boundary.type == "SentenceBoundary",
+                      sentence.index
+                        == block.startSentenceIndex + ordinal,
+                      sentence.chapterIndex == block.chapterIndex,
+                      sentence.chapterLocator == block.chapterLocator,
+                      boundary.offset >= previousBoundaryEnd,
+                      boundary.duration > 0,
+                      end > boundary.offset,
+                      end <= maximumOffset,
+                      !sentence.locator.isEmpty,
+                      locators.insert(sentence.locator).inserted
+                else {
+                    throw NativeAudioPlayerError.invalidSequence
+                }
+                previousBoundaryEnd = end
+            }
+        }
+        return validatedItems
+    }
+
+    func start(
+        items: [NativeAudioPlaybackItem],
+        rate: NativeAudioPlaybackRate,
+        volume: Float = 1,
+        acceptsAppends: Bool = false
+    ) throws {
+        precondition(Thread.isMainThread)
+        let validatedItems = try Self.validate(items: items)
+        guard volume.isFinite, (0...1).contains(volume) else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        if state == .preparing || state == .playing || state == .paused {
+            releasePlayers()
+            self.items.removeAll()
+            expectedLocators.removeAll()
+            currentBlockIndex = nil
+            boundaryCursor = 0
+            projectedCurrentEndUptime = nil
+            pendingHandoffReferenceUptime = nil
+            blockStartedEmitted = false
+            completionEmitted = false
+            pauseRequested = false
+        } else {
+            releasePlayers()
+        }
+        sessionGeneration = UUID()
+        self.items = validatedItems
+        self.rate = rate
+        self.volume = volume
+        currentBlockIndex = 0
+        boundaryCursor = 0
+        expectedLocators = items.flatMap {
+            $0.request.block.sentences.map(\.locator)
+        }
+        emittedLocatorCount = 0
+        decoderStartCount = 0
+        playerStartCount = 0
+        maximumConcurrentPlaying = 0
+        completionEmitted = false
+        pauseRequested = false
+        sentenceEndPauseTarget = nil
+        pauseBeforeNextChapterRequested = false
+        self.acceptsAppends = acceptsAppends
+        blockStartedEmitted = false
+        pendingHandoffReferenceUptime = nil
+        projectedCurrentEndUptime = nil
+        state = .preparing
+        emit(kind: .preparing)
+        do {
+            currentPlayer = try makePlayer(for: 0)
+            try startCurrentPlayer(handoffReferenceUptime: nil)
+            if validatedItems.indices.contains(1) {
+                preparedNextPlayer = try makePlayer(for: 1)
+            }
+        } catch let error as NativeAudioPlayerError {
+            fail(error)
+            throw error
+        } catch {
+            fail(.decodeFailed)
+            throw NativeAudioPlayerError.decodeFailed
+        }
+    }
+
+    func append(items newItems: [NativeAudioPlaybackItem]) throws {
+        precondition(Thread.isMainThread)
+        guard acceptsAppends,
+              !newItems.isEmpty,
+              state == .preparing
+                || state == .buffering
+                || state == .playing
+                || state == .paused
+        else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        let validated = try Self.validate(items: newItems)
+        guard let existingLast = items.last?.request.block,
+              let appendedFirst = validated.first?.request.block,
+              existingLast.documentRevision
+                == appendedFirst.documentRevision
+        else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        if appendedFirst.chapterIndex == existingLast.chapterIndex {
+            guard appendedFirst.chapterLocator
+                    == existingLast.chapterLocator,
+                  appendedFirst.startSentenceIndex
+                    == existingLast.endSentenceIndex + 1
+            else {
+                throw NativeAudioPlayerError.invalidSequence
+            }
+        } else {
+            guard appendedFirst.chapterIndex
+                    == existingLast.chapterIndex + 1,
+                  appendedFirst.chapterLocator
+                    != existingLast.chapterLocator,
+                  appendedFirst.startSentenceIndex == 0
+            else {
+                throw NativeAudioPlayerError.invalidSequence
+            }
+        }
+        let existingLocators = Set(
+            items.flatMap {
+                $0.request.block.sentences.map(\.locator)
+            }
+        )
+        guard validated.allSatisfy({
+            $0.request.block.sentences.allSatisfy {
+                !existingLocators.contains($0.locator)
+            }
+        }) else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+
+        let firstNewIndex = items.count
+        items.append(contentsOf: validated)
+        expectedLocators.append(
+            contentsOf: validated.flatMap {
+                $0.request.block.sentences.map(\.locator)
+            }
+        )
+
+        if state == .buffering,
+           currentPlayer == nil,
+           currentBlockIndex == firstNewIndex {
+            do {
+                currentPlayer = try makePlayer(for: firstNewIndex)
+                let pausesAtChapterBoundary =
+                    pauseBeforeNextChapterRequested
+                    && existingLast.chapterIndex
+                        != appendedFirst.chapterIndex
+                if pausesAtChapterBoundary {
+                    pauseBeforeNextChapterRequested = false
+                    pauseRequested = true
+                    pendingHandoffReferenceUptime = nil
+                    state = .paused
+                    if items.indices.contains(firstNewIndex + 1) {
+                        preparedNextPlayer = try makePlayer(
+                            for: firstNewIndex + 1
+                        )
+                    }
+                    emit(kind: .chapterBoundaryPaused)
+                    return
+                }
+                try startCurrentPlayer(
+                    handoffReferenceUptime:
+                        pendingHandoffReferenceUptime
+                )
+                if items.indices.contains(firstNewIndex + 1) {
+                    preparedNextPlayer = try makePlayer(
+                        for: firstNewIndex + 1
+                    )
+                }
+            } catch let error as NativeAudioPlayerError {
+                fail(error)
+                throw error
+            } catch {
+                fail(.decodeFailed)
+                throw NativeAudioPlayerError.decodeFailed
+            }
+            return
+        }
+
+        if state == .playing || state == .paused,
+           let currentBlockIndex,
+           preparedNextPlayer == nil,
+           firstNewIndex == currentBlockIndex + 1 {
+            do {
+                preparedNextPlayer = try makePlayer(
+                    for: firstNewIndex
+                )
+            } catch let error as NativeAudioPlayerError {
+                fail(error)
+                throw error
+            } catch {
+                fail(.decodeFailed)
+                throw NativeAudioPlayerError.decodeFailed
+            }
+        }
+    }
+
+    func sealSequence() {
+        precondition(Thread.isMainThread)
+        acceptsAppends = false
+        guard state == .buffering,
+              let currentBlockIndex,
+              currentBlockIndex >= items.count
+        else {
+            return
+        }
+        stopBoundaryTimer()
+        self.currentBlockIndex = nil
+        state = .completed
+        guard !completionEmitted,
+              emittedLocatorCount == expectedLocators.count
+        else {
+            fail(.invalidSequence)
+            return
+        }
+        completionEmitted = true
+        emit(kind: .completed)
+    }
+
+    @discardableResult
+    func pauseAfterCurrentSentence() -> Bool {
+        precondition(Thread.isMainThread)
+        guard currentPlayer != nil,
+              let currentBlockIndex,
+              items.indices.contains(currentBlockIndex),
+              state == .preparing
+                || state == .playing
+                || state == .paused,
+              let currentPlayer,
+              !items[currentBlockIndex].cached.boundaries.isEmpty
+        else {
+            return false
+        }
+        let boundaries = items[currentBlockIndex].cached.boundaries
+        let currentTime = currentPlayer.currentTime
+        let ordinal = boundaries.lastIndex {
+            Double($0.offset) / 10_000_000 <= currentTime
+        } ?? 0
+        let boundary = boundaries[ordinal]
+        sentenceEndPauseTarget = SentenceEndPauseTarget(
+            blockIndex: currentBlockIndex,
+            boundaryOrdinal: ordinal,
+            endSeconds: Double(
+                boundary.offset + boundary.duration
+            ) / 10_000_000
+        )
+        scheduleSentenceEndPauseIfNeeded()
+        return true
+    }
+
+    func setPauseBeforeNextChapter(_ enabled: Bool) {
+        precondition(Thread.isMainThread)
+        pauseBeforeNextChapterRequested = enabled
+    }
+
+    func cancelPauseAfterCurrentSentence() {
+        precondition(Thread.isMainThread)
+        sentenceEndPauseTarget = nil
+        cancelSentenceEndPauseTimer()
+    }
+
+    @discardableResult
+    func pause() -> Bool {
+        precondition(Thread.isMainThread)
+        if state == .buffering, currentPlayer == nil {
+            pauseRequested = true
+            pendingHandoffReferenceUptime = nil
+            state = .paused
+            emit(kind: .paused)
+            return true
+        }
+        guard state == .playing,
+              let currentPlayer
+        else {
+            return false
+        }
+        pauseRequested = true
+        let now = ProcessInfo.processInfo.systemUptime
+        let projectedEndHasPassed =
+            projectedCurrentEndUptime.map {
+                now >= $0
+            } ?? false
+        let clockResetAfterObservedEnd =
+            projectedEndHasPassed
+            && blockStartedEmitted
+            && currentPlayer.currentTime <= 0.01
+        let playerClockAtEnd =
+            projectedEndHasPassed
+            && blockStartedEmitted
+            && currentPlayer.currentTime + 0.01
+                >= currentPlayer.duration
+        if !currentPlayer.isPlaying,
+           clockResetAfterObservedEnd
+                || playerClockAtEnd {
+            currentPlayer.currentTime = currentPlayer.duration
+            audioPlayerDidFinishPlaying(
+                currentPlayer,
+                successfully: true
+            )
+            guard state == .paused else {
+                return false
+            }
+            emit(
+                kind: .paused,
+                playerTimeSeconds:
+                    self.currentPlayer?.currentTime ?? 0
+            )
+            return true
+        }
+        if currentPlayer.isPlaying {
+            currentPlayer.pause()
+        }
+        cancelSentenceEndPauseTimer()
+        stopBoundaryTimer()
+        projectedCurrentEndUptime = nil
+        pendingHandoffReferenceUptime = nil
+        state = .paused
+        emit(
+            kind: .paused,
+            playerTimeSeconds: currentPlayer.currentTime
+        )
+        return true
+    }
+
+    @discardableResult
+    func resume() -> Bool {
+        precondition(Thread.isMainThread)
+        guard state == .paused else {
+            return false
+        }
+        if currentPlayer == nil {
+            pauseRequested = false
+            guard let currentBlockIndex else {
+                return false
+            }
+            if items.indices.contains(currentBlockIndex) {
+                do {
+                    currentPlayer = try makePlayer(for: currentBlockIndex)
+                    try startCurrentPlayer(
+                        handoffReferenceUptime: nil
+                    )
+                    if items.indices.contains(currentBlockIndex + 1) {
+                        preparedNextPlayer = try makePlayer(
+                            for: currentBlockIndex + 1
+                        )
+                    }
+                    emit(kind: .resumed)
+                    return true
+                } catch let error as NativeAudioPlayerError {
+                    fail(error)
+                    return false
+                } catch {
+                    fail(.decodeFailed)
+                    return false
+                }
+            }
+            guard acceptsAppends else {
+                return false
+            }
+            state = .buffering
+            emit(kind: .buffering)
+            return true
+        }
+        guard let currentPlayer else {
+            return false
+        }
+        if preparedNextPlayer == nil,
+           let currentBlockIndex,
+           items.indices.contains(currentBlockIndex + 1) {
+            do {
+                preparedNextPlayer = try makePlayer(
+                    for: currentBlockIndex + 1
+                )
+            } catch let error as NativeAudioPlayerError {
+                fail(error)
+                return false
+            } catch {
+                fail(.decodeFailed)
+                return false
+            }
+        }
+        currentPlayer.enableRate = true
+        currentPlayer.rate = rate.multiplier
+        guard currentPlayer.play() else {
+            fail(.playbackFailed)
+            return false
+        }
+        pauseRequested = false
+        playerStartCount += 1
+        state = .playing
+        guard updateMaximumConcurrentPlaying() else {
+            return false
+        }
+        updateProjectedEnd()
+        startBoundaryTimer()
+        scheduleSentenceEndPauseIfNeeded()
+        emit(
+            kind: .resumed,
+            playerTimeSeconds: currentPlayer.currentTime
+        )
+        return true
+    }
+
+    @discardableResult
+    func setRate(_ rate: NativeAudioPlaybackRate) -> Bool {
+        precondition(Thread.isMainThread)
+        guard state == .preparing
+                || state == .buffering
+                || state == .playing
+                || state == .paused
+        else {
+            return false
+        }
+        self.rate = rate
+        for player in [currentPlayer, preparedNextPlayer].compactMap({ $0 }) {
+            player.enableRate = true
+            player.rate = rate.multiplier
+        }
+        if state == .playing {
+            updateProjectedEnd()
+            scheduleSentenceEndPauseIfNeeded()
+        }
+        emit(
+            kind: .rateChanged,
+            playerTimeSeconds: currentPlayer?.currentTime
+        )
+        return true
+    }
+
+    func stop() {
+        precondition(Thread.isMainThread)
+        let shouldEmit = state != .idle && state != .stopped
+        releasePlayers()
+        items.removeAll()
+        expectedLocators.removeAll()
+        currentBlockIndex = nil
+        boundaryCursor = 0
+        projectedCurrentEndUptime = nil
+        pendingHandoffReferenceUptime = nil
+        blockStartedEmitted = false
+        completionEmitted = false
+        pauseRequested = false
+        sentenceEndPauseTarget = nil
+        cancelSentenceEndPauseTimer()
+        pauseBeforeNextChapterRequested = false
+        acceptsAppends = false
+        state = .stopped
+        sessionGeneration = UUID()
+        if shouldEmit {
+            eventHandler(
+                makeEvent(
+                    kind: .stopped
+                )
+            )
+        }
+    }
+
+    func snapshot() -> NativeAudioPlayerSnapshot {
+        precondition(Thread.isMainThread)
+        return NativeAudioPlayerSnapshot(
+            sessionGeneration: sessionGeneration,
+            state: state,
+            currentBlockIndex: currentBlockIndex,
+            currentTimeSeconds: currentPlayer?.currentTime ?? 0,
+            rate: rate,
+            emittedLocatorCount: emittedLocatorCount,
+            decoderStartCount: decoderStartCount,
+            playerStartCount: playerStartCount,
+            maximumConcurrentPlaying: maximumConcurrentPlaying
+        )
+    }
+
+    private static func regularFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
+            return false
+        }
+        return values.isRegularFile == true
+            && values.isSymbolicLink != true
+    }
+
+    private func makePlayer(for index: Int) throws -> AVAudioPlayer {
+        guard items.indices.contains(index) else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        guard let item = items[index].freshlyValidated() else {
+            throw NativeAudioPlayerError.missingCommittedArtifact
+        }
+        items[index] = item
+        guard Self.regularFile(item.cached.audioURL),
+              Self.regularFile(item.cached.manifestURL)
+        else {
+            throw NativeAudioPlayerError.missingCommittedArtifact
+        }
+        decoderStartCount += 1
+        let player: AVAudioPlayer
+        do {
+            player = try AVAudioPlayer(contentsOf: item.cached.audioURL)
+        } catch {
+            throw NativeAudioPlayerError.decodeFailed
+        }
+        player.delegate = self
+        player.numberOfLoops = 0
+        player.enableRate = true
+        player.rate = rate.multiplier
+        player.volume = volume
+        guard player.duration.isFinite,
+              player.duration > 0,
+              player.duration
+                + Self.audioDurationToleranceSeconds
+                >= lastBoundaryEndSeconds(item),
+              player.prepareToPlay()
+        else {
+            player.delegate = nil
+            throw NativeAudioPlayerError.decodeFailed
+        }
+        return player
+    }
+
+    private func startCurrentPlayer(
+        handoffReferenceUptime: TimeInterval?
+    ) throws {
+        guard let currentPlayer, currentBlockIndex != nil else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        currentPlayer.enableRate = true
+        currentPlayer.rate = rate.multiplier
+        currentPlayer.volume = volume
+        blockStartedEmitted = false
+        pendingHandoffReferenceUptime = handoffReferenceUptime
+        projectedCurrentEndUptime = nil
+        guard currentPlayer.play() else {
+            throw NativeAudioPlayerError.playbackFailed
+        }
+        playerStartCount += 1
+        state = .playing
+        guard updateMaximumConcurrentPlaying() else {
+            throw NativeAudioPlayerError.invalidSequence
+        }
+        updateProjectedEnd()
+        startBoundaryTimer()
+        scheduleSentenceEndPauseIfNeeded()
+    }
+
+    private func startBoundaryTimer() {
+        stopBoundaryTimer()
+        let generation = sessionGeneration
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now(),
+            repeating: Self.boundaryTickSeconds,
+            leeway: .milliseconds(10)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.pollBoundaries(generation: generation)
+        }
+        boundaryTimer = timer
+        timer.resume()
+    }
+
+    private func stopBoundaryTimer() {
+        guard let boundaryTimer else {
+            return
+        }
+        boundaryTimer.setEventHandler {}
+        boundaryTimer.cancel()
+        self.boundaryTimer = nil
+    }
+
+    private func pollBoundaries(generation: UUID) {
+        precondition(Thread.isMainThread)
+        guard generation == sessionGeneration,
+              state == .playing,
+              let currentPlayer,
+              let currentBlockIndex,
+              items.indices.contains(currentBlockIndex)
+        else {
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !blockStartedEmitted {
+            if let reference = pendingHandoffReferenceUptime,
+               now - reference > Self.maximumHandoffSeconds,
+               currentPlayer.currentTime <= 0.01 {
+                fail(
+                    .handoffExceeded,
+                    handoffGapMS: max(0, (now - reference) * 1_000)
+                )
+                return
+            }
+            if currentPlayer.isPlaying, currentPlayer.currentTime > 0.01 {
+                let observedStart = now
+                    - currentPlayer.currentTime
+                    / Double(rate.multiplier)
+                let gap = pendingHandoffReferenceUptime.map {
+                    max(0, (observedStart - $0) * 1_000)
+                }
+                if let gap, !Self.handoffIsAcceptable(milliseconds: gap) {
+                    fail(.handoffExceeded, handoffGapMS: gap)
+                    return
+                }
+                blockStartedEmitted = true
+                pendingHandoffReferenceUptime = nil
+                updateProjectedEnd(referenceUptime: now)
+                emit(
+                    kind: .blockStarted,
+                    playerTimeSeconds: currentPlayer.currentTime,
+                    handoffGapMS: gap
+                )
+            }
+        }
+        let item = items[currentBlockIndex]
+        while item.cached.boundaries.indices.contains(boundaryCursor) {
+            if pauseAtRequestedSentenceEndIfNeeded(
+                player: currentPlayer,
+                item: item
+            ) {
+                return
+            }
+            let boundary = item.cached.boundaries[boundaryCursor]
+            let startSeconds = Double(boundary.offset) / 10_000_000
+            guard currentPlayer.currentTime >= startSeconds else {
+                break
+            }
+            let locator = item.request.block
+                .sentences[boundaryCursor].locator
+            guard expectedLocators.indices.contains(emittedLocatorCount),
+                  expectedLocators[emittedLocatorCount] == locator
+            else {
+                fail(.invalidSequence)
+                return
+            }
+            emittedLocatorCount += 1
+            boundaryCursor += 1
+            emit(
+                kind: .sentenceBoundary,
+                locator: locator,
+                playerTimeSeconds: currentPlayer.currentTime
+            )
+        }
+        if pauseAtRequestedSentenceEndIfNeeded(
+            player: currentPlayer,
+            item: item
+        ) {
+            return
+        }
+        if state == .playing {
+            updateProjectedEnd(referenceUptime: now)
+        }
+    }
+
+    private func pauseAtRequestedSentenceEndIfNeeded(
+        player: AVAudioPlayer,
+        item: NativeAudioPlaybackItem
+    ) -> Bool {
+        guard let target = sentenceEndPauseTarget,
+              let currentBlockIndex,
+              target.blockIndex == currentBlockIndex,
+              item.cached.boundaries.indices.contains(
+                target.boundaryOrdinal
+              )
+        else {
+            return false
+        }
+        guard player.currentTime >= target.endSeconds
+        else {
+            return false
+        }
+        sentenceEndPauseTarget = nil
+        cancelSentenceEndPauseTimer()
+        pauseRequested = true
+        player.pause()
+        stopBoundaryTimer()
+        projectedCurrentEndUptime = nil
+        pendingHandoffReferenceUptime = nil
+        state = .paused
+        emit(
+            kind: .sentenceBoundaryPaused,
+            playerTimeSeconds: player.currentTime
+        )
+        return true
+    }
+
+    private func scheduleSentenceEndPauseIfNeeded() {
+        cancelSentenceEndPauseTimer()
+        guard state == .playing,
+              let target = sentenceEndPauseTarget,
+              let currentBlockIndex,
+              target.blockIndex == currentBlockIndex,
+              let currentPlayer
+        else {
+            return
+        }
+        let remainingAudioSeconds =
+            target.endSeconds - currentPlayer.currentTime
+        if remainingAudioSeconds <= 0 {
+            let item = items[currentBlockIndex]
+            _ = pauseAtRequestedSentenceEndIfNeeded(
+                player: currentPlayer,
+                item: item
+            )
+            return
+        }
+        let generation = sessionGeneration
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now()
+                + remainingAudioSeconds / Double(rate.multiplier),
+            leeway: .milliseconds(1)
+        )
+        timer.setEventHandler { [weak self, weak timer] in
+            guard let self,
+                  generation == self.sessionGeneration,
+                  self.sentenceEndPauseTarget == target,
+                  let currentBlockIndex = self.currentBlockIndex,
+                  self.items.indices.contains(currentBlockIndex),
+                  let currentPlayer = self.currentPlayer
+            else {
+                timer?.setEventHandler {}
+                timer?.cancel()
+                return
+            }
+            self.sentenceEndPauseTimer = nil
+            timer?.setEventHandler {}
+            timer?.cancel()
+            if !self.pauseAtRequestedSentenceEndIfNeeded(
+                player: currentPlayer,
+                item: self.items[currentBlockIndex]
+            ) {
+                self.scheduleSentenceEndPauseIfNeeded()
+            }
+        }
+        sentenceEndPauseTimer = timer
+        timer.resume()
+    }
+
+    private func cancelSentenceEndPauseTimer() {
+        guard let sentenceEndPauseTimer else {
+            return
+        }
+        sentenceEndPauseTimer.setEventHandler {}
+        sentenceEndPauseTimer.cancel()
+        self.sentenceEndPauseTimer = nil
+    }
+
+    private func updateProjectedEnd(
+        referenceUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) {
+        guard let currentPlayer,
+              currentPlayer.duration.isFinite,
+              rate.multiplier > 0
+        else {
+            projectedCurrentEndUptime = nil
+            return
+        }
+        let remaining = max(
+            0,
+            currentPlayer.duration - currentPlayer.currentTime
+        )
+        projectedCurrentEndUptime = referenceUptime
+            + remaining / Double(rate.multiplier)
+    }
+
+    @discardableResult
+    private func updateMaximumConcurrentPlaying() -> Bool {
+        let active = [currentPlayer, preparedNextPlayer]
+            .compactMap { $0 }
+            .filter(\.isPlaying)
+            .count
+        maximumConcurrentPlaying = max(maximumConcurrentPlaying, active)
+        if active > 1 {
+            fail(.invalidSequence)
+            return false
+        }
+        return true
+    }
+
+    private func lastBoundaryEndSeconds(
+        _ item: NativeAudioPlaybackItem
+    ) -> TimeInterval {
+        guard let boundary = item.cached.boundaries.last else {
+            return 0
+        }
+        return Double(boundary.offset + boundary.duration)
+            / 10_000_000
+    }
+
+    private func emitRemainingBoundaries() -> Bool {
+        guard let currentBlockIndex,
+              items.indices.contains(currentBlockIndex)
+        else {
+            return false
+        }
+        let item = items[currentBlockIndex]
+        while item.cached.boundaries.indices.contains(boundaryCursor) {
+            let locator = item.request.block
+                .sentences[boundaryCursor].locator
+            guard expectedLocators.indices.contains(emittedLocatorCount),
+                  expectedLocators[emittedLocatorCount] == locator,
+                  let currentPlayer,
+                  Double(item.cached.boundaries[boundaryCursor].offset)
+                    / 10_000_000
+                    <= currentPlayer.currentTime
+                        + Self.audioDurationToleranceSeconds
+            else {
+                return false
+            }
+            emittedLocatorCount += 1
+            boundaryCursor += 1
+            emit(
+                kind: .sentenceBoundary,
+                locator: locator,
+                playerTimeSeconds: currentPlayer.currentTime
+            )
+        }
+        return true
+    }
+
+    private func releasePlayers() {
+        cancelSentenceEndPauseTimer()
+        sentenceEndPauseTarget = nil
+        stopBoundaryTimer()
+        for player in [currentPlayer, preparedNextPlayer].compactMap({ $0 }) {
+            player.delegate = nil
+            player.stop()
+        }
+        currentPlayer = nil
+        preparedNextPlayer = nil
+    }
+
+    private func fail(
+        _ error: NativeAudioPlayerError,
+        handoffGapMS: Double? = nil
+    ) {
+        let blockIndex = currentBlockIndex
+        let cacheKey = blockIndex.flatMap {
+            items.indices.contains($0) ? items[$0].cached.cacheKey : nil
+        }
+        let playerTime = currentPlayer?.currentTime
+        releasePlayers()
+        state = .recoverableError
+        deliver(
+            NativeAudioPlayerEvent(
+                sessionGeneration: sessionGeneration,
+                kind: .failed,
+                blockIndex: blockIndex,
+                cacheKey: cacheKey,
+                locator: nil,
+                playerTimeSeconds: playerTime,
+                handoffGapMS: handoffGapMS,
+                rate: rate,
+                errorCategory: error.category
+            )
+        )
+    }
+
+    private func makeEvent(
+        kind: NativeAudioPlayerEventKind,
+        locator: String? = nil,
+        playerTimeSeconds: TimeInterval? = nil,
+        handoffGapMS: Double? = nil
+    ) -> NativeAudioPlayerEvent {
+        let cacheKey = currentBlockIndex.flatMap {
+            items.indices.contains($0) ? items[$0].cached.cacheKey : nil
+        }
+        return NativeAudioPlayerEvent(
+            sessionGeneration: sessionGeneration,
+            kind: kind,
+            blockIndex: currentBlockIndex,
+            cacheKey: cacheKey,
+            locator: locator,
+            playerTimeSeconds: playerTimeSeconds,
+            handoffGapMS: handoffGapMS,
+            rate: rate,
+            errorCategory: nil
+        )
+    }
+
+    private func deliver(_ event: NativeAudioPlayerEvent) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  event.sessionGeneration == self.sessionGeneration
+            else {
+                return
+            }
+            self.eventHandler(event)
+        }
+    }
+
+    private func emit(
+        kind: NativeAudioPlayerEventKind,
+        locator: String? = nil,
+        playerTimeSeconds: TimeInterval? = nil,
+        handoffGapMS: Double? = nil
+    ) {
+        deliver(
+            makeEvent(
+                kind: kind,
+                locator: locator,
+                playerTimeSeconds: playerTimeSeconds,
+                handoffGapMS: handoffGapMS
+            )
+        )
+    }
+
+    func audioPlayerDecodeErrorDidOccur(
+        _ player: AVAudioPlayer,
+        error: Error?
+    ) {
+        precondition(Thread.isMainThread)
+        guard player === currentPlayer else {
+            return
+        }
+        fail(.decodeFailed)
+    }
+
+    func audioPlayerDidFinishPlaying(
+        _ player: AVAudioPlayer,
+        successfully flag: Bool
+    ) {
+        precondition(Thread.isMainThread)
+        guard player === currentPlayer,
+              let finishedIndex = currentBlockIndex
+        else {
+            return
+        }
+        guard flag, emitRemainingBoundaries() else {
+            fail(flag ? .invalidSequence : .playbackFailed)
+            return
+        }
+        let projectedEnd = projectedCurrentEndUptime
+            ?? ProcessInfo.processInfo.systemUptime
+        emit(
+            kind: .blockFinished,
+            playerTimeSeconds: player.currentTime
+        )
+        player.delegate = nil
+        currentPlayer = nil
+        projectedCurrentEndUptime = nil
+        let pausesAfterFinishedSentence =
+            sentenceEndPauseTarget?.blockIndex == finishedIndex
+        if pausesAfterFinishedSentence {
+            sentenceEndPauseTarget = nil
+            cancelSentenceEndPauseTimer()
+            pauseRequested = true
+        }
+        let nextIndex = finishedIndex + 1
+        guard items.indices.contains(nextIndex) else {
+            stopBoundaryTimer()
+            preparedNextPlayer?.delegate = nil
+            preparedNextPlayer?.stop()
+            preparedNextPlayer = nil
+            currentBlockIndex = nextIndex
+            if acceptsAppends {
+                state = pauseRequested ? .paused : .buffering
+                pendingHandoffReferenceUptime =
+                    pauseRequested ? nil : projectedEnd
+                if pausesAfterFinishedSentence {
+                    emit(kind: .sentenceBoundaryPaused)
+                } else if !pauseRequested {
+                    emit(kind: .buffering)
+                }
+                return
+            }
+            currentBlockIndex = nil
+            state = .completed
+            guard !completionEmitted,
+                  emittedLocatorCount == expectedLocators.count
+            else {
+                fail(.invalidSequence)
+                return
+            }
+            completionEmitted = true
+            emit(kind: .completed)
+            return
+        }
+        guard let next = preparedNextPlayer else {
+            fail(.decodeFailed)
+            return
+        }
+        let pausesAtChapterBoundary =
+            pauseBeforeNextChapterRequested
+            && items[finishedIndex].request.block.chapterIndex
+                != items[nextIndex].request.block.chapterIndex
+        if pausesAtChapterBoundary {
+            pauseBeforeNextChapterRequested = false
+            pauseRequested = true
+        }
+        preparedNextPlayer = nil
+        currentBlockIndex = nextIndex
+        boundaryCursor = 0
+        currentPlayer = next
+        if pauseRequested || state == .paused {
+            state = .paused
+            blockStartedEmitted = false
+            pendingHandoffReferenceUptime = nil
+            if items.indices.contains(nextIndex + 1) {
+                do {
+                    preparedNextPlayer = try makePlayer(
+                        for: nextIndex + 1
+                    )
+                } catch {
+                    fail(.decodeFailed)
+                }
+            }
+            if pausesAtChapterBoundary {
+                emit(kind: .chapterBoundaryPaused)
+            } else if pausesAfterFinishedSentence {
+                emit(kind: .sentenceBoundaryPaused)
+            }
+            return
+        }
+        do {
+            try startCurrentPlayer(
+                handoffReferenceUptime: projectedEnd
+            )
+            let following = nextIndex + 1
+            if items.indices.contains(following) {
+                preparedNextPlayer = try makePlayer(for: following)
+            }
+        } catch let error as NativeAudioPlayerError {
+            fail(error)
+        } catch {
+            fail(.decodeFailed)
+        }
+    }
+}
+
+private final class Gate2BAcceptanceEventRecorder {
+    private let condition = NSCondition()
+    private let startedUptime = ProcessInfo.processInfo.systemUptime
+    private var stored: [[String: Any]] = []
+
+    func record(_ event: [String: Any]) {
+        var value = event
+        value["elapsed_ms"] = max(
+            0,
+            Int(
+                round(
+                    (ProcessInfo.processInfo.systemUptime
+                        - startedUptime) * 1_000
+                )
+            )
+        )
+        condition.lock()
+        stored.append(value)
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait(
+        event name: String,
+        count: Int,
+        timeout: TimeInterval
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        while stored.filter({ $0["event"] as? String == name }).count
+            < count {
+            if !condition.wait(until: deadline) {
+                return false
+            }
+        }
+        return true
+    }
+
+    func snapshot() -> [[String: Any]] {
+        condition.lock()
+        defer { condition.unlock() }
+        return stored
+    }
+}
+
+private enum Gate2BAcceptanceHarness {
+    private enum Phase: String {
+        case generate
+        case restartCacheOnly = "restart-cache-only"
+        case corruptRebuild = "corrupt-rebuild"
+    }
+
+    private struct Fixture: Decodable {
+        struct Chapter: Decodable {
+            struct Sentence: Decodable {
+                let sourcePath: String
+                let sourceOrdinal: Int
+                let text: String
+
+                enum CodingKeys: String, CodingKey {
+                    case sourcePath = "source_path"
+                    case sourceOrdinal = "source_ordinal"
+                    case text
+                }
+            }
+
+            let index: Int
+            let locator: String
+            let title: String
+            let sentences: [Sentence]
+        }
+
+        let schema: String
+        let fixtureID: String
+        let bookID: String
+        let bookHash: String
+        let title: String
+        let chapter: Chapter
+
+        var sentencesAreSafe: Bool {
+            chapter.sentences.count >= 40
+                && Set(chapter.sentences.map(\.sourcePath)).count
+                    == chapter.sentences.count
+                && Set(chapter.sentences.map(\.text)).count
+                    == chapter.sentences.count
+                && chapter.sentences.allSatisfy {
+                    !$0.sourcePath.isEmpty
+                        && $0.sourceOrdinal >= 0
+                        && !$0.text.trimmingCharacters(
+                            in: .whitespacesAndNewlines
+                        ).isEmpty
+                }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case schema
+            case fixtureID = "fixture_id"
+            case bookID = "book_id"
+            case bookHash = "book_hash"
+            case title
+            case chapter
+        }
+    }
+
+    private struct Blocks {
+        let steadyA: ReadingSpeechGenerationRequest
+        let steadyB: ReadingSpeechGenerationRequest
+        let first: ReadingSpeechGenerationRequest
+        let cancel: ReadingSpeechGenerationRequest
+
+        var committed: [
+            (role: String, request: ReadingSpeechGenerationRequest)
+        ] {
+            [
+                ("steady-a", steadyA),
+                ("first", first),
+                ("steady-b", steadyB),
+            ]
+        }
+    }
+
+    private static let mode = "coordinator-cache-v1"
+    private static let fixtureSHA256 =
+        "2eebbffd6481c654c0a8a476338e4690b08893a24a69e9b1baf0fca2a211dec6"
+    private static let authorization =
+        "click-gate2b-public-reading-v1"
+    private static let resultName =
+        "click-gate2b-installed-acceptance.json"
+
+    private static func fail(_ message: String) -> NSError {
+        NSError(
+            domain: "Click.Gate2B.Acceptance",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private static func safeAcceptanceURL(
+        rawPath: String,
+        allowedNames: Set<String>
+    ) -> URL? {
+        let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let parent = url.deletingLastPathComponent()
+        let lexicalRoot = "/private/tmp"
+        let privateTmp = URL(
+            fileURLWithPath: lexicalRoot,
+            isDirectory: true
+        ).standardizedFileURL
+        let resolvedRoot = privateTmp.resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedParent = parent.resolvingSymlinksInPath()
+            .standardizedFileURL
+        let parentName = parent.lastPathComponent
+        let prefix = "click-gate2b-acceptance-"
+        let suffix = parentName.dropFirst(prefix.count)
+        let values = try? parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let expectedResolved = resolvedRoot.appendingPathComponent(
+            parentName,
+            isDirectory: true
+        ).standardizedFileURL
+        guard url.path == rawPath,
+              allowedNames.contains(url.lastPathComponent),
+              parent.deletingLastPathComponent().path == lexicalRoot,
+              parentName.hasPrefix(prefix),
+              !suffix.isEmpty,
+              suffix.allSatisfy({
+                  $0.isLetter
+                      || $0.isNumber
+                      || $0 == "-"
+                      || $0 == "_"
+              }),
+              values?.isDirectory == true,
+              values?.isSymbolicLink != true,
+              resolvedParent.path == expectedResolved.path
+        else {
+            return nil
+        }
+        return url
+    }
+
+    private static func writePrivate(
+        _ object: [String: Any],
+        to url: URL
+    ) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [
+                .prettyPrinted,
+                .sortedKeys,
+                .withoutEscapingSlashes,
+            ]
+        ) + Data([0x0A])
+        let partial = url.appendingPathExtension(
+            "partial.\(getpid()).\(UUID().uuidString.lowercased())"
+        )
+        defer { try? FileManager.default.removeItem(at: partial) }
+        guard FileManager.default.createFile(
+            atPath: partial.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw fail("unable to create private acceptance result")
+        }
+        let handle = try FileHandle(forWritingTo: partial)
+        try handle.synchronize()
+        try handle.close()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: partial.path
+        )
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+        guard rename(partial.path, url.path) == 0 else {
+            throw fail("unable to commit acceptance result")
+        }
+        let directory = url.deletingLastPathComponent()
+        let descriptor = open(directory.path, O_RDONLY)
+        if descriptor >= 0 {
+            _ = fsync(descriptor)
+            close(descriptor)
+        }
+    }
+
+    private static func loadFixture(
+        at url: URL
+    ) throws -> (ReadingDocument, ReadingChapter) {
+        guard url.pathExtension.lowercased() == "json",
+              let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              try ClickTTSGate0Contract.sha256File(url)
+                == fixtureSHA256
+        else {
+            throw fail("public Gate 2B fixture identity mismatch")
+        }
+        let data = try Data(contentsOf: url)
+        let fixture = try JSONDecoder().decode(Fixture.self, from: data)
+        guard fixture.schema
+            == "click.mac.gate2b.reading-fixture.v1",
+        fixture.fixtureID == authorization,
+        fixture.chapter.index == 0,
+        fixture.sentencesAreSafe
+        else {
+            throw fail("public Gate 2B fixture contract mismatch")
+        }
+        let bodyHash = ReadingIdentity.sha256(
+            fixture.chapter.sentences.map(\.text)
+                .joined(separator: "\u{1f}")
+        )
+        guard bodyHash == fixture.bookHash else {
+            throw fail("public Gate 2B fixture body hash mismatch")
+        }
+        let descriptor = ReadingChapterDescriptor(
+            index: fixture.chapter.index,
+            locator: fixture.chapter.locator,
+            title: fixture.chapter.title
+        )
+        let document = ReadingDocument.make(
+            bookID: fixture.bookID,
+            bookHash: fixture.bookHash,
+            title: fixture.title,
+            chapters: [descriptor]
+        )
+        let provider = EPUBReadingTextProvider(
+            document: document,
+            maximumCachedChapters: 2
+        )
+        let records = fixture.chapter.sentences.enumerated().map {
+            index,
+            sentence in
+            RenderedReadingSentence(
+                sourcePath: sentence.sourcePath,
+                sourceOrdinal: sentence.sourceOrdinal,
+                text: sentence.text,
+                sourceRanges: [
+                    DOMSourceRange(
+                        nodePath: [index],
+                        startUTF16: 0,
+                        endUTF16: sentence.text.utf16.count
+                    ),
+                ],
+                rendererIndexes: ["\(index)"]
+            )
+        }
+        let chapter = try provider.installRenderedChapter(
+            descriptorIndex: 0,
+            records: records
+        )
+        return (document, chapter)
+    }
+
+    private static func makeRequest(
+        _ block: ReadingSpeechBlock
+    ) -> ReadingSpeechGenerationRequest {
+        ReadingSpeechGenerationRequest(
+            block: block,
+            profile: ReadingSpeechSynthesisProfile(
+                voiceID: "zh-CN-YunjianNeural",
+                rate: "+0%",
+                volume: "+0%",
+                pitch: "+0Hz",
+                voiceCacheEpoch: "1",
+                prosodyRevision: "1"
+            )
+        )
+    }
+
+    private static func makeBlocks(
+        document: ReadingDocument,
+        chapter: ReadingChapter
+    ) throws -> Blocks {
+        let steadyA = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: 0,
+            kind: .steady
+        )
+        let steadyB = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: steadyA.endSentenceIndex + 1,
+            kind: .steady
+        )
+        let first = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: steadyB.endSentenceIndex + 1,
+            kind: .first
+        )
+        let cancel = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: first.endSentenceIndex + 1,
+            kind: .steady
+        )
+        return Blocks(
+            steadyA: makeRequest(steadyA),
+            steadyB: makeRequest(steadyB),
+            first: makeRequest(first),
+            cancel: makeRequest(cancel)
+        )
+    }
+
+    private static func artifactEvidence(
+        role: String,
+        request: ReadingSpeechGenerationRequest,
+        artifact: ReadingSpeechCachedBlock
+    ) throws -> [String: Any] {
+        let audioMode = (
+            try FileManager.default.attributesOfItem(
+                atPath: artifact.audioURL.path
+            )[.posixPermissions] as? NSNumber
+        )?.intValue ?? -1
+        let manifestMode = (
+            try FileManager.default.attributesOfItem(
+                atPath: artifact.manifestURL.path
+            )[.posixPermissions] as? NSNumber
+        )?.intValue ?? -1
+        return [
+            "role": role,
+            "cache_key": request.cacheKey,
+            "block_id": request.block.blockID,
+            "kind": request.block.kind.rawValue,
+            "start_locator":
+                request.block.sentences.first?.locator ?? "",
+            "end_locator":
+                request.block.sentences.last?.locator ?? "",
+            "sentence_count": request.block.sentences.count,
+            "estimated_duration_ms":
+                request.block.estimatedDurationMS,
+            "audio_duration_ms": artifact.audioDurationMS,
+            "audio_sha256":
+                try ClickTTSGate0Contract.sha256File(
+                    artifact.audioURL
+                ),
+            "manifest_sha256":
+                try ClickTTSGate0Contract.sha256File(
+                    artifact.manifestURL
+                ),
+            "audio_mode": String(format: "%04o", audioMode & 0o777),
+            "manifest_mode":
+                String(format: "%04o", manifestMode & 0o777),
+            "source": artifact.source,
+        ]
+    }
+
+    private static func residualReport(
+        cache: ReadingV2AudioCache
+    ) -> [String: Any] {
+        let productFiles = (
+            FileManager.default.enumerator(
+                at: cache.root,
+                includingPropertiesForKeys: nil,
+                options: []
+            )?.allObjects as? [URL] ?? []
+        ).filter {
+            let name = $0.lastPathComponent
+            return name.contains(".partial.")
+        }
+        let probeRoot = ClickTTSGate0Contract.cacheRoot
+        let probeFiles = (
+            FileManager.default.enumerator(
+                at: probeRoot,
+                includingPropertiesForKeys: nil,
+                options: []
+            )?.allObjects as? [URL] ?? []
+        ).filter {
+            let name = $0.lastPathComponent
+            return name.hasSuffix(".mp3")
+                || name.hasSuffix(".boundaries.json")
+                || name.hasSuffix(".manifest.json")
+                || name.contains(".partial.")
+        }
+        return [
+            "product_partial_count": productFiles.count,
+            "probe_artifact_or_partial_count": probeFiles.count,
+        ]
+    }
+
+    private static func resourceHandshake(
+        stage: String,
+        parent: URL
+    ) throws {
+        let environment = ProcessInfo.processInfo.environment
+        let names: [String: String] = [
+            "ready": "click-gate2b-resource-ready.json",
+            "start": "click-gate2b-resource-start",
+            "finished": "click-gate2b-resource-finished",
+            "ack": "click-gate2b-resource-ack",
+        ]
+        let key: String
+        switch stage {
+        case "ready": key = "CLICK_GATE2B_RESOURCE_READY"
+        case "start": key = "CLICK_GATE2B_RESOURCE_START"
+        case "finished": key = "CLICK_GATE2B_RESOURCE_FINISHED"
+        case "ack": key = "CLICK_GATE2B_RESOURCE_ACK"
+        default: throw fail("invalid resource handshake stage")
+        }
+        guard let raw = environment[key] else {
+            return
+        }
+        guard let expectedName = names[stage],
+              let url = safeAcceptanceURL(
+                  rawPath: raw,
+                  allowedNames: [expectedName]
+              ),
+              url.deletingLastPathComponent() == parent
+        else {
+            throw fail("unsafe resource handshake path")
+        }
+        if stage == "ready" {
+            try writePrivate(
+                [
+                    "schema": "click.mac.gate2b.resource-ready.v1",
+                    "pid": Int(getpid()),
+                ],
+                to: url
+            )
+            return
+        }
+        if stage == "finished" {
+            guard FileManager.default.createFile(
+                atPath: url.path,
+                contents: Data("finished\n".utf8),
+                attributes: [.posixPermissions: 0o600]
+            ) else {
+                throw fail("unable to publish resource finish marker")
+            }
+            return
+        }
+        let timeout: TimeInterval = stage == "start" ? 30 : 120
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: url.path) {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        throw fail("resource handshake timed out")
+    }
+
+    private static func runGenerate(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        let helperReadyDwellMS = 1_250
+        try resourceHandshake(stage: "ready", parent: parent)
+        try resourceHandshake(stage: "start", parent: parent)
+        let recorder = Gate2BAcceptanceEventRecorder()
+        let cancelReadyRelease = DispatchSemaphore(value: 0)
+        let engine = EdgeTTSOnlineEngine { event in
+            if event["event"] as? String == "helper_ready" {
+                Thread.sleep(
+                    forTimeInterval: Double(helperReadyDwellMS) / 1_000
+                )
+            }
+            recorder.record(event)
+            if event["event"] as? String == "helper_ready",
+               event["cache_key"] as? String == blocks.cancel.cacheKey {
+                _ = cancelReadyRelease.wait(timeout: .now() + 5)
+            }
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        let lock = NSLock()
+        let group = DispatchGroup()
+        var results: [
+            String: [Result<ReadingSpeechCachedBlock, Error>]
+        ] = [:]
+        func submit(
+            role: String,
+            request: ReadingSpeechGenerationRequest
+        ) {
+            group.enter()
+            _ = coordinator.request(request) { result in
+                lock.lock()
+                results[role, default: []].append(result)
+                lock.unlock()
+                group.leave()
+            }
+        }
+
+        submit(role: "steady-a", request: blocks.steadyA)
+        guard recorder.wait(
+            event: "helper_started",
+            count: 1,
+            timeout: 20
+        ) else {
+            throw fail("first steady helper did not start")
+        }
+        submit(role: "steady-b", request: blocks.steadyB)
+        for _ in 0..<4 {
+            submit(role: "first", request: blocks.first)
+        }
+        guard group.wait(timeout: .now() + 240) == .success,
+              coordinator.waitUntilIdle(timeout: 5)
+        else {
+            _ = coordinator.cancelAllAndWait(timeout: 5)
+            throw fail("generation/single-flight phase timed out")
+        }
+        let expectedCounts = [
+            "steady-a": 1,
+            "steady-b": 1,
+            "first": 4,
+        ]
+        for (role, expected) in expectedCounts {
+            guard results[role]?.count == expected,
+                  results[role]?.allSatisfy({
+                      (try? $0.get()) != nil
+                  }) == true
+            else {
+                throw fail("generation result set is incomplete")
+            }
+        }
+        let successfulFirst = results["first", default: []]
+            .compactMap { try? $0.get().cacheKey }
+        guard Set(successfulFirst) == [blocks.first.cacheKey],
+              successfulFirst.count == 4
+        else {
+            throw fail("same-key subscribers diverged")
+        }
+        let dispatchOrder = recorder.snapshot().compactMap {
+            event -> String? in
+            guard event["event"] as? String == "helper_started" else {
+                return nil
+            }
+            return event["cache_key"] as? String
+        }
+        guard dispatchOrder == [
+            blocks.steadyA.cacheKey,
+            blocks.first.cacheKey,
+            blocks.steadyB.cacheKey,
+        ] else {
+            throw fail("first-block priority order is wrong")
+        }
+
+        let cancelCompletion = DispatchSemaphore(value: 0)
+        var cancelResult: Result<ReadingSpeechCachedBlock, Error>?
+        let cancelTicket = coordinator.request(blocks.cancel) {
+            cancelResult = $0
+            cancelCompletion.signal()
+        }
+        guard recorder.wait(
+            event: "helper_ready",
+            count: 4,
+            timeout: 30
+        ) else {
+            cancelReadyRelease.signal()
+            _ = coordinator.cancelAllAndWait(timeout: 5)
+            throw fail("cancel helper did not become sampling-visible")
+        }
+        let cancelStarted = ProcessInfo.processInfo.systemUptime
+        coordinator.cancel(cancelTicket)
+        cancelReadyRelease.signal()
+        guard cancelCompletion.wait(timeout: .now() + 5) == .success,
+              coordinator.waitUntilIdle(timeout: 5),
+              ProcessInfo.processInfo.systemUptime - cancelStarted <= 5,
+              {
+                  if case .failure = cancelResult {
+                      return true
+                  }
+                  return false
+              }()
+        else {
+            throw fail("bounded cancellation failed")
+        }
+        guard cache.load(blocks.cancel) == nil else {
+            throw fail("canceled block became committed")
+        }
+
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == 4,
+              snapshot.maximumConcurrentHelpers == 1,
+              snapshot.activeHelperPID == nil
+        else {
+            throw fail("helper concurrency/lifecycle contract failed")
+        }
+        var artifacts: [[String: Any]] = []
+        for item in blocks.committed {
+            guard let artifact = results[item.role]?.first.flatMap({
+                try? $0.get()
+            }),
+            artifact.source == "online",
+            cache.load(item.request) != nil
+            else {
+                throw fail(
+                    "committed product block is missing or not online"
+                )
+            }
+            artifacts.append(
+                try artifactEvidence(
+                    role: item.role,
+                    request: item.request,
+                    artifact: artifact
+                )
+            )
+        }
+        let residual = residualReport(cache: cache)
+        guard residual["product_partial_count"] as? Int == 0,
+              residual["probe_artifact_or_partial_count"] as? Int
+                == 0
+        else {
+            throw fail("generation left staging or partial files")
+        }
+        let activeHelperPID: Any = snapshot.activeHelperPID.map {
+            Int($0) as Any
+        } ?? NSNull()
+        let lastHelperPID: Any = snapshot.lastHelperPID.map {
+            Int($0) as Any
+        } ?? NSNull()
+        try resourceHandshake(stage: "finished", parent: parent)
+        try resourceHandshake(stage: "ack", parent: parent)
+        return [
+            "phase": Phase.generate.rawValue,
+            "artifacts": artifacts,
+            "single_flight_subscriber_count": 4,
+            "dispatch_order": dispatchOrder,
+            "cancel": [
+                "bounded_seconds": 5,
+                "cache_hit_after_cancel": false,
+            ],
+            "resource_sampling_visibility": [
+                "helper_ready_dwell_ms": helperReadyDwellMS,
+                "applied_helper_count": 4,
+                "cancel_ready_barrier": true,
+                "excluded_from_cancel_bound": true,
+            ],
+            "engine": [
+                "helper_start_count": snapshot.helperStartCount,
+                "maximum_concurrent_helpers":
+                    snapshot.maximumConcurrentHelpers,
+                "active_helper_pid": activeHelperPID,
+                "last_helper_pid": lastHelperPID,
+            ],
+            "residual": residual,
+            "events": recorder.snapshot(),
+        ]
+    }
+
+    private static func runRestartCacheOnly(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        try resourceHandshake(stage: "ready", parent: parent)
+        try resourceHandshake(stage: "start", parent: parent)
+        let recorder = Gate2BAcceptanceEventRecorder()
+        let engine = EdgeTTSOnlineEngine {
+            recorder.record($0)
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var results: [String: ReadingSpeechCachedBlock] = [:]
+        var failures = 0
+        for item in blocks.committed {
+            group.enter()
+            _ = coordinator.request(
+                item.request,
+                policy: .cacheOnly
+            ) { result in
+                lock.lock()
+                if let artifact = try? result.get() {
+                    results[item.role] = artifact
+                } else {
+                    failures += 1
+                }
+                lock.unlock()
+                group.leave()
+            }
+        }
+        guard group.wait(timeout: .now() + 10) == .success,
+              coordinator.waitUntilIdle(timeout: 2),
+              failures == 0,
+              results.count == blocks.committed.count
+        else {
+            throw fail("restart cache-only lookup failed")
+        }
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == 0,
+              snapshot.maximumConcurrentHelpers == 0,
+              snapshot.activeHelperPID == nil,
+              recorder.snapshot().isEmpty
+        else {
+            throw fail("cache-only restart launched a helper")
+        }
+        let artifacts = try blocks.committed.map { item in
+            guard let artifact = results[item.role] else {
+                throw fail("restart artifact is missing")
+            }
+            return try artifactEvidence(
+                role: item.role,
+                request: item.request,
+                artifact: artifact
+            )
+        }
+        let phaseResult: [String: Any] = [
+            "phase": Phase.restartCacheOnly.rawValue,
+            "artifacts": artifacts,
+            "engine": [
+                "helper_start_count": 0,
+                "maximum_concurrent_helpers": 0,
+                "active_helper_pid": NSNull(),
+            ],
+            "events": [],
+            "residual": residualReport(cache: cache),
+        ]
+        try resourceHandshake(stage: "finished", parent: parent)
+        try resourceHandshake(stage: "ack", parent: parent)
+        return phaseResult
+    }
+
+    private static func runCorruptRebuild(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        try resourceHandshake(stage: "ready", parent: parent)
+        try resourceHandshake(stage: "start", parent: parent)
+        guard cache.load(blocks.first) == nil else {
+            throw fail("corrupt target still matched before rebuild")
+        }
+        let recorder = Gate2BAcceptanceEventRecorder()
+        let engine = EdgeTTSOnlineEngine {
+            recorder.record($0)
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        let cacheOnlyDone = DispatchSemaphore(value: 0)
+        var cacheOnlyFailedClosed = false
+        _ = coordinator.request(
+            blocks.first,
+            policy: .cacheOnly
+        ) { result in
+            if case let .failure(error) = result,
+               error as? ReadingSpeechGenerationError
+                == .cacheMissRequiresNetwork {
+                cacheOnlyFailedClosed = true
+            }
+            cacheOnlyDone.signal()
+        }
+        guard cacheOnlyDone.wait(timeout: .now() + 5) == .success,
+              cacheOnlyFailedClosed,
+              engine.snapshot().helperStartCount == 0
+        else {
+            throw fail("corrupt cache did not fail closed offline")
+        }
+        let rebuildDone = DispatchSemaphore(value: 0)
+        var rebuilt: ReadingSpeechCachedBlock?
+        _ = coordinator.request(blocks.first) { result in
+            rebuilt = try? result.get()
+            rebuildDone.signal()
+        }
+        guard rebuildDone.wait(timeout: .now() + 120) == .success,
+              coordinator.waitUntilIdle(timeout: 5),
+              let rebuilt,
+              cache.load(blocks.first) != nil
+        else {
+            _ = coordinator.cancelAllAndWait(timeout: 5)
+            throw fail("corrupt cache rebuild failed")
+        }
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == 1,
+              snapshot.maximumConcurrentHelpers == 1,
+              snapshot.activeHelperPID == nil
+        else {
+            throw fail("corrupt rebuild helper contract failed")
+        }
+        let residual = residualReport(cache: cache)
+        guard residual["product_partial_count"] as? Int == 0,
+              residual["probe_artifact_or_partial_count"] as? Int
+                == 0
+        else {
+            throw fail("corrupt rebuild left residual files")
+        }
+        let phaseResult: [String: Any] = [
+            "phase": Phase.corruptRebuild.rawValue,
+            "cache_only_failed_closed": true,
+            "rebuild": try artifactEvidence(
+                role: "first",
+                request: blocks.first,
+                artifact: rebuilt
+            ),
+            "engine": [
+                "helper_start_count": snapshot.helperStartCount,
+                "maximum_concurrent_helpers":
+                    snapshot.maximumConcurrentHelpers,
+                "active_helper_pid": NSNull(),
+            ],
+            "events": recorder.snapshot(),
+            "residual": residual,
+        ]
+        try resourceHandshake(stage: "finished", parent: parent)
+        try resourceHandshake(stage: "ack", parent: parent)
+        return phaseResult
+    }
+
+    static func runIfRequested() -> Int32? {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["CLICK_GATE2B_ACCEPTANCE_MODE"] != nil else {
+            return nil
+        }
+        var resultURL: URL?
+        do {
+            guard environment["CLICK_GATE2B_ACCEPTANCE_MODE"] == mode,
+                  environment[
+                      "CLICK_GATE2B_PUBLIC_FIXTURE_AUTHORIZATION"
+                  ] == authorization,
+                  let phaseRaw = environment[
+                      "CLICK_GATE2B_ACCEPTANCE_PHASE"
+                  ],
+                  let phase = Phase(rawValue: phaseRaw),
+                  let rawResult = environment[
+                      "CLICK_GATE2B_ACCEPTANCE_RESULT"
+                  ],
+                  let safeResult = safeAcceptanceURL(
+                      rawPath: rawResult,
+                      allowedNames: [resultName]
+                  ),
+                  let rawFixture = environment[
+                      "CLICK_GATE2B_PUBLIC_FIXTURE"
+                  ]
+            else {
+                throw fail("Gate 2B acceptance environment is incomplete")
+            }
+            resultURL = safeResult
+            let fixtureURL = URL(fileURLWithPath: rawFixture)
+                .standardizedFileURL
+            guard fixtureURL.path == rawFixture else {
+                throw fail("Gate 2B fixture path is not canonical")
+            }
+            let fixture = try loadFixture(at: fixtureURL)
+            let blocks = try makeBlocks(
+                document: fixture.0,
+                chapter: fixture.1
+            )
+            let cache = ReadingV2AudioCache()
+            let phaseResult: [String: Any]
+            switch phase {
+            case .generate:
+                phaseResult = try runGenerate(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: safeResult.deletingLastPathComponent()
+                )
+            case .restartCacheOnly:
+                phaseResult = try runRestartCacheOnly(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: safeResult.deletingLastPathComponent()
+                )
+            case .corruptRebuild:
+                guard environment[
+                    "CLICK_GATE2B_CORRUPT_CACHE_KEY"
+                ] == blocks.first.cacheKey else {
+                    throw fail("corrupt target key is not the first block")
+                }
+                phaseResult = try runCorruptRebuild(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: safeResult.deletingLastPathComponent()
+                )
+            }
+            let executableURL = Bundle.main.executableURL
+            let executableHash = try executableURL.map {
+                try ClickTTSGate0Contract.sha256File($0)
+            } ?? ""
+            try writePrivate(
+                [
+                    "ok": true,
+                    "schema":
+                        "click.mac.gate2b.installed-acceptance.v1",
+                    "mode": mode,
+                    "phase": phase.rawValue,
+                    "pid": Int(getpid()),
+                    "bundle_path":
+                        Bundle.main.bundleURL.standardizedFileURL.path,
+                    "bundle_identifier":
+                        Bundle.main.bundleIdentifier ?? "",
+                    "executable_sha256": executableHash,
+                    "fixed_home": NSHomeDirectory(),
+                    "fixture_sha256": fixtureSHA256,
+                    "runtime_manifest_sha256":
+                        ReadingSpeechEngineIdentity.product
+                            .runtimeManifestSHA256,
+                    "helper_sha256":
+                        ReadingSpeechEngineIdentity.product.helperSHA256,
+                    "cache_root": cache.root.path,
+                    "submitted_text_in_output": false,
+                    "result": phaseResult,
+                ],
+                to: safeResult
+            )
+            return 0
+        } catch {
+            if let resultURL {
+                try? writePrivate(
+                    [
+                        "ok": false,
+                        "schema":
+                            "click.mac.gate2b.installed-acceptance.v1",
+                        "pid": Int(getpid()),
+                        "error": (error as NSError).localizedDescription,
+                        "submitted_text_in_output": false,
+                    ],
+                    to: resultURL
+                )
+            }
+            return 1
+        }
+    }
+}
+
+private final class Gate2CPlaybackEventRecorder {
+    private let startedUptime = ProcessInfo.processInfo.systemUptime
+    private(set) var events: [[String: Any]] = []
+
+    func record(_ event: NativeAudioPlayerEvent) {
+        events.append(
+            [
+                "elapsed_ms": max(
+                    0,
+                    Int(
+                        round(
+                            (
+                                ProcessInfo.processInfo.systemUptime
+                                    - startedUptime
+                            ) * 1_000
+                        )
+                    )
+                ),
+                "session_generation":
+                    event.sessionGeneration.uuidString.lowercased(),
+                "kind": event.kind.rawValue,
+                "block_index": event.blockIndex as Any? ?? NSNull(),
+                "cache_key": event.cacheKey as Any? ?? NSNull(),
+                "locator": event.locator as Any? ?? NSNull(),
+                "player_time_seconds":
+                    event.playerTimeSeconds as Any? ?? NSNull(),
+                "handoff_gap_ms":
+                    event.handoffGapMS as Any? ?? NSNull(),
+                "rate": event.rate.rawValue,
+                "error_category":
+                    event.errorCategory as Any? ?? NSNull(),
+            ]
+        )
+    }
+
+    var emittedLocators: [String] {
+        events.compactMap {
+            guard $0["kind"] as? String
+                == NativeAudioPlayerEventKind.sentenceBoundary.rawValue
+            else {
+                return nil
+            }
+            return $0["locator"] as? String
+        }
+    }
+
+    func count(_ kind: NativeAudioPlayerEventKind) -> Int {
+        events.filter { $0["kind"] as? String == kind.rawValue }.count
+    }
+
+    var handoffGapsMS: [Double] {
+        events.compactMap { $0["handoff_gap_ms"] as? Double }
+    }
+}
+
+enum Gate2CBlockGenerationOutcome: String {
+    case committed
+    case completionMissing = "completion_missing"
+    case generationError = "generation_error"
+    case sourceMismatch = "source_mismatch"
+    case freshCacheReloadFailed = "cache_reload_failed"
+    case playbackItemValidationFailed =
+        "playback_item_validation_failed"
+}
+
+enum Gate2CBatchGenerationFailure: String {
+    case generationWaitTimeout = "generation_wait_timeout"
+    case helperLifecycleFailed = "helper_lifecycle_failed"
+}
+
+enum Gate2CGenerationDiagnostics {
+    struct BlockOutcome {
+        fileprivate let evidence: [String: Any]
+
+        private init(evidence: [String: Any]) {
+            self.evidence = evidence
+        }
+
+        fileprivate static func make(
+            role: String,
+            blockKind: String,
+            outcome: Gate2CBlockGenerationOutcome,
+            error: Error?,
+            actualSource: String?
+        ) -> BlockOutcome {
+            let safeRole = Gate2CGenerationDiagnostics.allowedRoles
+                .contains(role)
+                ? role
+                : "unknown"
+            let safeBlockKind = ["first", "steady"].contains(blockKind)
+                ? blockKind
+                : "unknown"
+            let safeSource: Any
+            if let actualSource {
+                safeSource =
+                    Gate2CGenerationDiagnostics.allowedSources
+                        .contains(actualSource)
+                    ? actualSource
+                    : "unknown"
+            } else {
+                safeSource = NSNull()
+            }
+            var value: [String: Any] = [
+                "role": safeRole,
+                "block_kind": safeBlockKind,
+                "outcome": outcome.rawValue,
+                "actual_source": safeSource,
+            ]
+            if outcome == .generationError {
+                let classification =
+                    Gate2CGenerationDiagnostics.classify(error)
+                value["error"] = [
+                    "origin": classification.origin,
+                    "category": classification.category,
+                ]
+            }
+            value = value.filter { !($0.value is NSNull) }
+            return BlockOutcome(evidence: value)
+        }
+    }
+
+    struct Failure: LocalizedError {
+        fileprivate let evidence: [String: Any]
+
+        var errorDescription: String? {
+            "Gate 2C online generation validation failed"
+        }
+
+        private init(evidence: [String: Any]) {
+            self.evidence = evidence
+        }
+
+        fileprivate static func make(
+            blockOutcomes: [BlockOutcome],
+            batchFailure: Gate2CBatchGenerationFailure?,
+            engine: [String: Any],
+            events: [[String: Any]],
+            rolesByCacheKey: [String: String]
+        ) -> Failure {
+            let sanitizedEvents =
+                Gate2CGenerationDiagnostics.sanitizeEvents(
+                    events,
+                    rolesByCacheKey: rolesByCacheKey
+                )
+            return Failure(
+                evidence: [
+                    "schema":
+                        "click.mac.gate2c.generation-failure.v1",
+                    "stage": "online_generation",
+                    "block_outcomes":
+                        blockOutcomes.map(\.evidence),
+                    "batch_failure":
+                        batchFailure?.rawValue as Any?
+                            ?? NSNull(),
+                    "engine":
+                        Gate2CGenerationDiagnostics.sanitizeEngine(
+                            engine
+                        ),
+                    "engine_events": sanitizedEvents.events,
+                    "dropped_event_count":
+                        sanitizedEvents.dropped,
+                ]
+            )
+        }
+    }
+
+    enum BlockObservation {
+        case completionMissing
+        case generationError(Error)
+        case generated(
+            actualSource: String,
+            cacheReloaded: Bool,
+            playbackItemValid: Bool
+        )
+    }
+
+    struct BlockResolution {
+        let outcome: BlockOutcome
+        let failed: Bool
+    }
+
+    private static let allowedRoles: Set<String> = [
+        "batch",
+        "first",
+        "steady-a",
+        "steady-b",
+    ]
+    private static let allowedSources: Set<String> = [
+        "cache",
+        "online",
+        "probe",
+    ]
+    private static let allowedProviderCategories: Set<String> = [
+        "busy",
+        "canceled",
+        "circuit_open",
+        "disclosure_required",
+        "empty_audio",
+        "internal_error",
+        "invalid_boundary",
+        "invalid_request",
+        "invalid_voice_or_request",
+        "network_unavailable",
+        "protocol_error",
+        "rate_limited",
+        "runtime_version_mismatch",
+        "service_unavailable",
+        "startup",
+        "timeout",
+        "unknown",
+    ]
+    private static let allowedEngineEvents: Set<String> = [
+        "generation_submitted",
+        "helper_ready",
+        "helper_started",
+        "helper_terminated",
+    ]
+
+    private static func safeNonnegativeInteger(_ value: Any?) -> Any {
+        guard let value = value as? Int, value >= 0 else {
+            return NSNull()
+        }
+        return value
+    }
+
+    private static func sanitizeEngine(
+        _ engine: [String: Any]
+    ) -> [String: Any] {
+        [
+            "helper_start_count":
+                safeNonnegativeInteger(engine["helper_start_count"]),
+            "maximum_concurrent_helpers":
+                safeNonnegativeInteger(
+                    engine["maximum_concurrent_helpers"]
+                ),
+            "active_helper_pid":
+                safeNonnegativeInteger(engine["active_helper_pid"]),
+            "last_helper_pid":
+                safeNonnegativeInteger(engine["last_helper_pid"]),
+        ]
+    }
+
+    private static func sanitizeEvents(
+        _ events: [[String: Any]],
+        rolesByCacheKey: [String: String]
+    ) -> (
+        events: [[String: Any]],
+        dropped: Int
+    ) {
+        var dropped = 0
+        let sanitized = events.compactMap { event -> [String: Any]? in
+            guard let name = event["event"] as? String,
+                  allowedEngineEvents.contains(name)
+            else {
+                dropped += 1
+                return nil
+            }
+            var value: [String: Any] = [
+                "event": name,
+                "elapsed_ms":
+                    safeNonnegativeInteger(event["elapsed_ms"]),
+                "pid": safeNonnegativeInteger(event["pid"]),
+                "pgid": safeNonnegativeInteger(event["pgid"]),
+                "status": safeNonnegativeInteger(event["status"]),
+            ]
+            if let cacheKey = event["cache_key"] as? String,
+               let role = rolesByCacheKey[cacheKey],
+               allowedRoles.contains(role) {
+                value["role"] = role
+            }
+            value = value.filter { !($0.value is NSNull) }
+            return value
+        }
+        return (sanitized, dropped)
+    }
+
+    private static func classify(
+        _ error: Error?
+    ) -> (
+        origin: String,
+        category: String
+    ) {
+        guard let error else {
+            return ("internal", "unknown")
+        }
+        guard let error = error as? ReadingSpeechGenerationError else {
+            return ("internal", "unknown")
+        }
+        switch error {
+        case .cacheMissRequiresNetwork:
+            return ("coordinator", "cache_miss_requires_network")
+        case .canceled:
+            return ("coordinator", "canceled")
+        case .thermalBlocked:
+            return ("engine", "thermal_blocked")
+        case .runtimeUnavailable:
+            return ("runtime", "runtime_unavailable")
+        case .runtimeIdentityMismatch:
+            return ("runtime", "runtime_identity_mismatch")
+        case .helperProtocol:
+            return ("helper", "helper_protocol")
+        case let .helperFailed(category):
+            return (
+                "helper",
+                allowedProviderCategories.contains(category)
+                    ? category
+                    : "unknown"
+            )
+        case .timedOut:
+            return ("engine", "engine_timed_out")
+        case .invalidArtifact:
+            return ("artifact", "invalid_artifact")
+        case .cacheCommit:
+            return ("cache", "cache_commit")
+        }
+    }
+
+    static func blockOutcome(
+        role: String,
+        blockKind: String,
+        outcome: Gate2CBlockGenerationOutcome,
+        error: Error? = nil,
+        actualSource: String? = nil
+    ) -> BlockOutcome {
+        BlockOutcome.make(
+            role: role,
+            blockKind: blockKind,
+            outcome: outcome,
+            error: error,
+            actualSource: actualSource
+        )
+    }
+
+    static func resolveBlockObservation(
+        role: String,
+        blockKind: String,
+        observation: BlockObservation
+    ) -> BlockResolution {
+        let outcome: BlockOutcome
+        switch observation {
+        case .completionMissing:
+            outcome = blockOutcome(
+                role: role,
+                blockKind: blockKind,
+                outcome: .completionMissing
+            )
+        case let .generationError(error):
+            outcome = blockOutcome(
+                role: role,
+                blockKind: blockKind,
+                outcome: .generationError,
+                error: error
+            )
+        case let .generated(
+            actualSource,
+            cacheReloaded,
+            playbackItemValid
+        ):
+            if actualSource != "online" {
+                outcome = blockOutcome(
+                    role: role,
+                    blockKind: blockKind,
+                    outcome: .sourceMismatch,
+                    actualSource: actualSource
+                )
+            } else if !cacheReloaded {
+                outcome = blockOutcome(
+                    role: role,
+                    blockKind: blockKind,
+                    outcome: .freshCacheReloadFailed
+                )
+            } else if !playbackItemValid {
+                outcome = blockOutcome(
+                    role: role,
+                    blockKind: blockKind,
+                    outcome: .playbackItemValidationFailed
+                )
+            } else {
+                outcome = blockOutcome(
+                    role: role,
+                    blockKind: blockKind,
+                    outcome: .committed
+                )
+            }
+        }
+        let failed: Bool
+        switch observation {
+        case let .generated(
+            actualSource,
+            cacheReloaded,
+            playbackItemValid
+        ):
+            failed = actualSource != "online"
+                || !cacheReloaded
+                || !playbackItemValid
+        case .completionMissing, .generationError:
+            failed = true
+        }
+        return BlockResolution(
+            outcome: outcome,
+            failed: failed
+        )
+    }
+
+    static func missingCacheKeysAtDeadline(
+        requestKeys: [String],
+        completedKeys: Set<String>
+    ) -> Set<String> {
+        Set(requestKeys).subtracting(completedKeys)
+    }
+
+    static func makeFailure(
+        blockOutcomes: [BlockOutcome],
+        batchFailure: Gate2CBatchGenerationFailure? = nil,
+        engine: [String: Any],
+        events: [[String: Any]],
+        rolesByCacheKey: [String: String]
+    ) -> Failure {
+        Failure.make(
+            blockOutcomes: blockOutcomes,
+            batchFailure: batchFailure,
+            engine: engine,
+            events: events,
+            rolesByCacheKey: rolesByCacheKey
+        )
+    }
+
+    static func terminalFailureOutput(
+        error: Error,
+        pid: Int
+    ) -> [String: Any] {
+        let diagnostic = error as? Failure
+        let nsError = error as NSError
+        let errorSummary: String
+        if let diagnostic {
+            errorSummary =
+                diagnostic.errorDescription
+                ?? "Gate 2C internal acceptance error"
+        } else if nsError.domain == "Click.Gate2C.Acceptance",
+                  nsError.code == 1 {
+            errorSummary = nsError.localizedDescription
+        } else {
+            errorSummary = "Gate 2C internal acceptance error"
+        }
+        var output: [String: Any] = [
+            "ok": false,
+            "schema":
+                "click.mac.gate2c.installed-acceptance.v1",
+            "pid": pid,
+            "error": errorSummary,
+            "submitted_text_in_output": false,
+        ]
+        if let diagnostic {
+            output["failure"] = diagnostic.evidence
+        }
+        guard JSONSerialization.isValidJSONObject(output) else {
+            return [
+                "ok": false,
+                "schema":
+                    "click.mac.gate2c.installed-acceptance.v1",
+                "pid": pid,
+                "error": "Gate 2C internal acceptance error",
+                "submitted_text_in_output": false,
+            ]
+        }
+        return output
+    }
+}
+
+private enum Gate2CAcceptanceHarness {
+    private enum Phase: String {
+        case generatePlayControls = "generate-play-controls"
+        case restartCacheOnlySteady = "restart-cache-only-steady"
+        case corruptRejectRecover = "corrupt-reject-recover"
+    }
+
+    private struct Fixture: Decodable {
+        struct Chapter: Decodable {
+            struct Sentence: Decodable {
+                let sourcePath: String
+                let sourceOrdinal: Int
+                let text: String
+
+                enum CodingKeys: String, CodingKey {
+                    case sourcePath = "source_path"
+                    case sourceOrdinal = "source_ordinal"
+                    case text
+                }
+            }
+
+            let index: Int
+            let locator: String
+            let title: String
+            let sentences: [Sentence]
+        }
+
+        let schema: String
+        let fixtureID: String
+        let bookID: String
+        let bookHash: String
+        let title: String
+        let chapter: Chapter
+
+        enum CodingKeys: String, CodingKey {
+            case schema
+            case fixtureID = "fixture_id"
+            case bookID = "book_id"
+            case bookHash = "book_hash"
+            case title
+            case chapter
+        }
+    }
+
+    private struct Blocks {
+        let first: ReadingSpeechGenerationRequest
+        let steadyA: ReadingSpeechGenerationRequest
+        let steadyB: ReadingSpeechGenerationRequest
+
+        var namedRequests: [
+            (role: String, request: ReadingSpeechGenerationRequest)
+        ] {
+            [
+                ("first", first),
+                ("steady-a", steadyA),
+                ("steady-b", steadyB),
+            ]
+        }
+
+        var requests: [ReadingSpeechGenerationRequest] {
+            namedRequests.map { $0.request }
+        }
+    }
+
+    private static let mode = "native-short-block-player-v1"
+    private static let fixtureSHA256 =
+        "2eebbffd6481c654c0a8a476338e4690b08893a24a69e9b1baf0fca2a211dec6"
+    private static let authorization =
+        "click-gate2c-public-reading-v1"
+    private static let resultName =
+        "click-gate2c-installed-acceptance.json"
+
+    private static func fail(_ message: String) -> NSError {
+        NSError(
+            domain: "Click.Gate2C.Acceptance",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private static func safeAcceptanceURL(
+        rawPath: String,
+        allowedNames: Set<String>
+    ) -> URL? {
+        let url = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let parent = url.deletingLastPathComponent()
+        let lexicalRoot = "/private/tmp"
+        let privateTmp = URL(
+            fileURLWithPath: lexicalRoot,
+            isDirectory: true
+        ).standardizedFileURL
+        let resolvedRoot = privateTmp.resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedParent = parent.resolvingSymlinksInPath()
+            .standardizedFileURL
+        let parentName = parent.lastPathComponent
+        let prefix = "click-gate2c-acceptance-"
+        let suffix = parentName.dropFirst(prefix.count)
+        let values = try? parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let expectedResolved = resolvedRoot.appendingPathComponent(
+            parentName,
+            isDirectory: true
+        ).standardizedFileURL
+        guard url.path == rawPath,
+              allowedNames.contains(url.lastPathComponent),
+              parent.deletingLastPathComponent().path == lexicalRoot,
+              parentName.hasPrefix(prefix),
+              !suffix.isEmpty,
+              suffix.allSatisfy({
+                  $0.isLetter
+                      || $0.isNumber
+                      || $0 == "-"
+                      || $0 == "_"
+              }),
+              values?.isDirectory == true,
+              values?.isSymbolicLink != true,
+              resolvedParent.path == expectedResolved.path
+        else {
+            return nil
+        }
+        return url
+    }
+
+    private static func writePrivate(
+        _ object: [String: Any],
+        to url: URL
+    ) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [
+                .prettyPrinted,
+                .sortedKeys,
+                .withoutEscapingSlashes,
+            ]
+        ) + Data([0x0A])
+        let partial = url.appendingPathExtension(
+            "partial.\(getpid()).\(UUID().uuidString.lowercased())"
+        )
+        defer { try? FileManager.default.removeItem(at: partial) }
+        guard FileManager.default.createFile(
+            atPath: partial.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw fail("unable to create private Gate 2C result")
+        }
+        let handle = try FileHandle(forWritingTo: partial)
+        try handle.synchronize()
+        try handle.close()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: partial.path
+        )
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+        guard rename(partial.path, url.path) == 0 else {
+            throw fail("unable to commit Gate 2C result")
+        }
+        let descriptor = open(
+            url.deletingLastPathComponent().path,
+            O_RDONLY
+        )
+        if descriptor >= 0 {
+            _ = fsync(descriptor)
+            close(descriptor)
+        }
+    }
+
+    private static func loadFixture(
+        at url: URL
+    ) throws -> (ReadingDocument, ReadingChapter) {
+        guard url.pathExtension.lowercased() == "json",
+              let values = try? url.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              try ClickTTSGate0Contract.sha256File(url)
+                == fixtureSHA256
+        else {
+            throw fail("public Gate 2C fixture identity mismatch")
+        }
+        let fixture = try JSONDecoder().decode(
+            Fixture.self,
+            from: Data(contentsOf: url)
+        )
+        guard fixture.schema
+            == "click.mac.gate2b.reading-fixture.v1",
+        fixture.fixtureID == "click-gate2b-public-reading-v1",
+        fixture.chapter.index == 0,
+        fixture.chapter.sentences.count >= 40,
+        Set(fixture.chapter.sentences.map(\.sourcePath)).count
+            == fixture.chapter.sentences.count,
+        Set(fixture.chapter.sentences.map(\.text)).count
+            == fixture.chapter.sentences.count,
+        fixture.chapter.sentences.allSatisfy({
+            !$0.sourcePath.isEmpty
+                && $0.sourceOrdinal >= 0
+                && !$0.text.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty
+        })
+        else {
+            throw fail("public Gate 2C fixture contract mismatch")
+        }
+        let bodyHash = ReadingIdentity.sha256(
+            fixture.chapter.sentences.map(\.text)
+                .joined(separator: "\u{1f}")
+        )
+        guard bodyHash == fixture.bookHash else {
+            throw fail("public Gate 2C fixture body hash mismatch")
+        }
+        let descriptor = ReadingChapterDescriptor(
+            index: fixture.chapter.index,
+            locator: fixture.chapter.locator,
+            title: fixture.chapter.title
+        )
+        let document = ReadingDocument.make(
+            bookID: fixture.bookID,
+            bookHash: fixture.bookHash,
+            title: fixture.title,
+            chapters: [descriptor]
+        )
+        let provider = EPUBReadingTextProvider(
+            document: document,
+            maximumCachedChapters: 2
+        )
+        let records = fixture.chapter.sentences.enumerated().map {
+            index,
+            sentence in
+            RenderedReadingSentence(
+                sourcePath: sentence.sourcePath,
+                sourceOrdinal: sentence.sourceOrdinal,
+                text: sentence.text,
+                sourceRanges: [
+                    DOMSourceRange(
+                        nodePath: [index],
+                        startUTF16: 0,
+                        endUTF16: sentence.text.utf16.count
+                    ),
+                ],
+                rendererIndexes: ["\(index)"]
+            )
+        }
+        let chapter = try provider.installRenderedChapter(
+            descriptorIndex: 0,
+            records: records
+        )
+        return (document, chapter)
+    }
+
+    private static func makeRequest(
+        _ block: ReadingSpeechBlock
+    ) -> ReadingSpeechGenerationRequest {
+        ReadingSpeechGenerationRequest(
+            block: block,
+            profile: ReadingSpeechSynthesisProfile(
+                voiceID: "zh-CN-YunjianNeural",
+                rate: "+0%",
+                volume: "+0%",
+                pitch: "+0Hz",
+                voiceCacheEpoch: "1",
+                prosodyRevision: "1"
+            )
+        )
+    }
+
+    private static func makeBlocks(
+        document: ReadingDocument,
+        chapter: ReadingChapter
+    ) throws -> Blocks {
+        let first = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: 0,
+            kind: .first
+        )
+        let steadyA = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: first.endSentenceIndex + 1,
+            kind: .steady
+        )
+        let steadyB = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: steadyA.endSentenceIndex + 1,
+            kind: .steady
+        )
+        guard steadyB.endSentenceIndex < chapter.sentences.count else {
+            throw fail("Gate 2C blocks escaped the fixture chapter")
+        }
+        return Blocks(
+            first: makeRequest(first),
+            steadyA: makeRequest(steadyA),
+            steadyB: makeRequest(steadyB)
+        )
+    }
+
+    private static func resourceHandshake(
+        stage: String,
+        phase: Phase,
+        parent: URL
+    ) throws {
+        let environment = ProcessInfo.processInfo.environment
+        let names: [String: String] = [
+            "ready": "click-gate2c-resource-ready.json",
+            "start": "click-gate2c-resource-start",
+            "finished": "click-gate2c-resource-finished",
+            "ack": "click-gate2c-resource-ack",
+        ]
+        let key: String
+        switch stage {
+        case "ready": key = "CLICK_GATE2C_RESOURCE_READY"
+        case "start": key = "CLICK_GATE2C_RESOURCE_START"
+        case "finished": key = "CLICK_GATE2C_RESOURCE_FINISHED"
+        case "ack": key = "CLICK_GATE2C_RESOURCE_ACK"
+        default: throw fail("invalid Gate 2C handshake stage")
+        }
+        guard let raw = environment[key] else {
+            throw fail("Gate 2C resource handshake is required")
+        }
+        guard let expectedName = names[stage],
+              let url = safeAcceptanceURL(
+                  rawPath: raw,
+                  allowedNames: [expectedName]
+              ),
+              url.deletingLastPathComponent() == parent
+        else {
+            throw fail("unsafe Gate 2C resource handshake path")
+        }
+        if stage == "ready" {
+            try writePrivate(
+                [
+                    "schema": "click.mac.gate2c.resource-ready.v1",
+                    "pid": Int(getpid()),
+                    "phase": phase.rawValue,
+                ],
+                to: url
+            )
+            return
+        }
+        if stage == "finished" {
+            guard !FileManager.default.fileExists(atPath: url.path),
+                  FileManager.default.createFile(
+                      atPath: url.path,
+                      contents: Data("finished\n".utf8),
+                      attributes: [.posixPermissions: 0o600]
+                  )
+            else {
+                throw fail("unable to publish Gate 2C finish marker")
+            }
+            return
+        }
+        let timeout: TimeInterval = stage == "start" ? 180 : 180
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: url.path) {
+                return
+            }
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: min(
+                    deadline,
+                    Date().addingTimeInterval(0.05)
+                )
+            )
+        }
+        throw fail("Gate 2C resource handshake timed out")
+    }
+
+    private static func cacheFingerprint(
+        _ cache: ReadingV2AudioCache
+    ) throws -> [String: Any] {
+        let root = cache.root
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let files = (
+            FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                    .fileSizeKey,
+                ],
+                options: []
+            )?.allObjects as? [URL] ?? []
+        )
+        var identities: [String] = []
+        for url in files {
+            let values = try url.resourceValues(
+                forKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                    .fileSizeKey,
+                ]
+            )
+            guard values.isSymbolicLink != true else {
+                throw fail("Gate 2C cache contains a symlink")
+            }
+            guard values.isRegularFile == true else {
+                continue
+            }
+            let canonicalURL = url
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+            let prefix = root.path + "/"
+            guard canonicalURL.path.hasPrefix(prefix) else {
+                throw fail("Gate 2C cache file escaped its root")
+            }
+            identities.append(
+                [
+                    String(canonicalURL.path.dropFirst(prefix.count)),
+                    String(values.fileSize ?? -1),
+                    try ClickTTSGate0Contract.sha256File(canonicalURL),
+                ].joined(separator: ":")
+            )
+        }
+        identities.sort()
+        return [
+            "file_count": identities.count,
+            "sha256": ReadingIdentity.sha256(
+                identities.joined(separator: "\n")
+            ),
+        ]
+    }
+
+    private static func residualReport(
+        cache: ReadingV2AudioCache
+    ) -> [String: Any] {
+        let productFiles = (
+            FileManager.default.enumerator(
+                at: cache.root,
+                includingPropertiesForKeys: nil,
+                options: []
+            )?.allObjects as? [URL] ?? []
+        ).filter {
+            $0.lastPathComponent.contains(".partial.")
+        }
+        let probeRoot = ClickTTSGate0Contract.cacheRoot
+        let probeFiles = (
+            FileManager.default.enumerator(
+                at: probeRoot,
+                includingPropertiesForKeys: nil,
+                options: []
+            )?.allObjects as? [URL] ?? []
+        ).filter {
+            let name = $0.lastPathComponent
+            return name.hasSuffix(".mp3")
+                || name.hasSuffix(".boundaries.json")
+                || name.hasSuffix(".manifest.json")
+                || name.contains(".partial.")
+        }
+        return [
+            "product_partial_count": productFiles.count,
+            "probe_artifact_or_partial_count": probeFiles.count,
+        ]
+    }
+
+    private static func artifactEvidence(
+        request: ReadingSpeechGenerationRequest,
+        artifact: ReadingSpeechCachedBlock
+    ) throws -> [String: Any] {
+        [
+            "cache_key": request.cacheKey,
+            "block_id": request.block.blockID,
+            "kind": request.block.kind.rawValue,
+            "start_sentence_index":
+                request.block.startSentenceIndex,
+            "end_sentence_index":
+                request.block.endSentenceIndex,
+            "sentence_count": request.block.sentences.count,
+            "estimated_duration_ms":
+                request.block.estimatedDurationMS,
+            "audio_duration_ms": artifact.audioDurationMS,
+            "boundary_count": artifact.boundaries.count,
+            "audio_sha256":
+                try ClickTTSGate0Contract.sha256File(
+                    artifact.audioURL
+                ),
+            "manifest_sha256":
+                try ClickTTSGate0Contract.sha256File(
+                    artifact.manifestURL
+                ),
+            "source": artifact.source,
+        ]
+    }
+
+    private static func generateItems(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        recorder: Gate2BAcceptanceEventRecorder
+    ) throws -> (
+        items: [NativeAudioPlaybackItem],
+        engine: [String: Any]
+    ) {
+        let engine = EdgeTTSOnlineEngine {
+            recorder.record($0)
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        func engineEvidence() -> [String: Any] {
+            let snapshot = engine.snapshot()
+            return [
+                "helper_start_count": snapshot.helperStartCount,
+                "maximum_concurrent_helpers":
+                    snapshot.maximumConcurrentHelpers,
+                "active_helper_pid":
+                    snapshot.activeHelperPID.map { Int($0) as Any }
+                        ?? NSNull(),
+                "last_helper_pid":
+                    snapshot.lastHelperPID.map { Int($0) as Any }
+                        ?? NSNull(),
+            ]
+        }
+        let rolesByCacheKey = Dictionary(
+            uniqueKeysWithValues: blocks.namedRequests.map {
+                ($0.request.cacheKey, $0.role)
+            }
+        )
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var results: [
+            String: Result<ReadingSpeechCachedBlock, Error>
+        ] = [:]
+        for named in blocks.namedRequests {
+            group.enter()
+            _ = coordinator.request(named.request) { result in
+                lock.lock()
+                results[named.request.cacheKey] = result
+                lock.unlock()
+                group.leave()
+            }
+        }
+        let callbacksFinished =
+            group.wait(timeout: .now() + 300) == .success
+        lock.lock()
+        let resultsAtDeadline = results
+        lock.unlock()
+        let missingAtDeadline =
+            callbacksFinished
+            ? Set<String>()
+            : Gate2CGenerationDiagnostics
+                .missingCacheKeysAtDeadline(
+                    requestKeys:
+                        blocks.namedRequests.map {
+                            $0.request.cacheKey
+                        },
+                    completedKeys:
+                        Set(resultsAtDeadline.keys)
+                )
+        let coordinatorIdle =
+            coordinator.waitUntilIdle(timeout: 5)
+        let batchFailure: Gate2CBatchGenerationFailure?
+        if callbacksFinished, coordinatorIdle {
+            batchFailure = nil
+        } else {
+            _ = coordinator.cancelAllAndWait(timeout: 5)
+            _ = group.wait(timeout: .now() + 2)
+            batchFailure = .generationWaitTimeout
+        }
+        lock.lock()
+        let completedResults = results
+        lock.unlock()
+
+        var items: [NativeAudioPlaybackItem] = []
+        var blockOutcomes: [
+            Gate2CGenerationDiagnostics.BlockOutcome
+        ] = []
+        var hasBlockFailure = false
+        func record(
+            role: String,
+            blockKind: String,
+            observation:
+                Gate2CGenerationDiagnostics.BlockObservation
+        ) {
+            let resolution =
+                Gate2CGenerationDiagnostics
+                    .resolveBlockObservation(
+                        role: role,
+                        blockKind: blockKind,
+                        observation: observation
+                    )
+            blockOutcomes.append(resolution.outcome)
+            hasBlockFailure =
+                hasBlockFailure || resolution.failed
+        }
+        for named in blocks.namedRequests {
+            let request = named.request
+            if missingAtDeadline.contains(request.cacheKey) {
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .completionMissing
+                )
+                continue
+            }
+            guard let result = completedResults[request.cacheKey] else {
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .completionMissing
+                )
+                continue
+            }
+            let artifact: ReadingSpeechCachedBlock
+            switch result {
+            case let .success(value):
+                artifact = value
+            case let .failure(error):
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .generationError(error)
+                )
+                continue
+            }
+            guard artifact.source == "online" else {
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .generated(
+                        actualSource: artifact.source,
+                        cacheReloaded: false,
+                        playbackItemValid: false
+                    )
+                )
+                continue
+            }
+            guard cache.load(request) != nil else {
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .generated(
+                        actualSource: artifact.source,
+                        cacheReloaded: false,
+                        playbackItemValid: false
+                    )
+                )
+                continue
+            }
+            guard let item = NativeAudioPlaybackItem(
+                request: request,
+                cache: cache
+            ) else {
+                record(
+                    role: named.role,
+                    blockKind: request.block.kind.rawValue,
+                    observation: .generated(
+                        actualSource: artifact.source,
+                        cacheReloaded: true,
+                        playbackItemValid: false
+                    )
+                )
+                continue
+            }
+            items.append(item)
+            record(
+                role: named.role,
+                blockKind: request.block.kind.rawValue,
+                observation: .generated(
+                    actualSource: artifact.source,
+                    cacheReloaded: true,
+                    playbackItemValid: true
+                )
+            )
+        }
+        if batchFailure != nil || hasBlockFailure {
+            throw Gate2CGenerationDiagnostics.makeFailure(
+                blockOutcomes: blockOutcomes,
+                batchFailure: batchFailure,
+                engine: engineEvidence(),
+                events: recorder.snapshot(),
+                rolesByCacheKey: rolesByCacheKey
+            )
+        }
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == blocks.requests.count,
+              snapshot.maximumConcurrentHelpers == 1,
+              snapshot.activeHelperPID == nil
+        else {
+            throw Gate2CGenerationDiagnostics.makeFailure(
+                blockOutcomes: blockOutcomes,
+                batchFailure: .helperLifecycleFailed,
+                engine: engineEvidence(),
+                events: recorder.snapshot(),
+                rolesByCacheKey: rolesByCacheKey
+            )
+        }
+        return (
+            items,
+            engineEvidence()
+        )
+    }
+
+    private static func cacheOnlyItems(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        recorder: Gate2BAcceptanceEventRecorder
+    ) throws -> (
+        items: [NativeAudioPlaybackItem],
+        engine: [String: Any]
+    ) {
+        let engine = EdgeTTSOnlineEngine {
+            recorder.record($0)
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var results: [
+            String: Result<ReadingSpeechCachedBlock, Error>
+        ] = [:]
+        for request in blocks.requests {
+            group.enter()
+            _ = coordinator.request(
+                request,
+                policy: .cacheOnly
+            ) { result in
+                lock.lock()
+                results[request.cacheKey] = result
+                lock.unlock()
+                group.leave()
+            }
+        }
+        guard group.wait(timeout: .now() + 10) == .success,
+              coordinator.waitUntilIdle(timeout: 2)
+        else {
+            throw fail("Gate 2C cache-only load timed out")
+        }
+        let items = try blocks.requests.map { request in
+            guard let result = results[request.cacheKey],
+                  let artifact = try? result.get(),
+                  artifact.source == "cache"
+            else {
+                throw fail("Gate 2C cache-only block was unavailable")
+            }
+            guard let item = NativeAudioPlaybackItem(
+                request: request,
+                cache: cache
+            ) else {
+                throw fail(
+                    "Gate 2C cached block failed fresh validation"
+                )
+            }
+            return item
+        }
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == 0,
+              snapshot.maximumConcurrentHelpers == 0,
+              snapshot.activeHelperPID == nil,
+              recorder.snapshot().isEmpty
+        else {
+            throw fail("Gate 2C cache-only load launched a helper")
+        }
+        return (
+            items,
+            [
+                "helper_start_count": 0,
+                "maximum_concurrent_helpers": 0,
+                "active_helper_pid": NSNull(),
+            ]
+        )
+    }
+
+    private static func runLoop(
+        for seconds: TimeInterval
+    ) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: min(
+                    deadline,
+                    Date().addingTimeInterval(0.02)
+                )
+            )
+        }
+    }
+
+    private static func waitUntil(
+        timeout: TimeInterval,
+        _ condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            _ = RunLoop.current.run(
+                mode: .default,
+                before: min(
+                    deadline,
+                    Date().addingTimeInterval(0.02)
+                )
+            )
+        }
+        return condition()
+    }
+
+    private static func validateCompletedPlayback(
+        items: [NativeAudioPlaybackItem],
+        player: NativeAudioPlayer,
+        recorder: Gate2CPlaybackEventRecorder
+    ) throws -> [String: Any] {
+        let expectedLocators = items.flatMap {
+            $0.request.block.sentences.map(\.locator)
+        }
+        let gaps = recorder.handoffGapsMS
+        let snapshot = player.snapshot()
+        guard snapshot.state == .completed,
+              snapshot.maximumConcurrentPlaying == 1,
+              snapshot.emittedLocatorCount == expectedLocators.count,
+              recorder.emittedLocators == expectedLocators,
+              recorder.count(.blockStarted) == items.count,
+              recorder.count(.blockFinished) == items.count,
+              recorder.count(.completed) == 1,
+              recorder.count(.failed) == 0,
+              gaps.count == max(0, items.count - 1),
+              gaps.allSatisfy({
+                  NativeAudioPlayer.handoffIsAcceptable(
+                      milliseconds: $0
+                  )
+              })
+        else {
+            throw fail("Gate 2C playback sequence contract failed")
+        }
+        return [
+            "state": snapshot.state.rawValue,
+            "emitted_locator_count":
+                snapshot.emittedLocatorCount,
+            "expected_locator_count": expectedLocators.count,
+            "maximum_concurrent_playing":
+                snapshot.maximumConcurrentPlaying,
+            "decoder_start_count": snapshot.decoderStartCount,
+            "player_start_count": snapshot.playerStartCount,
+            "handoff_gap_ms": gaps,
+            "events": recorder.events,
+        ]
+    }
+
+    private static func runGeneratePlayControls(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        let phase = Phase.generatePlayControls
+        try resourceHandshake(
+            stage: "ready",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "start",
+            phase: phase,
+            parent: parent
+        )
+        let engineRecorder = Gate2BAcceptanceEventRecorder()
+        let generated = try generateItems(
+            blocks: blocks,
+            cache: cache,
+            recorder: engineRecorder
+        )
+        let beforePlayback = try cacheFingerprint(cache)
+        let playbackRecorder = Gate2CPlaybackEventRecorder()
+        let player = NativeAudioPlayer {
+            playbackRecorder.record($0)
+        }
+        try player.start(
+            items: generated.items,
+            rate: .x10,
+            volume: 0.55
+        )
+        guard waitUntil(timeout: 10, {
+            player.snapshot().currentTimeSeconds > 0.50
+        }) else {
+            throw fail("Gate 2C audible playback did not start")
+        }
+        var rateTrials: [[String: Any]] = []
+        for trialRate in NativeAudioPlaybackRate.allCases {
+            guard player.setRate(trialRate) else {
+                throw fail("Gate 2C rate trial was rejected")
+            }
+            let startedWall = ProcessInfo.processInfo.systemUptime
+            let startedAudio = player.snapshot().currentTimeSeconds
+            runLoop(for: 1.50)
+            let endedWall = ProcessInfo.processInfo.systemUptime
+            let endedAudio = player.snapshot().currentTimeSeconds
+            let wallDelta = endedWall - startedWall
+            let audioDelta = endedAudio - startedAudio
+            let observedRate = audioDelta / wallDelta
+            let relativeError = abs(
+                observedRate - Double(trialRate.multiplier)
+            ) / Double(trialRate.multiplier)
+            guard wallDelta >= 1.45,
+                  audioDelta > 0,
+                  relativeError <= 0.10
+            else {
+                throw fail("Gate 2C playback rate clock ratio failed")
+            }
+            rateTrials.append(
+                [
+                    "rate": trialRate.rawValue,
+                    "wall_delta_seconds": wallDelta,
+                    "audio_delta_seconds": audioDelta,
+                    "observed_rate": observedRate,
+                    "relative_error": relativeError,
+                ]
+            )
+        }
+        guard player.pause() else {
+            throw fail("Gate 2C pause was rejected")
+        }
+        let pausedAt = player.snapshot().currentTimeSeconds
+        let pauseStarted = ProcessInfo.processInfo.systemUptime
+        runLoop(for: 1.10)
+        let pauseHeld = ProcessInfo.processInfo.systemUptime - pauseStarted
+        let pauseDrift = abs(
+            player.snapshot().currentTimeSeconds - pausedAt
+        )
+        guard pauseHeld >= 1.0, pauseDrift <= 0.020 else {
+            throw fail("Gate 2C pause clock did not remain frozen")
+        }
+        guard player.setRate(.x20) else {
+            throw fail("Gate 2C finishing rate was rejected")
+        }
+        let resumeStarted = ProcessInfo.processInfo.systemUptime
+        guard player.resume() else {
+            throw fail("Gate 2C resume was rejected")
+        }
+        let resumeLatencyMS = (
+            ProcessInfo.processInfo.systemUptime - resumeStarted
+        ) * 1_000
+        guard resumeLatencyMS <= 20 else {
+            throw fail("Gate 2C resume exceeded 20 ms")
+        }
+        let maximumRemaining = generated.items.reduce(0.0) {
+            $0 + Double($1.cached.audioDurationMS) / 1_000
+        } / Double(NativeAudioPlaybackRate.x20.multiplier) + 60
+        guard waitUntil(timeout: maximumRemaining, {
+            (
+                player.snapshot().state == .completed
+                    && playbackRecorder.count(.completed) == 1
+            )
+                || player.snapshot().state == .recoverableError
+        }) else {
+            player.stop()
+            throw fail("Gate 2C full three-block playback timed out")
+        }
+        let playback = try validateCompletedPlayback(
+            items: generated.items,
+            player: player,
+            recorder: playbackRecorder
+        )
+        let stopRecorder = Gate2CPlaybackEventRecorder()
+        let stopPlayer = NativeAudioPlayer {
+            stopRecorder.record($0)
+        }
+        try stopPlayer.start(
+            items: [generated.items[0]],
+            rate: .x20,
+            volume: 0
+        )
+        guard waitUntil(timeout: 5, {
+            stopPlayer.snapshot().currentTimeSeconds > 0.10
+        }) else {
+            stopPlayer.stop()
+            throw fail("Gate 2C stop exercise did not start")
+        }
+        stopPlayer.stop()
+        let stoppedEventCount = stopRecorder.events.count
+        runLoop(for: 1.10)
+        guard stopPlayer.snapshot().state == .stopped,
+              stopRecorder.events.count == stoppedEventCount,
+              stopRecorder.count(.completed) == 0
+        else {
+            throw fail("Gate 2C stale event arrived after stop")
+        }
+        let afterPlayback = try cacheFingerprint(cache)
+        guard NSDictionary(dictionary: beforePlayback)
+            .isEqual(to: afterPlayback)
+        else {
+            throw fail("Gate 2C playback mutated the cache")
+        }
+        let artifacts = try zip(
+            blocks.requests,
+            generated.items
+        ).map {
+            try artifactEvidence(
+                request: $0.0,
+                artifact: $0.1.cached
+            )
+        }
+        try resourceHandshake(
+            stage: "finished",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "ack",
+            phase: phase,
+            parent: parent
+        )
+        return [
+            "phase": phase.rawValue,
+            "artifacts": artifacts,
+            "engine": generated.engine,
+            "engine_events": engineRecorder.snapshot(),
+            "playback": playback,
+            "controls": [
+                "pause_hold_seconds": pauseHeld,
+                "pause_clock_drift_seconds": pauseDrift,
+                "resume_latency_ms": resumeLatencyMS,
+                "rate_trials": rateTrials,
+                "stop_hold_seconds": 1.10,
+                "events_after_stop": 0,
+            ],
+            "cache_before_playback": beforePlayback,
+            "cache_after_playback": afterPlayback,
+            "residual": residualReport(cache: cache),
+            "human_confirmation": [
+                "required": true,
+                "confirmed": false,
+            ],
+        ]
+    }
+
+    private static func runRestartCacheOnlySteady(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        let phase = Phase.restartCacheOnlySteady
+        let engineRecorder = Gate2BAcceptanceEventRecorder()
+        let cached = try cacheOnlyItems(
+            blocks: blocks,
+            cache: cache,
+            recorder: engineRecorder
+        )
+        let beforePlayback = try cacheFingerprint(cache)
+        let expectedSeconds = cached.items.reduce(0.0) {
+            $0 + Double($1.cached.audioDurationMS) / 1_000
+        } / Double(NativeAudioPlaybackRate.x08.multiplier)
+        guard expectedSeconds >= 620 else {
+            throw fail("Gate 2C steady playback is shorter than 620 s")
+        }
+        try resourceHandshake(
+            stage: "ready",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "start",
+            phase: phase,
+            parent: parent
+        )
+        let playbackRecorder = Gate2CPlaybackEventRecorder()
+        let player = NativeAudioPlayer {
+            playbackRecorder.record($0)
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        try player.start(
+            items: cached.items,
+            rate: .x08,
+            volume: 0
+        )
+        guard waitUntil(timeout: expectedSeconds + 60, {
+            (
+                player.snapshot().state == .completed
+                    && playbackRecorder.count(.completed) == 1
+            )
+                || player.snapshot().state == .recoverableError
+        }) else {
+            player.stop()
+            throw fail("Gate 2C steady playback timed out")
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - started
+        guard elapsed >= 600 else {
+            throw fail("Gate 2C steady playback was shorter than 600 s")
+        }
+        let playback = try validateCompletedPlayback(
+            items: cached.items,
+            player: player,
+            recorder: playbackRecorder
+        )
+        let afterPlayback = try cacheFingerprint(cache)
+        guard NSDictionary(dictionary: beforePlayback)
+            .isEqual(to: afterPlayback)
+        else {
+            throw fail("Gate 2C steady playback mutated the cache")
+        }
+        try resourceHandshake(
+            stage: "finished",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "ack",
+            phase: phase,
+            parent: parent
+        )
+        return [
+            "phase": phase.rawValue,
+            "expected_playback_seconds": expectedSeconds,
+            "observed_playback_seconds": elapsed,
+            "engine": cached.engine,
+            "engine_events": engineRecorder.snapshot(),
+            "playback": playback,
+            "cache_before_playback": beforePlayback,
+            "cache_after_playback": afterPlayback,
+            "residual": residualReport(cache: cache),
+        ]
+    }
+
+    private static func runCorruptRejectRecover(
+        blocks: Blocks,
+        cache: ReadingV2AudioCache,
+        parent: URL
+    ) throws -> [String: Any] {
+        let phase = Phase.corruptRejectRecover
+        guard cache.load(blocks.first) == nil else {
+            throw fail("Gate 2C corrupt target still matched")
+        }
+        try resourceHandshake(
+            stage: "ready",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "start",
+            phase: phase,
+            parent: parent
+        )
+        let engineRecorder = Gate2BAcceptanceEventRecorder()
+        let engine = EdgeTTSOnlineEngine {
+            engineRecorder.record($0)
+        }
+        let coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .global(qos: .userInitiated)
+        )
+        let rejectedPlayer = NativeAudioPlayer { _ in }
+        let cacheOnlyDone = DispatchSemaphore(value: 0)
+        var cacheOnlyRejected = false
+        _ = coordinator.request(
+            blocks.first,
+            policy: .cacheOnly
+        ) { result in
+            if case let .failure(error) = result,
+               error as? ReadingSpeechGenerationError
+                == .cacheMissRequiresNetwork {
+                cacheOnlyRejected = true
+            }
+            cacheOnlyDone.signal()
+        }
+        guard cacheOnlyDone.wait(timeout: .now() + 5) == .success,
+              cacheOnlyRejected,
+              engine.snapshot().helperStartCount == 0,
+              rejectedPlayer.snapshot().decoderStartCount == 0,
+              rejectedPlayer.snapshot().playerStartCount == 0
+        else {
+            throw fail("Gate 2C corrupt cache did not fail closed")
+        }
+        let rebuildDone = DispatchSemaphore(value: 0)
+        var rebuilt: ReadingSpeechCachedBlock?
+        _ = coordinator.request(blocks.first) { result in
+            rebuilt = try? result.get()
+            rebuildDone.signal()
+        }
+        guard rebuildDone.wait(timeout: .now() + 180) == .success,
+              coordinator.waitUntilIdle(timeout: 5),
+              let rebuilt,
+              rebuilt.source == "online",
+              cache.load(blocks.first) != nil
+        else {
+            _ = coordinator.cancelAllAndWait(timeout: 5)
+            throw fail("Gate 2C corrupt cache rebuild failed")
+        }
+        let snapshot = engine.snapshot()
+        guard snapshot.helperStartCount == 1,
+              snapshot.maximumConcurrentHelpers == 1,
+              snapshot.activeHelperPID == nil
+        else {
+            throw fail("Gate 2C corrupt rebuild helper contract failed")
+        }
+        guard let item = NativeAudioPlaybackItem(
+            request: blocks.first,
+            cache: cache
+        ) else {
+            throw fail("Gate 2C rebuilt block failed fresh validation")
+        }
+        let playbackRecorder = Gate2CPlaybackEventRecorder()
+        let player = NativeAudioPlayer {
+            playbackRecorder.record($0)
+        }
+        try player.start(
+            items: [item],
+            rate: .x20,
+            volume: 0
+        )
+        let timeout = Double(rebuilt.audioDurationMS) / 1_000 / 2 + 30
+        guard waitUntil(timeout: timeout, {
+            (
+                player.snapshot().state == .completed
+                    && playbackRecorder.count(.completed) == 1
+            )
+                || player.snapshot().state == .recoverableError
+        }) else {
+            player.stop()
+            throw fail("Gate 2C rebuilt artifact did not play")
+        }
+        let playback = try validateCompletedPlayback(
+            items: [item],
+            player: player,
+            recorder: playbackRecorder
+        )
+        let residual = residualReport(cache: cache)
+        guard residual["product_partial_count"] as? Int == 0,
+              residual["probe_artifact_or_partial_count"] as? Int == 0
+        else {
+            throw fail("Gate 2C rebuild left partial files")
+        }
+        try resourceHandshake(
+            stage: "finished",
+            phase: phase,
+            parent: parent
+        )
+        try resourceHandshake(
+            stage: "ack",
+            phase: phase,
+            parent: parent
+        )
+        return [
+            "phase": phase.rawValue,
+            "cache_only_rejected": true,
+            "rejected_decoder_start_count": 0,
+            "rejected_player_start_count": 0,
+            "rebuild":
+                try artifactEvidence(
+                    request: blocks.first,
+                    artifact: rebuilt
+                ),
+            "engine": [
+                "helper_start_count": snapshot.helperStartCount,
+                "maximum_concurrent_helpers":
+                    snapshot.maximumConcurrentHelpers,
+                "active_helper_pid": NSNull(),
+            ],
+            "engine_events": engineRecorder.snapshot(),
+            "playback": playback,
+            "residual": residual,
+        ]
+    }
+
+    static func runIfRequested() -> Int32? {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["CLICK_GATE2C_ACCEPTANCE_MODE"] != nil else {
+            return nil
+        }
+        var resultURL: URL?
+        do {
+            guard environment["CLICK_GATE2C_ACCEPTANCE_MODE"] == mode,
+                  environment[
+                      "CLICK_GATE2C_PUBLIC_FIXTURE_AUTHORIZATION"
+                  ] == authorization,
+                  let phaseRaw = environment[
+                      "CLICK_GATE2C_ACCEPTANCE_PHASE"
+                  ],
+                  let phase = Phase(rawValue: phaseRaw),
+                  let rawResult = environment[
+                      "CLICK_GATE2C_ACCEPTANCE_RESULT"
+                  ],
+                  let safeResult = safeAcceptanceURL(
+                      rawPath: rawResult,
+                      allowedNames: [resultName]
+                  ),
+                  let rawFixture = environment[
+                      "CLICK_GATE2C_PUBLIC_FIXTURE"
+                  ]
+            else {
+                throw fail("Gate 2C acceptance environment is incomplete")
+            }
+            resultURL = safeResult
+            let fixtureURL = URL(fileURLWithPath: rawFixture)
+                .standardizedFileURL
+            guard fixtureURL.path == rawFixture else {
+                throw fail("Gate 2C fixture path is not canonical")
+            }
+            let fixture = try loadFixture(at: fixtureURL)
+            let blocks = try makeBlocks(
+                document: fixture.0,
+                chapter: fixture.1
+            )
+            let cache = ReadingV2AudioCache()
+            if phase == .corruptRejectRecover {
+                guard environment[
+                    "CLICK_GATE2C_CORRUPT_CACHE_KEY"
+                ] == blocks.first.cacheKey else {
+                    throw fail("Gate 2C corrupt target key changed")
+                }
+            }
+            let parent = safeResult.deletingLastPathComponent()
+            let phaseResult: [String: Any]
+            switch phase {
+            case .generatePlayControls:
+                phaseResult = try runGeneratePlayControls(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: parent
+                )
+            case .restartCacheOnlySteady:
+                phaseResult = try runRestartCacheOnlySteady(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: parent
+                )
+            case .corruptRejectRecover:
+                phaseResult = try runCorruptRejectRecover(
+                    blocks: blocks,
+                    cache: cache,
+                    parent: parent
+                )
+            }
+            let executableURL = Bundle.main.executableURL
+            let executableHash = try executableURL.map {
+                try ClickTTSGate0Contract.sha256File($0)
+            } ?? ""
+            try writePrivate(
+                [
+                    "ok": true,
+                    "schema":
+                        "click.mac.gate2c.installed-acceptance.v1",
+                    "mode": mode,
+                    "phase": phase.rawValue,
+                    "pid": Int(getpid()),
+                    "bundle_path":
+                        Bundle.main.bundleURL.standardizedFileURL.path,
+                    "bundle_identifier":
+                        Bundle.main.bundleIdentifier ?? "",
+                    "executable_sha256": executableHash,
+                    "fixed_home": NSHomeDirectory(),
+                    "fixture_sha256": fixtureSHA256,
+                    "runtime_manifest_sha256":
+                        ReadingSpeechEngineIdentity.product
+                            .runtimeManifestSHA256,
+                    "helper_sha256":
+                        ReadingSpeechEngineIdentity.product.helperSHA256,
+                    "cache_root": cache.root.path,
+                    "submitted_text_in_output": false,
+                    "result": phaseResult,
+                ],
+                to: safeResult
+            )
+            return 0
+        } catch {
+            if let resultURL {
+                let output =
+                    Gate2CGenerationDiagnostics
+                        .terminalFailureOutput(
+                            error: error,
+                            pid: Int(getpid())
+                        )
+                try? writePrivate(output, to: resultURL)
+            }
+            return 1
+        }
+    }
+}
+
+enum RenderedReadingChapterPayloadError: Error, CustomStringConvertible {
+    case invalidEnvelope
+    case invalidSentence
+    case invalidRange
+    case invalidRendererIndex
+    case chapterTooLarge
+
+    var description: String {
+        switch self {
+        case .invalidEnvelope: return "invalid rendered chapter envelope"
+        case .invalidSentence: return "invalid rendered sentence"
+        case .invalidRange: return "invalid rendered DOM range"
+        case .invalidRendererIndex: return "invalid rendered sentence index"
+        case .chapterTooLarge: return "rendered chapter exceeds limits"
+        }
+    }
+}
+
+enum RenderedReadingChapterPayloadParser {
+    private static func integer(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        }
+        if let number = value as? NSNumber,
+           CFGetTypeID(number) != CFBooleanGetTypeID() {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
+    static func parse(
+        _ payload: [String: Any]
+    ) throws -> [RenderedReadingSentence] {
+        guard payload["normalizerRevision"] as? String
+                == ReadingDocument.normalizerRevision,
+              let rawSentences = payload["sentences"]
+                as? [[String: Any]],
+              rawSentences.count <= 20_000
+        else {
+            throw RenderedReadingChapterPayloadError.invalidEnvelope
+        }
+        var totalUTF16 = 0
+        var records: [RenderedReadingSentence] = []
+        records.reserveCapacity(rawSentences.count)
+        for rawSentence in rawSentences {
+            guard let sourcePath = rawSentence["sourcePath"] as? String,
+                  let sourceOrdinal = integer(
+                    rawSentence["sourceOrdinal"]
+                  ),
+                  let text = rawSentence["text"] as? String,
+                  text.utf16.count <= 100_000,
+                  let rawRanges = rawSentence["sourceRanges"]
+                    as? [[String: Any]],
+                  rawRanges.count <= 1_000,
+                  let rawRendererIndexes =
+                    rawSentence["rendererIndexes"] as? [Any]
+            else {
+                throw RenderedReadingChapterPayloadError.invalidSentence
+            }
+            totalUTF16 += text.utf16.count
+            guard totalUTF16 <= 8_000_000 else {
+                throw RenderedReadingChapterPayloadError.chapterTooLarge
+            }
+            let sourceRanges = try rawRanges.map {
+                rawRange -> DOMSourceRange in
+                guard let rawPath = rawRange["nodePath"] as? [Any],
+                      let startUTF16 = integer(
+                        rawRange["startUTF16"]
+                      ),
+                      let endUTF16 = integer(
+                        rawRange["endUTF16"]
+                      )
+                else {
+                    throw RenderedReadingChapterPayloadError.invalidRange
+                }
+                let path = rawPath.compactMap(integer)
+                guard path.count == rawPath.count else {
+                    throw RenderedReadingChapterPayloadError.invalidRange
+                }
+                return DOMSourceRange(
+                    nodePath: path,
+                    startUTF16: startUTF16,
+                    endUTF16: endUTF16
+                )
+            }
+            let rendererIndexes = try rawRendererIndexes.map {
+                value -> String in
+                if let string = value as? String {
+                    return string
+                }
+                if let number = value as? NSNumber,
+                   CFGetTypeID(number) != CFBooleanGetTypeID() {
+                    return number.stringValue
+                }
+                throw RenderedReadingChapterPayloadError
+                    .invalidRendererIndex
+            }
+            records.append(
+                RenderedReadingSentence(
+                    sourcePath: sourcePath,
+                    sourceOrdinal: sourceOrdinal,
+                    text: text,
+                    sourceRanges: sourceRanges,
+                    rendererIndexes: rendererIndexes
+                )
+            )
+        }
+        return records
+    }
+}
+
+final class ReadingChapterSnapshotLoader: NSObject,
+    WKScriptMessageHandler,
+    WKNavigationDelegate
+{
+    typealias Completion = (
+        Result<[RenderedReadingSentence], Error>
+    ) -> Void
+
+    private struct Pending {
+        let chapterIndex: Int
+        let chapterURL: URL
+        let completion: Completion
+        let token: UUID
+    }
+
+    private let script: String
+    private var webView: WKWebView?
+    private var contentRuleList: WKContentRuleList?
+    private var pending: Pending?
+    private var timeoutWorkItem: DispatchWorkItem?
+    private var contentRulesReady = false
+    private var contentRulesFailed = false
+    private var waitingForRules: (() -> Void)?
+
+    init(script: String) {
+        self.script = script
+        super.init()
+        prepareContentRules()
+    }
+
+    deinit {
+        stop()
+    }
+
+    var isLoading: Bool {
+        pending != nil
+    }
+
+    func load(
+        chapterIndex: Int,
+        chapterURL: URL,
+        bookRootURL: URL,
+        completion: @escaping Completion
+    ) {
+        precondition(Thread.isMainThread)
+        guard pending == nil,
+              chapterIndex >= 0,
+              chapterURL.standardizedFileURL.path.hasPrefix(
+                bookRootURL.standardizedFileURL.path + "/"
+              )
+        else {
+            completion(
+                .failure(
+                    RenderedReadingChapterPayloadError.invalidEnvelope
+                )
+            )
+            return
+        }
+        let begin = { [weak self] in
+            guard let self else { return }
+            guard self.contentRulesReady,
+                  !self.contentRulesFailed
+            else {
+                completion(
+                    .failure(
+                        RenderedReadingChapterPayloadError
+                            .invalidEnvelope
+                    )
+                )
+                return
+            }
+            let token = UUID()
+            self.pending = Pending(
+                chapterIndex: chapterIndex,
+                chapterURL: chapterURL.standardizedFileURL,
+                completion: completion,
+                token: token
+            )
+            let item = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.pending?.token == token
+                else {
+                    return
+                }
+                self.finish(
+                    .failure(
+                        ReadingSpeechGenerationError.timedOut
+                    )
+                )
+            }
+            self.timeoutWorkItem = item
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 15,
+                execute: item
+            )
+            self.makeWebViewIfNeeded().loadFileURL(
+                chapterURL,
+                allowingReadAccessTo: bookRootURL
+            )
+        }
+        if contentRulesReady || contentRulesFailed {
+            begin()
+        } else {
+            waitingForRules = begin
+        }
+    }
+
+    func stop() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.stop()
+            }
+            return
+        }
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
+        if let pending {
+            self.pending = nil
+            pending.completion(
+                .failure(ReadingSpeechGenerationError.canceled)
+            )
+        }
+        webView?.stopLoading()
+        webView?.configuration.userContentController
+            .removeScriptMessageHandler(forName: "sentenceReader")
+        webView?.navigationDelegate = nil
+        webView = nil
+        waitingForRules = nil
+    }
+
+    private func prepareContentRules() {
+        let rules = """
+        [
+          {
+            "trigger": {"url-filter": "^https?://"},
+            "action": {"type": "block"}
+          }
+        ]
+        """
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier:
+                "click.reader.tts.local-chapter-snapshot-v1",
+            encodedContentRuleList: rules
+        ) { [weak self] list, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let list, error == nil {
+                    self.contentRuleList = list
+                    self.contentRulesReady = true
+                } else {
+                    self.contentRulesFailed = true
+                }
+                let continuation = self.waitingForRules
+                self.waitingForRules = nil
+                continuation?()
+            }
+        }
+    }
+
+    private func makeWebViewIfNeeded() -> WKWebView {
+        if let webView {
+            return webView
+        }
+        guard let contentRuleList else {
+            preconditionFailure("content rules must be ready")
+        }
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        configuration.userContentController.add(contentRuleList)
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: script,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            )
+        )
+        configuration.userContentController.add(
+            self,
+            name: "sentenceReader"
+        )
+        let view = WKWebView(
+            frame: NSRect(
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1
+            ),
+            configuration: configuration
+        )
+        view.navigationDelegate = self
+        webView = view
+        return view
+    }
+
+    private func finish(
+        _ result: Result<[RenderedReadingSentence], Error>
+    ) {
+        precondition(Thread.isMainThread)
+        guard let pending else {
+            return
+        }
+        self.pending = nil
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = nil
+        pending.completion(result)
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.frameInfo.isMainFrame,
+              message.webView === webView,
+              let pending,
+              let payload = message.body as? [String: Any],
+              payload["type"] as? String == "readingChapter",
+              message.webView?.url?.standardizedFileURL
+                == pending.chapterURL
+        else {
+            return
+        }
+        do {
+            finish(
+                .success(
+                    try RenderedReadingChapterPayloadParser
+                        .parse(payload)
+                )
+            )
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        finish(.failure(error))
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        finish(.failure(error))
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        let scheme = navigationAction.request.url?.scheme?
+            .lowercased()
+        decisionHandler(
+            scheme == "http" || scheme == "https"
+                ? .cancel
+                : .allow
+        )
+    }
+}
+
+struct ReadingBufferHorizonPolicy: Equatable {
+    static let standard = ReadingBufferHorizonPolicy()
+
+    let lowWaterMS: Int
+    let batchMS: Int
+    let highWaterMS: Int
+
+    init(
+        lowWaterMS: Int = 60 * 60 * 1_000,
+        batchMS: Int = 30 * 60 * 1_000,
+        highWaterMS: Int = 90 * 60 * 1_000
+    ) {
+        self.lowWaterMS = lowWaterMS
+        self.batchMS = batchMS
+        self.highWaterMS = highWaterMS
+    }
+
+    func listeningDurationMS(
+        standardDurationMS: Int,
+        rate: NativeAudioPlaybackRate
+    ) -> Int {
+        guard standardDurationMS > 0,
+              rate.multiplier > 0
+        else {
+            return 0
+        }
+        return max(
+            0,
+            Int(
+                Double(standardDurationMS)
+                    / Double(rate.multiplier)
+            )
+        )
+    }
+
+    func shouldStartBatch(
+        horizonMS: Int,
+        batchIsActive: Bool,
+        paused: Bool,
+        reachedEndOfDocument: Bool
+    ) -> Bool {
+        !batchIsActive
+            && !paused
+            && !reachedEndOfDocument
+            && horizonMS < lowWaterMS
+    }
+
+    func batchIsSatisfied(
+        generatedStandardMS: Int,
+        horizonMS: Int,
+        rate: NativeAudioPlaybackRate
+    ) -> Bool {
+        horizonMS >= highWaterMS
+            || listeningDurationMS(
+                standardDurationMS: generatedStandardMS,
+                rate: rate
+            ) >= batchMS
+    }
+}
+
+struct ReadingBufferCursor: Codable, Equatable {
+    let chapterIndex: Int
+    let sentenceIndex: Int
+}
+
+struct ReadingBufferPlannedRequest {
+    let request: ReadingSpeechGenerationRequest
+    let nextCursor: ReadingBufferCursor?
+}
+
+enum ReadingBufferPlanner {
+    static func makeNext(
+        document: ReadingDocument,
+        chapter: ReadingChapter,
+        cursor: ReadingBufferCursor,
+        kind: ReadingSpeechBlockKind,
+        profile: ReadingSpeechSynthesisProfile
+    ) throws -> ReadingBufferPlannedRequest {
+        guard chapter.descriptor.index == cursor.chapterIndex else {
+            throw ReadingSpeechBlockBuilderError.chapterMismatch
+        }
+        let block = try ReadingSpeechBlockBuilder.makeBlock(
+            document: document,
+            chapter: chapter,
+            startSentenceIndex: cursor.sentenceIndex,
+            kind: kind
+        )
+        let nextCursor: ReadingBufferCursor?
+        let nextSentenceIndex = block.endSentenceIndex + 1
+        if chapter.sentences.indices.contains(nextSentenceIndex) {
+            nextCursor = ReadingBufferCursor(
+                chapterIndex: cursor.chapterIndex,
+                sentenceIndex: nextSentenceIndex
+            )
+        } else if document.chapters.indices.contains(
+            cursor.chapterIndex + 1
+        ) {
+            nextCursor = ReadingBufferCursor(
+                chapterIndex: cursor.chapterIndex + 1,
+                sentenceIndex: 0
+            )
+        } else {
+            nextCursor = nil
+        }
+        return ReadingBufferPlannedRequest(
+            request: ReadingSpeechGenerationRequest(
+                block: block,
+                profile: profile
+            ),
+            nextCursor: nextCursor
+        )
+    }
+}
+
+enum ReadingTTSProductEventKind: String {
+    case preparing
+    case authorizationRequired
+    case batchStarted
+    case blockReady
+    case playing
+    case buffering
+    case paused
+    case sentenceBoundaryPaused
+    case chapterBoundaryPaused
+    case resumed
+    case sentenceBoundary
+    case horizonChanged
+    case batchCompleted
+    case bufferWarning
+    case recoverableError
+    case completed
+    case stopped
+}
+
+struct ReadingTTSProductEvent {
+    let sessionGeneration: UUID
+    let monotonicUptimeMS: Double
+    let kind: ReadingTTSProductEventKind
+    let message: String
+    let locator: String?
+    let chapterIndex: Int?
+    let horizonMS: Int
+    let batchID: String?
+    let cacheKey: String?
+    let standardRTF: Double?
+    let requestElapsedMS: Double?
+    let handoffGapMS: Double?
+    let audibleSeamMS: Double?
+    let source: String?
+    let audioDurationMS: Int?
+    let batchGeneratedStandardMS: Int?
+    let batchBlockCount: Int?
+    let batchCacheKeys: [String]
+    let blockIndex: Int?
+    let blockChapterIndex: Int?
+    let playerSessionGeneration: UUID?
+    let playerTimeSeconds: TimeInterval
+    let fromChapterIndex: Int?
+    let toChapterIndex: Int?
+    let fromCacheKey: String?
+    let toCacheKey: String?
+}
+
+struct ReadingTTSProductSnapshot {
+    let sessionGeneration: UUID
+    let state: ReadingAudioSessionState
+    let currentLocator: String?
+    let horizonMS: Int
+    let rate: NativeAudioPlaybackRate
+    let voiceID: String?
+    let batchIsActive: Bool
+    let batchID: String?
+    let batchGeneratedStandardMS: Int
+    let batchBlockCount: Int
+    let batchCacheKeys: [String]
+    let readyBlockCount: Int
+    let reachedEndOfDocument: Bool
+    let playerSessionGeneration: UUID?
+    let playerState: NativeAudioPlayerState
+    let playerCurrentBlockIndex: Int?
+    let playerCurrentTimeSeconds: TimeInterval
+    let cancellationSettled: Bool
+    let pendingRequest: Bool
+    let waitingForAuthorization: Bool
+    let activeGenerationCacheKey: String?
+    let queuedGenerationCacheKeys: [String]
+    let startedGenerationCacheKeys: [String]
+    let startedGenerationJobCount: Int
+    let startedGenerationHistoryTruncated: Bool
+    let maximumConcurrentGenerationJobCount: Int
+}
+
+final class ReadingTTSProductController {
+    typealias ChapterLoader = (
+        Int,
+        @escaping (Result<ReadingChapter, Error>) -> Void
+    ) -> Void
+    typealias NetworkAuthorizer = (
+        @escaping (Bool) -> Void
+    ) -> Void
+    typealias EventHandler = (ReadingTTSProductEvent) -> Void
+
+    private struct Batch {
+        let id: String
+        var generatedStandardMS: Int
+        var blockCount: Int
+        var cacheKeys: [String]
+    }
+
+    private struct RequestTiming {
+        let generation: UUID
+        let cacheKey: String
+        let submittedUptime: TimeInterval
+    }
+
+    private enum CancellationIntent: Equatable {
+        case suspend
+        case restart
+        case terminalStop
+        case resumeAfterSettlement
+    }
+
+    private enum RecoverableFailureKind: Equatable {
+        case generation
+        case cancellation
+        case playback
+    }
+
+    private let cache: ReadingV2AudioCache
+    private let engine: SpeechEngine
+    private let coordinator: TTSGenerationCoordinator
+    private let horizonPolicy: ReadingBufferHorizonPolicy
+    private let playerVolume: Float
+    private let eventHandler: EventHandler
+    private let cancellationQueue = DispatchQueue(
+        label: "local.click.reader-tts-cancellation",
+        qos: .utility
+    )
+    private lazy var player = NativeAudioPlayer {
+        [weak self] event in
+        self?.handlePlayerEvent(event)
+    }
+
+    private var document: ReadingDocument?
+    private var profile: ReadingSpeechSynthesisProfile?
+    private var rate: NativeAudioPlaybackRate = .x10
+    private var cursor: ReadingBufferCursor?
+    private var nextBlockKind: ReadingSpeechBlockKind = .first
+    private var chapterLoader: ChapterLoader?
+    private var networkAuthorizer: NetworkAuthorizer?
+    private var sessionGeneration = UUID()
+    private var generation = UUID()
+    private var cancellationGeneration = UUID()
+    private var pendingRequest = false
+    private var waitingForAuthorization = false
+    private var cancellationSettled = true
+    private var coordinatorObservationNeedsReset = false
+    private var userPaused = false
+    private var reachedEndOfDocument = false
+    private var batch: Batch?
+    private var playbackItems: [NativeAudioPlaybackItem] = []
+    private var state: ReadingAudioSessionState = .idle
+    private var currentLocator: String?
+    private var bufferFailureMessage: String?
+    private var pauseBeforeNextChapter = false
+    private var transientFailureDates: [Date] = []
+    private var circuitOpenUntil: Date?
+    private var cacheRequestTiming: RequestTiming?
+    private var onlineRequestTiming: RequestTiming?
+    private var recoverableFailureKind:
+        RecoverableFailureKind?
+
+    init(
+        cache: ReadingV2AudioCache = ReadingV2AudioCache(),
+        engine: SpeechEngine = EdgeTTSOnlineEngine(),
+        horizonPolicy: ReadingBufferHorizonPolicy = .standard,
+        playerVolume: Float = 1,
+        eventHandler: @escaping EventHandler
+    ) {
+        precondition(playerVolume.isFinite && (0...1).contains(playerVolume))
+        self.cache = cache
+        self.engine = engine
+        self.horizonPolicy = horizonPolicy
+        self.playerVolume = playerVolume
+        self.eventHandler = eventHandler
+        coordinator = TTSGenerationCoordinator(
+            engine: engine,
+            cache: cache,
+            callbackQueue: .main
+        )
+    }
+
+    func start(
+        document: ReadingDocument,
+        sentence: ReadingSentence,
+        profile: ReadingSpeechSynthesisProfile,
+        rate: NativeAudioPlaybackRate,
+        chapterLoader: @escaping ChapterLoader,
+        networkAuthorizer: @escaping NetworkAuthorizer
+    ) {
+        precondition(Thread.isMainThread)
+        stop(
+            emitEvent: false,
+            cancellationIntent: .restart
+        )
+        sessionGeneration = UUID()
+        generation = UUID()
+        coordinatorObservationNeedsReset = true
+        self.document = document
+        self.profile = profile
+        self.rate = rate
+        self.chapterLoader = chapterLoader
+        self.networkAuthorizer = networkAuthorizer
+        cursor = ReadingBufferCursor(
+            chapterIndex: sentence.chapterIndex,
+            sentenceIndex: sentence.index
+        )
+        nextBlockKind = .first
+        currentLocator = sentence.locator
+        userPaused = false
+        reachedEndOfDocument = false
+        bufferFailureMessage = nil
+        recoverableFailureKind = nil
+        state = .preparing
+        emit(
+            .preparing,
+            message: "正在准备 Microsoft Edge 在线朗读"
+        )
+        pumpWhenCancellationSettles()
+    }
+
+    func pause() {
+        precondition(Thread.isMainThread)
+        guard [.preparing, .playing, .recoverableError]
+            .contains(state)
+        else {
+            return
+        }
+        userPaused = true
+        state = .paused
+        let nativePauseAccepted = player.pause()
+        invalidateGenerationAndCancel()
+        if !nativePauseAccepted {
+            emit(.paused, message: "朗读已暂停")
+        }
+    }
+
+    func resume() {
+        precondition(Thread.isMainThread)
+        guard state == .paused else {
+            return
+        }
+        bufferFailureMessage = nil
+        userPaused = false
+        state = .preparing
+        if player.resume() {
+            state = .playing
+        } else {
+            emit(.preparing, message: "正在恢复朗读缓存")
+        }
+        pumpWhenCancellationSettles()
+    }
+
+    func retry() {
+        precondition(Thread.isMainThread)
+        guard state == .recoverableError else {
+            return
+        }
+        if recoverableFailureKind == .playback {
+            guard let document,
+                  let profile,
+                  let chapterLoader,
+                  let networkAuthorizer,
+                  let currentLocator,
+                  let sentence = sentence(at: currentLocator)
+            else {
+                emit(
+                    .recoverableError,
+                    message:
+                        "本地播放失败后无法恢复当前句，请关闭后重新开始"
+                )
+                return
+            }
+            start(
+                document: document,
+                sentence: sentence,
+                profile: profile,
+                rate: rate,
+                chapterLoader: chapterLoader,
+                networkAuthorizer: networkAuthorizer
+            )
+            return
+        }
+        bufferFailureMessage = nil
+        userPaused = false
+        state = .preparing
+        if recoverableFailureKind == .cancellation {
+            recoverableFailureKind = nil
+            emit(
+                .preparing,
+                message: "正在重新安全结束旧语音任务"
+            )
+            invalidateGenerationAndCancel(
+                intent: .resumeAfterSettlement
+            )
+            return
+        }
+        recoverableFailureKind = nil
+        if player.resume() {
+            state = .playing
+        } else {
+            emit(.preparing, message: "正在恢复朗读缓存")
+        }
+        pumpWhenCancellationSettles()
+    }
+
+    func stop() {
+        stop(
+            emitEvent: true,
+            cancellationIntent: .terminalStop
+        )
+    }
+
+    @discardableResult
+    func shutdown(timeout: TimeInterval) -> Bool {
+        precondition(Thread.isMainThread)
+        stop(
+            emitEvent: false,
+            cancellationIntent: .terminalStop
+        )
+        let settled = cancellationQueue.sync {
+            coordinator.cancelAllAndWait(timeout: timeout)
+        }
+        cancellationGeneration = UUID()
+        cancellationSettled = settled
+        return settled
+    }
+
+    func setRate(_ rate: NativeAudioPlaybackRate) {
+        precondition(Thread.isMainThread)
+        self.rate = rate
+        _ = player.setRate(rate)
+        emit(
+            .horizonChanged,
+            message: "已切换为 \(rate.rawValue)×"
+        )
+        if !userPaused {
+            pump()
+        }
+    }
+
+    @discardableResult
+    func pauseAfterCurrentSentence() -> Bool {
+        precondition(Thread.isMainThread)
+        return player.pauseAfterCurrentSentence()
+    }
+
+    func setPauseBeforeNextChapter(_ enabled: Bool) {
+        precondition(Thread.isMainThread)
+        pauseBeforeNextChapter = enabled
+        player.setPauseBeforeNextChapter(enabled)
+    }
+
+    func cancelPauseAfterCurrentSentence() {
+        precondition(Thread.isMainThread)
+        player.cancelPauseAfterCurrentSentence()
+    }
+
+    func snapshot() -> ReadingTTSProductSnapshot {
+        precondition(Thread.isMainThread)
+        let playerSnapshot = player.snapshot()
+        let coordinatorSnapshot = coordinator.snapshot()
+        return ReadingTTSProductSnapshot(
+            sessionGeneration: sessionGeneration,
+            state: state,
+            currentLocator: currentLocator,
+            horizonMS: currentHorizonMS(),
+            rate: rate,
+            voiceID: profile?.voiceID,
+            batchIsActive: batch != nil,
+            batchID: batch?.id,
+            batchGeneratedStandardMS:
+                batch?.generatedStandardMS ?? 0,
+            batchBlockCount: batch?.blockCount ?? 0,
+            batchCacheKeys: batch?.cacheKeys ?? [],
+            readyBlockCount: playbackItems.count,
+            reachedEndOfDocument: reachedEndOfDocument,
+            playerSessionGeneration:
+                playerSnapshot.state == .idle
+                    || playerSnapshot.state == .stopped
+                    ? nil
+                    : playerSnapshot.sessionGeneration,
+            playerState: playerSnapshot.state,
+            playerCurrentBlockIndex:
+                playerSnapshot.currentBlockIndex,
+            playerCurrentTimeSeconds:
+                playerSnapshot.currentTimeSeconds,
+            cancellationSettled: cancellationSettled,
+            pendingRequest: pendingRequest,
+            waitingForAuthorization:
+                waitingForAuthorization,
+            activeGenerationCacheKey:
+                coordinatorSnapshot.activeCacheKey,
+            queuedGenerationCacheKeys:
+                coordinatorSnapshot.queuedCacheKeys,
+            startedGenerationCacheKeys:
+                coordinatorSnapshot.startedFlightCacheKeys,
+            startedGenerationJobCount:
+                coordinatorSnapshot.startedFlightCount,
+            startedGenerationHistoryTruncated:
+                coordinatorSnapshot
+                    .startedFlightHistoryTruncated,
+            maximumConcurrentGenerationJobCount:
+                coordinatorSnapshot.maximumConcurrentFlightCount
+        )
+    }
+
+    func protectedCacheKeys() -> Set<String> {
+        guard !playbackItems.isEmpty else {
+            return []
+        }
+        let currentIndex =
+            player.snapshot().currentBlockIndex ?? 0
+        let startIndex = max(0, currentIndex - 1)
+        guard playbackItems.indices.contains(startIndex) else {
+            return []
+        }
+        return Set(
+            playbackItems[startIndex...].map {
+                $0.request.cacheKey
+            }
+        )
+    }
+
+    func sentence(
+        at locator: String
+    ) -> ReadingSentence? {
+        playbackItems.lazy
+            .flatMap { $0.request.block.sentences }
+            .first { $0.locator == locator }
+    }
+
+    func adjacentSentence(
+        from locator: String,
+        direction: Int
+    ) -> ReadingSentence? {
+        guard direction == -1 || direction == 1 else {
+            return nil
+        }
+        let sentences = playbackItems.flatMap {
+            $0.request.block.sentences
+        }
+        guard let index = sentences.firstIndex(
+            where: { $0.locator == locator }
+        ) else {
+            return nil
+        }
+        let target = index + direction
+        return sentences.indices.contains(target)
+            ? sentences[target]
+            : nil
+    }
+
+    func adjacentParagraph(
+        from locator: String,
+        direction: Int
+    ) -> ReadingSentence? {
+        ReadingParagraphNavigator.adjacent(
+            in: playbackItems.flatMap {
+                $0.request.block.sentences
+            },
+            from: locator,
+            direction: direction
+        )
+    }
+
+    var isQuiescentForVoicePreview: Bool {
+        cancellationSettled
+            && !pendingRequest
+            && !waitingForAuthorization
+            && batch == nil
+    }
+
+    private func stop(
+        emitEvent: Bool,
+        cancellationIntent: CancellationIntent
+    ) {
+        precondition(Thread.isMainThread)
+        generation = UUID()
+        pendingRequest = false
+        waitingForAuthorization = false
+        userPaused = false
+        reachedEndOfDocument = false
+        batch = nil
+        cursor = nil
+        document = nil
+        profile = nil
+        chapterLoader = nil
+        networkAuthorizer = nil
+        currentLocator = nil
+        bufferFailureMessage = nil
+        pauseBeforeNextChapter = false
+        cacheRequestTiming = nil
+        onlineRequestTiming = nil
+        recoverableFailureKind = nil
+        player.stop()
+        playbackItems.removeAll()
+        state = .stopped
+        invalidateGenerationAndCancel(
+            intent: cancellationIntent
+        )
+        if emitEvent {
+            emit(.stopped, message: "朗读已关闭")
+        }
+    }
+
+    private func invalidateGenerationAndCancel(
+        intent: CancellationIntent = .suspend
+    ) {
+        generation = UUID()
+        let cancellationToken = UUID()
+        cancellationGeneration = cancellationToken
+        pendingRequest = false
+        waitingForAuthorization = false
+        batch = nil
+        cacheRequestTiming = nil
+        onlineRequestTiming = nil
+        cancellationSettled = false
+        cancellationQueue.async {
+            [weak self] in
+            guard let self else { return }
+            let settled = self.coordinator.cancelAllAndWait(
+                timeout: 2
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.cancellationGeneration
+                        == cancellationToken
+                else {
+                    return
+                }
+                self.cancellationSettled = settled
+                guard settled else {
+                    guard intent != .terminalStop else {
+                        return
+                    }
+                    self.state = .recoverableError
+                    self.recoverableFailureKind =
+                        .cancellation
+                    self.emit(
+                        .recoverableError,
+                        message:
+                            "旧语音任务未能安全结束，Click 已禁止启动新任务"
+                    )
+                    return
+                }
+                if intent == .resumeAfterSettlement {
+                    self.recoverableFailureKind = nil
+                    let nativeState =
+                        self.player.snapshot().state
+                    if nativeState == .playing
+                        || nativeState == .preparing {
+                        self.state = .playing
+                    } else if self.player.resume() {
+                        self.state = .playing
+                    } else {
+                        self.state = .preparing
+                        self.emit(
+                            .preparing,
+                            message:
+                                "旧语音任务已安全结束，正在恢复朗读缓存"
+                        )
+                    }
+                }
+                self.pumpWhenCancellationSettles()
+            }
+        }
+    }
+
+    private func pumpWhenCancellationSettles() {
+        guard cancellationSettled, !userPaused else {
+            return
+        }
+        if coordinatorObservationNeedsReset {
+            guard coordinator.resetObservationHistoryIfIdle()
+            else {
+                state = .recoverableError
+                recoverableFailureKind = .cancellation
+                emit(
+                    .recoverableError,
+                    message:
+                        "旧语音任务尚未完全释放，Click 已禁止启动新任务"
+                )
+                return
+            }
+            coordinatorObservationNeedsReset = false
+        }
+        pump()
+    }
+
+    private func pump() {
+        precondition(Thread.isMainThread)
+        guard cancellationSettled,
+              !userPaused,
+              !pendingRequest,
+              !waitingForAuthorization,
+              bufferFailureMessage == nil,
+              let document,
+              let profile,
+              let chapterLoader,
+              cursor != nil
+        else {
+            return
+        }
+        if let openUntil = circuitOpenUntil,
+           openUntil > Date() {
+            state = .recoverableError
+            emit(
+                .recoverableError,
+                message:
+                    "Microsoft 在线语音暂时暂停重试；已有缓存仍可播放"
+            )
+            return
+        }
+        circuitOpenUntil = nil
+
+        let horizonMS = currentHorizonMS()
+        if batch == nil {
+            guard horizonPolicy.shouldStartBatch(
+                horizonMS: horizonMS,
+                batchIsActive: false,
+                paused: userPaused,
+                reachedEndOfDocument: reachedEndOfDocument
+            ) else {
+                return
+            }
+            batch = Batch(
+                id: UUID().uuidString.lowercased(),
+                generatedStandardMS: 0,
+                blockCount: 0,
+                cacheKeys: []
+            )
+            emit(
+                .batchStarted,
+                message: "开始补充一个 30 分钟缓存批次"
+            )
+        }
+
+        guard let cursor else {
+            finishPlanningAtEnd()
+            return
+        }
+        let token = generation
+        pendingRequest = true
+        chapterLoader(cursor.chapterIndex) {
+            [weak self] result in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.generation == token,
+                      !self.userPaused
+                else {
+                    return
+                }
+                switch result {
+                case let .success(chapter):
+                    do {
+                        let planned = try ReadingBufferPlanner
+                            .makeNext(
+                                document: document,
+                                chapter: chapter,
+                                cursor: cursor,
+                                kind: self.nextBlockKind,
+                                profile: profile
+                            )
+                        self.requestCacheOnly(
+                            planned,
+                            token: token
+                        )
+                    } catch {
+                        self.pendingRequest = false
+                        self.failRecoverably(
+                            "后续章节无法建立稳定朗读顺序"
+                        )
+                    }
+                case .failure:
+                    self.pendingRequest = false
+                    self.failRecoverably(
+                        "后续章节解析失败，Click 已暂停朗读补充"
+                    )
+                }
+            }
+        }
+    }
+
+    private func requestCacheOnly(
+        _ planned: ReadingBufferPlannedRequest,
+        token: UUID
+    ) {
+        cacheRequestTiming = RequestTiming(
+            generation: token,
+            cacheKey: planned.request.cacheKey,
+            submittedUptime:
+                ProcessInfo.processInfo.systemUptime
+        )
+        coordinator.request(
+            planned.request,
+            policy: .cacheOnly
+        ) { [weak self] result in
+            guard let self,
+                  self.generation == token,
+                  !self.userPaused
+            else {
+                return
+            }
+            switch result {
+            case let .success(cached):
+                self.complete(
+                    planned,
+                    cached: cached,
+                    token: token
+                )
+            case let .failure(error):
+                self.cacheRequestTiming = nil
+                guard error as? ReadingSpeechGenerationError
+                        == .cacheMissRequiresNetwork
+                else {
+                    self.pendingRequest = false
+                    self.handleGenerationFailure(error)
+                    return
+                }
+                self.requestNetworkAuthorization(
+                    planned,
+                    token: token
+                )
+            }
+        }
+    }
+
+    private func requestNetworkAuthorization(
+        _ planned: ReadingBufferPlannedRequest,
+        token: UUID
+    ) {
+        guard let networkAuthorizer else {
+            pendingRequest = false
+            failRecoverably("未缓存内容需要联网")
+            return
+        }
+        waitingForAuthorization = true
+        emit(
+            .authorizationRequired,
+            message: "首次联网前需要确认正文外发说明"
+        )
+        networkAuthorizer { [weak self] accepted in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.generation == token
+                else {
+                    return
+                }
+                self.waitingForAuthorization = false
+                guard accepted, !self.userPaused else {
+                    self.pendingRequest = false
+                    self.state = .paused
+                    self.userPaused = true
+                    self.emit(
+                        .paused,
+                        message:
+                            "已取消；未启动语音 helper，也未发送正文"
+                    )
+                    return
+                }
+                self.requestOnline(planned, token: token)
+            }
+        }
+    }
+
+    private func requestOnline(
+        _ planned: ReadingBufferPlannedRequest,
+        token: UUID
+    ) {
+        onlineRequestTiming = RequestTiming(
+            generation: token,
+            cacheKey: planned.request.cacheKey,
+            submittedUptime:
+                ProcessInfo.processInfo.systemUptime
+        )
+        coordinator.request(
+            planned.request,
+            policy: .networkAuthorized
+        ) { [weak self] result in
+            guard let self,
+                  self.generation == token,
+                  !self.userPaused
+            else {
+                return
+            }
+            switch result {
+            case let .success(cached):
+                self.transientFailureDates.removeAll()
+                self.bufferFailureMessage = nil
+                self.complete(
+                    planned,
+                    cached: cached,
+                    token: token
+                )
+            case let .failure(error):
+                self.onlineRequestTiming = nil
+                self.pendingRequest = false
+                self.handleGenerationFailure(error)
+            }
+        }
+    }
+
+    private func complete(
+        _ planned: ReadingBufferPlannedRequest,
+        cached: ReadingSpeechCachedBlock,
+        token: UUID
+    ) {
+        guard generation == token,
+              let item = NativeAudioPlaybackItem(
+                request: planned.request,
+                cache: cache
+              )
+        else {
+            pendingRequest = false
+            failRecoverably("完整音频缓存未能通过播放前校验")
+            return
+        }
+        do {
+            if playbackItems.isEmpty {
+                try player.start(
+                    items: [item],
+                    rate: rate,
+                    volume: playerVolume,
+                    acceptsAppends: true
+                )
+                player.setPauseBeforeNextChapter(
+                    pauseBeforeNextChapter
+                )
+            } else {
+                try player.append(items: [item])
+            }
+        } catch {
+            pendingRequest = false
+            failRecoverably("音频块顺序校验失败，Click 已停止续播")
+            return
+        }
+        playbackItems.append(item)
+        cursor = planned.nextCursor
+        nextBlockKind = .steady
+        if cursor == nil {
+            reachedEndOfDocument = true
+        }
+        batch?.generatedStandardMS += cached.audioDurationMS
+        batch?.blockCount += 1
+        batch?.cacheKeys.append(cached.cacheKey)
+        pendingRequest = false
+        state = .playing
+        recoverableFailureKind = nil
+        let completedUptime =
+            ProcessInfo.processInfo.systemUptime
+        let matchingTiming: RequestTiming?
+        if cached.source == "online",
+           let timing = onlineRequestTiming,
+           timing.generation == token,
+           timing.cacheKey == cached.cacheKey {
+            matchingTiming = timing
+        } else if cached.source == "cache",
+                  let timing = cacheRequestTiming,
+                  timing.generation == token,
+                  timing.cacheKey == cached.cacheKey {
+            matchingTiming = timing
+        } else {
+            matchingTiming = nil
+        }
+        let requestElapsedMS = matchingTiming.map {
+            max(0, (completedUptime - $0.submittedUptime) * 1_000)
+        }
+        cacheRequestTiming = nil
+        onlineRequestTiming = nil
+        let standardRTF: Double?
+        if cached.source == "online",
+           let elapsed = requestElapsedMS,
+           cached.audioDurationMS > 0 {
+            standardRTF = elapsed
+                / Double(cached.audioDurationMS)
+        } else {
+            standardRTF = nil
+        }
+        emit(
+            .blockReady,
+            message: cached.source == "cache"
+                ? "已从本机缓存接入后续音频"
+                : "已生成并接入后续音频",
+            cacheKey: cached.cacheKey,
+            standardRTF: standardRTF,
+            requestElapsedMS: requestElapsedMS,
+            source: cached.source,
+            audioDurationMS: cached.audioDurationMS,
+            blockIndex: playbackItems.count - 1
+        )
+
+        let horizonMS = currentHorizonMS()
+        if reachedEndOfDocument {
+            finishPlanningAtEnd()
+            return
+        }
+        if let batch,
+           horizonPolicy.batchIsSatisfied(
+               generatedStandardMS:
+                   batch.generatedStandardMS,
+               horizonMS: horizonMS,
+               rate: rate
+           ) {
+            self.batch = nil
+            emit(
+                .batchCompleted,
+                message:
+                    "30 分钟缓存批次已完成，正在重新计算连续可播时间",
+                batchID: batch.id,
+                batchGeneratedStandardMS:
+                    batch.generatedStandardMS,
+                batchBlockCount: batch.blockCount,
+                batchCacheKeys: batch.cacheKeys
+            )
+            enforceCacheLimitWhenIdle()
+        }
+        emit(
+            .horizonChanged,
+            message: horizonSummary(horizonMS)
+        )
+        pump()
+    }
+
+    private func finishPlanningAtEnd() {
+        pendingRequest = false
+        cacheRequestTiming = nil
+        onlineRequestTiming = nil
+        reachedEndOfDocument = true
+        let completedBatch = batch
+        batch = nil
+        if let completedBatch {
+            emit(
+                .batchCompleted,
+                message: "全书剩余内容已全部进入连续缓存",
+                batchID: completedBatch.id,
+                batchGeneratedStandardMS:
+                    completedBatch.generatedStandardMS,
+                batchBlockCount: completedBatch.blockCount,
+                batchCacheKeys: completedBatch.cacheKeys
+            )
+        }
+        player.sealSequence()
+        enforceCacheLimitWhenIdle()
+    }
+
+    private func enforceCacheLimitWhenIdle() {
+        let protected = protectedCacheKeys()
+        DispatchQueue.global(qos: .utility).async {
+            [cache] in
+            _ = cache.enforceLRU(
+                protectedCacheKeys: protected
+            )
+        }
+    }
+
+    private func handleGenerationFailure(_ error: Error) {
+        if let generationError =
+            error as? ReadingSpeechGenerationError {
+            switch generationError {
+            case .canceled:
+                return
+            case .thermalBlocked:
+                failRecoverably(
+                    "机器温度较高，Click 已停止补充；已有缓存仍可播放"
+                )
+                return
+            case .cacheMissRequiresNetwork:
+                failRecoverably("未缓存内容需要联网")
+                return
+            case let .helperFailed(category):
+                let transient = [
+                    "network_unavailable",
+                    "timeout",
+                    "rate_limited",
+                    "service_unavailable",
+                    "protocol_error",
+                    "internal_error",
+                ].contains(category)
+                if transient {
+                    registerTransientFailure()
+                    failRecoverably(
+                        category == "rate_limited"
+                            ? "Microsoft 在线语音暂时限流；已有缓存仍可播放"
+                            : "Microsoft 在线语音暂时不可用；已有缓存仍可播放"
+                    )
+                    return
+                }
+                failRecoverably("当前 Microsoft 在线声音不可用")
+                return
+            case .timedOut:
+                registerTransientFailure()
+                failRecoverably(
+                    "Microsoft 在线语音等待超时；已有缓存仍可播放"
+                )
+                return
+            case .runtimeUnavailable:
+                failRecoverably("Click 私有语音运行时不可用")
+                return
+            case .runtimeIdentityMismatch:
+                failRecoverably("Click 语音组件版本不一致，请更新 Click")
+                return
+            case .helperProtocol, .invalidArtifact, .cacheCommit:
+                failRecoverably(
+                    "在线语音返回内容未通过安全校验"
+                )
+                return
+            }
+        }
+        failRecoverably("朗读补充失败；已有缓存仍可播放")
+    }
+
+    private func registerTransientFailure() {
+        let cutoff = Date().addingTimeInterval(-5 * 60)
+        transientFailureDates = transientFailureDates.filter {
+            $0 >= cutoff
+        }
+        transientFailureDates.append(Date())
+        if transientFailureDates.count >= 3 {
+            circuitOpenUntil = Date().addingTimeInterval(5 * 60)
+        }
+    }
+
+    private func failRecoverably(
+        _ message: String,
+        kind: RecoverableFailureKind = .generation
+    ) {
+        batch = nil
+        pendingRequest = false
+        cacheRequestTiming = nil
+        onlineRequestTiming = nil
+        bufferFailureMessage = message
+        recoverableFailureKind = kind
+        switch player.snapshot().state {
+        case .playing, .preparing:
+            state = .playing
+            emit(.bufferWarning, message: message)
+        case .paused:
+            state = .paused
+            emit(.bufferWarning, message: message)
+        case .buffering, .idle, .completed, .stopped,
+             .recoverableError:
+            state = .recoverableError
+            emit(.recoverableError, message: message)
+        }
+    }
+
+    private func currentHorizonMS() -> Int {
+        guard !playbackItems.isEmpty else {
+            return 0
+        }
+        let playerSnapshot = player.snapshot()
+        let startIndex = playerSnapshot.currentBlockIndex
+            ?? playbackItems.count
+        guard startIndex < playbackItems.count else {
+            return 0
+        }
+        var standardMS = 0
+        for index in startIndex..<playbackItems.count {
+            let duration = playbackItems[index]
+                .cached.audioDurationMS
+            if index == startIndex {
+                standardMS += max(
+                    0,
+                    duration
+                        - Int(
+                            playerSnapshot.currentTimeSeconds
+                                * 1_000
+                        )
+                )
+            } else {
+                standardMS += duration
+            }
+        }
+        return horizonPolicy.listeningDurationMS(
+            standardDurationMS: standardMS,
+            rate: rate
+        )
+    }
+
+    private func horizonSummary(_ horizonMS: Int) -> String {
+        let minutes = Double(horizonMS) / 60_000
+        return String(
+            format: "连续可播 %.1f 分钟",
+            minutes
+        )
+    }
+
+    private func audibleSeamMS(
+        toBlockIndex: Int,
+        handoffGapMS: Double
+    ) -> Double? {
+        let fromBlockIndex = toBlockIndex - 1
+        guard playbackItems.indices.contains(fromBlockIndex),
+              playbackItems.indices.contains(toBlockIndex),
+              let fromBoundary = playbackItems[fromBlockIndex]
+                .cached.boundaries.last,
+              let toBoundary = playbackItems[toBlockIndex]
+                .cached.boundaries.first,
+              rate.multiplier > 0
+        else {
+            return nil
+        }
+        let fromBoundaryEndMS = Double(
+            fromBoundary.offset + fromBoundary.duration
+        ) / 10_000
+        let trailingSilenceMS = max(
+            0,
+            Double(
+                playbackItems[fromBlockIndex]
+                    .cached.audioDurationMS
+            ) - fromBoundaryEndMS
+        )
+        let leadingSilenceMS =
+            Double(toBoundary.offset) / 10_000
+        return handoffGapMS
+            + (trailingSilenceMS + leadingSilenceMS)
+                / Double(rate.multiplier)
+    }
+
+    private func handlePlayerEvent(
+        _ event: NativeAudioPlayerEvent
+    ) {
+        precondition(Thread.isMainThread)
+        switch event.kind {
+        case .preparing:
+            state = .preparing
+            emit(.preparing, message: "正在准备本地音频播放器")
+        case .buffering:
+            if let bufferFailureMessage {
+                state = .recoverableError
+                emit(
+                    .recoverableError,
+                    message: bufferFailureMessage
+                )
+                return
+            }
+            state = userPaused ? .paused : .preparing
+            emit(
+                .buffering,
+                message: "正在等待下一段完整缓存"
+            )
+            pump()
+        case .blockStarted:
+            state = .playing
+            emit(
+                .playing,
+                message: "正在朗读",
+                cacheKey: event.cacheKey,
+                handoffGapMS: event.handoffGapMS,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+        case .sentenceBoundary:
+            currentLocator = event.locator
+            emit(
+                .sentenceBoundary,
+                message: "正在朗读当前句",
+                locator: event.locator,
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+            pump()
+        case .paused:
+            state = .paused
+            if !userPaused {
+                userPaused = true
+                invalidateGenerationAndCancel()
+            }
+            emit(
+                .paused,
+                message: "朗读已暂停",
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+        case .sentenceBoundaryPaused:
+            state = .paused
+            if !userPaused {
+                userPaused = true
+                invalidateGenerationAndCancel()
+            }
+            emit(
+                .sentenceBoundaryPaused,
+                message: "已在当前句结束后暂停",
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+        case .chapterBoundaryPaused:
+            state = .paused
+            if !userPaused {
+                userPaused = true
+                invalidateGenerationAndCancel()
+            }
+            emit(
+                .chapterBoundaryPaused,
+                message: "本章已读完，已在跨章前暂停",
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+        case .resumed:
+            state = .playing
+            emit(
+                .resumed,
+                message: "继续朗读",
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+        case .completed:
+            state = .completed
+            emit(.completed, message: "已读完全书")
+        case .failed:
+            state = .recoverableError
+            recoverableFailureKind = .playback
+            emit(
+                .recoverableError,
+                message: "本地缓存音频播放失败，Click 已停止"
+            )
+        case .stopped:
+            state = .stopped
+        case .blockFinished, .rateChanged:
+            emit(
+                .horizonChanged,
+                message: horizonSummary(currentHorizonMS()),
+                cacheKey: event.cacheKey,
+                blockIndex: event.blockIndex,
+                playerSessionGeneration:
+                    event.sessionGeneration,
+                playerTimeSeconds:
+                    event.playerTimeSeconds
+            )
+            pump()
+        }
+    }
+
+    private func emit(
+        _ kind: ReadingTTSProductEventKind,
+        message: String,
+        locator: String? = nil,
+        batchID: String? = nil,
+        cacheKey: String? = nil,
+        standardRTF: Double? = nil,
+        requestElapsedMS: Double? = nil,
+        handoffGapMS: Double? = nil,
+        source: String? = nil,
+        audioDurationMS: Int? = nil,
+        batchGeneratedStandardMS: Int? = nil,
+        batchBlockCount: Int? = nil,
+        batchCacheKeys: [String]? = nil,
+        blockIndex: Int? = nil,
+        playerSessionGeneration: UUID? = nil,
+        playerTimeSeconds: TimeInterval? = nil
+    ) {
+        let playerSnapshot = player.snapshot()
+        let blockItem = blockIndex.flatMap {
+            playbackItems.indices.contains($0)
+                ? playbackItems[$0]
+                : nil
+        }
+        let resolvedBlockChapterIndex =
+            blockItem?.request.block.chapterIndex
+        let resolvedLocator = locator ?? currentLocator
+        let chapterIndex = resolvedBlockChapterIndex
+            ?? resolvedLocator.flatMap {
+                locator in
+                playbackItems.lazy
+                    .flatMap { $0.request.block.sentences }
+                    .first { $0.locator == locator }?
+                    .chapterIndex
+            }
+        let isPlaybackTransition =
+            kind == .playing
+            && handoffGapMS != nil
+            && blockIndex.map { $0 > 0 } == true
+        let fromItem = isPlaybackTransition
+            ? blockIndex.flatMap {
+                let fromIndex = $0 - 1
+                return playbackItems.indices.contains(fromIndex)
+                    ? playbackItems[fromIndex]
+                    : nil
+            }
+            : nil
+        let resolvedAudibleSeamMS =
+            isPlaybackTransition
+                ? blockIndex.flatMap { index in
+                    handoffGapMS.flatMap {
+                        audibleSeamMS(
+                            toBlockIndex: index,
+                            handoffGapMS: $0
+                        )
+                    }
+                }
+                : nil
+        eventHandler(
+            ReadingTTSProductEvent(
+                sessionGeneration: sessionGeneration,
+                monotonicUptimeMS:
+                    ProcessInfo.processInfo.systemUptime
+                        * 1_000,
+                kind: kind,
+                message: message,
+                locator: resolvedLocator,
+                chapterIndex: chapterIndex,
+                horizonMS: currentHorizonMS(),
+                batchID: batchID ?? batch?.id,
+                cacheKey: cacheKey ?? blockItem?.cached.cacheKey,
+                standardRTF: standardRTF,
+                requestElapsedMS: requestElapsedMS,
+                handoffGapMS: handoffGapMS,
+                audibleSeamMS: resolvedAudibleSeamMS,
+                source: source ?? blockItem?.cached.source,
+                audioDurationMS:
+                    audioDurationMS
+                        ?? blockItem?.cached.audioDurationMS,
+                batchGeneratedStandardMS:
+                    batchGeneratedStandardMS
+                        ?? batch?.generatedStandardMS,
+                batchBlockCount:
+                    batchBlockCount ?? batch?.blockCount,
+                batchCacheKeys:
+                    batchCacheKeys ?? batch?.cacheKeys ?? [],
+                blockIndex: blockIndex,
+                blockChapterIndex:
+                    resolvedBlockChapterIndex,
+                playerSessionGeneration:
+                    playerSessionGeneration
+                        ?? (
+                            playerSnapshot.state == .idle
+                                || playerSnapshot.state == .stopped
+                                ? nil
+                                : playerSnapshot.sessionGeneration
+                        ),
+                playerTimeSeconds:
+                    playerTimeSeconds
+                        ?? playerSnapshot.currentTimeSeconds,
+                fromChapterIndex:
+                    fromItem?.request.block.chapterIndex,
+                toChapterIndex:
+                    isPlaybackTransition
+                        ? blockItem?.request.block.chapterIndex
+                        : nil,
+                fromCacheKey: fromItem?.cached.cacheKey,
+                toCacheKey:
+                    isPlaybackTransition
+                        ? blockItem?.cached.cacheKey
+                        : nil
+            )
+        )
+    }
+}
+
+enum ReadingInteractionKind: String, Codable, Equatable {
+    case ordinarySentence
+    case englishLookup
+    case doubleClickNote
+    case dragSelection
+    case selectionAction
+    case secondaryClick
+    case link
+    case control
+    case notePreview
+    case navigation
+}
+
+enum ReadingInteractionDecision: String, Codable, Equatable {
+    case ignore
+    case schedule
+    case cancel
+}
+
+enum ReadingInteractionArbitrator {
+    static func decision(
+        sessionIsJumpEligible: Bool,
+        kind: ReadingInteractionKind,
+        hasStableLocator: Bool
+    ) -> ReadingInteractionDecision {
+        guard sessionIsJumpEligible else {
+            return .ignore
+        }
+        guard kind == .ordinarySentence, hasStableLocator else {
+            return .cancel
+        }
+        return .schedule
+    }
+}
+
+struct ReadingJumpCandidate: Codable, Equatable {
+    let sessionID: String
+    let documentRevision: String
+    let chapterLocator: String
+    let sentenceLocator: String
+}
+
+final class ReadingJumpCoordinator {
+    private let delay: TimeInterval
+    private let queue: DispatchQueue
+    private let commit: (ReadingJumpCandidate) -> Void
+    private var generation = 0
+    private var pending: DispatchWorkItem?
+
+    init(
+        delay: TimeInterval = NSEvent.doubleClickInterval,
+        queue: DispatchQueue = .main,
+        commit: @escaping (ReadingJumpCandidate) -> Void
+    ) {
+        self.delay = max(0, delay)
+        self.queue = queue
+        self.commit = commit
+    }
+
+    func schedule(_ candidate: ReadingJumpCandidate) {
+        cancel()
+        let token = generation
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.generation == token
+            else {
+                return
+            }
+            self.pending = nil
+            self.commit(candidate)
+        }
+        pending = workItem
+        queue.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    func cancel() {
+        generation += 1
+        pending?.cancel()
+        pending = nil
+    }
+}
+
+enum EPUBLinkedReadingOrderResolver {
+    struct Resolution {
+        let hubURL: URL
+        let linkedChapters: [URL]
+    }
+
+    private static let minimumLinkedChapterCount = 8
+
+    static func resolve(spineURLs: [URL], manifestHTMLURLs: [URL]) -> Resolution? {
+        let normalizedSpine = uniqueFileURLs(spineURLs)
+        let normalizedManifest = uniqueFileURLs(manifestHTMLURLs)
+        let spinePaths = Set(normalizedSpine.map(\.path))
+        let omittedManifestURLs = normalizedManifest.filter { !spinePaths.contains($0.path) }
+
+        guard omittedManifestURLs.count >= minimumLinkedChapterCount,
+              omittedManifestURLs.count > normalizedSpine.count
+        else {
+            return nil
+        }
+
+        let omittedPaths = Set(omittedManifestURLs.map(\.path))
+        var best: Resolution?
+        for hubURL in normalizedSpine {
+            let linked = linkedManifestChapters(
+                from: hubURL,
+                allowedPaths: omittedPaths
+            )
+            if linked.count > (best?.linkedChapters.count ?? 0) {
+                best = Resolution(hubURL: hubURL, linkedChapters: linked)
+            }
+        }
+
+        guard let best,
+              best.linkedChapters.count >= minimumLinkedChapterCount,
+              best.linkedChapters.count * 2 >= omittedManifestURLs.count
+        else {
+            return nil
+        }
+        return best
+    }
+
+    private static func linkedManifestChapters(from hubURL: URL, allowedPaths: Set<String>) -> [URL] {
+        guard let document = try? XMLDocument(contentsOf: hubURL, options: []) else {
+            return []
+        }
+        let links = (try? document.nodes(forXPath: "//*[local-name()='a' and @href]"))?.compactMap { $0 as? XMLElement } ?? []
+        var seen: Set<String> = []
+        var result: [URL] = []
+        for link in links {
+            guard let href = link.attribute(forName: "href")?.stringValue,
+                  let targetURL = localResourceURL(href: href, relativeTo: hubURL),
+                  allowedPaths.contains(targetURL.path),
+                  seen.insert(targetURL.path).inserted,
+                  FileManager.default.fileExists(atPath: targetURL.path)
+            else {
+                continue
+            }
+            result.append(targetURL)
+        }
+        return result
+    }
+
+    private static func localResourceURL(href: String, relativeTo hubURL: URL) -> URL? {
+        let trimmed = href.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("#"),
+              URLComponents(string: trimmed)?.scheme == nil
+        else {
+            return nil
+        }
+
+        let withoutFragment = trimmed.components(separatedBy: "#").first ?? trimmed
+        let withoutQuery = withoutFragment.components(separatedBy: "?").first ?? withoutFragment
+        let decoded = withoutQuery.removingPercentEncoding ?? withoutQuery
+        guard !decoded.isEmpty else {
+            return nil
+        }
+        return hubURL.deletingLastPathComponent()
+            .appendingPathComponent(decoded)
+            .standardizedFileURL
+    }
+
+    private static func uniqueFileURLs(_ urls: [URL]) -> [URL] {
+        var seen: Set<String> = []
+        return urls.compactMap { url in
+            let normalized = url.standardizedFileURL
+            return seen.insert(normalized.path).inserted ? normalized : nil
+        }
+    }
+}
+
+private enum ReadingTTSControlStyle {
+    static func configureIconButton(
+        _ button: NSButton,
+        symbolName: String,
+        accessibilityLabel: String,
+        toolTip: String,
+        size: CGFloat
+    ) {
+        button.bezelStyle = .texturedRounded
+        button.controlSize = .regular
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.contentTintColor = .white
+        button.setAccessibilityLabel(accessibilityLabel)
+        button.toolTip = toolTip
+        setSymbol(
+            button,
+            name: symbolName,
+            accessibilityDescription: accessibilityLabel
+        )
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: size),
+            button.heightAnchor.constraint(equalToConstant: size),
+        ])
+    }
+
+    static func updatePlaybackButton(
+        _ button: NSButton,
+        title: String
+    ) {
+        button.title = title
+        let symbolName: String
+        switch title {
+        case "暂停":
+            symbolName = "pause.fill"
+        case "重试":
+            symbolName = "arrow.clockwise"
+        default:
+            symbolName = "play.fill"
+        }
+        setSymbol(
+            button,
+            name: symbolName,
+            accessibilityDescription: title
+        )
+        button.imagePosition = .imageOnly
+        button.toolTip = title
+    }
+
+    static func setSymbol(
+        _ button: NSButton,
+        name: String,
+        accessibilityDescription: String
+    ) {
+        let configuration = NSImage.SymbolConfiguration(
+            pointSize: 15,
+            weight: .semibold
+        )
+        button.image = NSImage(
+            systemSymbolName: name,
+            accessibilityDescription: accessibilityDescription
+        )?.withSymbolConfiguration(configuration)
+    }
+}
+
+final class ListeningModeWindowController: NSObject, NSWindowDelegate {
+    private static let originXKey =
+        "Click.ReaderTTS.listeningPanel.originX.v1"
+    private static let originYKey =
+        "Click.ReaderTTS.listeningPanel.originY.v1"
+    private static let widthKey =
+        "Click.ReaderTTS.listeningPanel.width.v1"
+    private static let heightKey =
+        "Click.ReaderTTS.listeningPanel.height.v1"
+    private static let pinnedKey =
+        "Click.ReaderTTS.listeningPanel.pinned.v1"
+    private static let edgeSnapDistance: CGFloat = 20
+    private static let minimumSize =
+        NSSize(width: 420, height: 96)
+    private static let maximumSize =
+        NSSize(width: 900, height: 260)
+    private static let minimumSubtitleLines = 2
+    private static let maximumSubtitleLines = 6
+    private static let subtitleLineHeight: CGFloat = 17
+    private static let fixedVerticalChromeHeight: CGFloat = 61
+
+    private let panel: NSPanel
+    private let subtitleLabel = NSTextField(
+        wrappingLabelWithString: "正在准备朗读正文"
+    )
+    private let statusLabel = NSTextField(labelWithString: "正在准备")
+    private let pinButton = NSButton(
+        title: "📌",
+        target: nil,
+        action: nil
+    )
+    private let previousButton = NSButton(
+        title: "上一段",
+        target: nil,
+        action: nil
+    )
+    private let playPauseButton = NSButton(
+        title: "暂停",
+        target: nil,
+        action: nil
+    )
+    private let nextButton = NSButton(
+        title: "下一段",
+        target: nil,
+        action: nil
+    )
+    private let timerButton = NSButton(
+        title: "定时",
+        target: nil,
+        action: nil
+    )
+    private let returnButton = NSButton(
+        title: "返回阅读",
+        target: nil,
+        action: nil
+    )
+    private let closeButton = NSButton(
+        title: "×",
+        target: nil,
+        action: nil
+    )
+
+    private let onPrevious: () -> Void
+    private let onTogglePlayback: () -> Void
+    private let onNext: () -> Void
+    private let onTimer: (NSButton) -> Void
+    private let onReturn: () -> Void
+    private let onClose: () -> Void
+    private var isAdjustingFrame = false
+    private var hasRestoredFrame = false
+    private var currentSubtitleLineCapacity =
+        ListeningModeWindowController.minimumSubtitleLines
+    private var isPinned: Bool
+
+    init(
+        onPrevious: @escaping () -> Void,
+        onTogglePlayback: @escaping () -> Void,
+        onNext: @escaping () -> Void,
+        onTimer: @escaping (NSButton) -> Void,
+        onReturn: @escaping () -> Void,
+        onClose: @escaping () -> Void
+    ) {
+        self.onPrevious = onPrevious
+        self.onTogglePlayback = onTogglePlayback
+        self.onNext = onNext
+        self.onTimer = onTimer
+        self.onReturn = onReturn
+        self.onClose = onClose
+        let defaults = UserDefaults.standard
+        isPinned = defaults.object(forKey: Self.pinnedKey) == nil
+            ? true
+            : defaults.bool(forKey: Self.pinnedKey)
+        panel = NSPanel(
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: 420,
+                height: 96
+            ),
+            styleMask: [
+                .titled,
+                .nonactivatingPanel,
+                .fullSizeContentView,
+                .resizable,
+            ],
+            backing: .buffered,
+            defer: false
+        )
+        super.init()
+        configurePanel()
+    }
+
+    var isVisible: Bool {
+        panel.isVisible
+    }
+
+    func show() {
+        restoreFrameIfNeeded()
+        applyPinnedState()
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+    }
+
+    func update(
+        title: String,
+        chapter: String,
+        sentence: String,
+        status: String,
+        playPauseTitle: String,
+        timerTitle: String
+    ) {
+        panel.title = [title, chapter]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+        let trimmedSentence = sentence.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        subtitleLabel.stringValue = trimmedSentence.isEmpty
+            ? "正在准备朗读正文"
+            : trimmedSentence
+        subtitleLabel.toolTip = subtitleLabel.stringValue
+        statusLabel.stringValue = status
+        statusLabel.toolTip = [panel.title, status]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+        ReadingTTSControlStyle.updatePlaybackButton(
+            playPauseButton,
+            title: playPauseTitle
+        )
+        timerButton.title = timerTitle
+        ReadingTTSControlStyle.setSymbol(
+            timerButton,
+            name: "timer",
+            accessibilityDescription: timerTitle
+        )
+        timerButton.imagePosition = .imageOnly
+        timerButton.toolTip = timerTitle
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard hasRestoredFrame, !isAdjustingFrame else {
+            return
+        }
+        snapToVisibleScreenEdge()
+        persistFrame()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        guard hasRestoredFrame, !isAdjustingFrame else {
+            return
+        }
+        updateSubtitleLineCapacity()
+        let clamped = clampedOrigin(panel.frame.origin)
+        if clamped != panel.frame.origin {
+            isAdjustingFrame = true
+            panel.setFrameOrigin(clamped)
+            isAdjustingFrame = false
+        }
+        persistFrame()
+    }
+
+    private func configurePanel() {
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isOpaque = false
+        panel.backgroundColor = NSColor(
+            calibratedWhite: 0.08,
+            alpha: 0.97
+        )
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = true
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.isFloatingPanel = true
+        panel.isReleasedWhenClosed = false
+        panel.delegate = self
+        panel.minSize = Self.minimumSize
+        panel.maxSize = Self.maximumSize
+
+        let root = NSView()
+        root.wantsLayer = true
+        root.layer?.backgroundColor =
+            NSColor(calibratedWhite: 0.08, alpha: 0.97).cgColor
+        root.layer?.cornerRadius = 12
+        root.layer?.masksToBounds = true
+
+        subtitleLabel.font =
+            NSFont(name: "Microsoft YaHei", size: 13)
+            ?? NSFont.systemFont(ofSize: 13, weight: .semibold)
+        subtitleLabel.textColor = .white
+        subtitleLabel.lineBreakMode = .byWordWrapping
+        subtitleLabel.maximumNumberOfLines =
+            Self.minimumSubtitleLines
+        subtitleLabel.cell?.wraps = true
+        subtitleLabel.cell?.truncatesLastVisibleLine = true
+        subtitleLabel.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+        subtitleLabel.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .vertical
+        )
+        subtitleLabel.setContentHuggingPriority(
+            .defaultLow,
+            for: .vertical
+        )
+        statusLabel.font =
+            NSFont(name: "Microsoft YaHei", size: 10)
+            ?? NSFont.systemFont(ofSize: 10)
+        statusLabel.textColor =
+            NSColor.white.withAlphaComponent(0.68)
+        statusLabel.lineBreakMode = .byTruncatingTail
+
+        pinButton.target = self
+        pinButton.action = #selector(togglePinned(_:))
+        previousButton.target = self
+        previousButton.action = #selector(previous(_:))
+        playPauseButton.target = self
+        playPauseButton.action = #selector(togglePlayback(_:))
+        nextButton.target = self
+        nextButton.action = #selector(next(_:))
+        timerButton.target = self
+        timerButton.action = #selector(showTimer(_:))
+        returnButton.target = self
+        returnButton.action = #selector(returnToReading(_:))
+        closeButton.target = self
+        closeButton.action = #selector(closeListening(_:))
+
+        ReadingTTSControlStyle.configureIconButton(
+            pinButton,
+            symbolName: "pin.fill",
+            accessibilityLabel: "切换听音挂件置顶",
+            toolTip: "切换默认置顶",
+            size: 34
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            previousButton,
+            symbolName: "backward.end.fill",
+            accessibilityLabel: "上一段",
+            toolTip: "上一段",
+            size: 36
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            playPauseButton,
+            symbolName: "pause.fill",
+            accessibilityLabel: "播放或暂停朗读",
+            toolTip: "暂停",
+            size: 40
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            nextButton,
+            symbolName: "forward.end.fill",
+            accessibilityLabel: "下一段",
+            toolTip: "下一段",
+            size: 36
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            timerButton,
+            symbolName: "timer",
+            accessibilityLabel: "朗读定时",
+            toolTip: "朗读定时",
+            size: 36
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            returnButton,
+            symbolName: "book.closed.fill",
+            accessibilityLabel: "返回阅读",
+            toolTip: "返回阅读",
+            size: 36
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            closeButton,
+            symbolName: "xmark",
+            accessibilityLabel: "结束朗读",
+            toolTip: "结束本次朗读",
+            size: 36
+        )
+        ReadingTTSControlStyle.updatePlaybackButton(
+            playPauseButton,
+            title: "暂停"
+        )
+
+        let subtitleStack = NSStackView(
+            views: [
+                subtitleLabel,
+                pinButton,
+            ]
+        )
+        subtitleStack.orientation = .horizontal
+        subtitleStack.alignment = .top
+        subtitleStack.spacing = 7
+        subtitleStack.setContentHuggingPriority(
+            .defaultLow,
+            for: .vertical
+        )
+        statusLabel.setContentCompressionResistancePriority(
+            .defaultLow,
+            for: .horizontal
+        )
+
+        let controls = NSStackView(
+            views: [
+                previousButton,
+                playPauseButton,
+                nextButton,
+                timerButton,
+                statusLabel,
+                returnButton,
+                closeButton,
+            ]
+        )
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 6
+        controls.setContentHuggingPriority(
+            .required,
+            for: .vertical
+        )
+
+        let stack = NSStackView(views: [subtitleStack, controls])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .fill
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        subtitleStack.translatesAutoresizingMaskIntoConstraints = false
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        panel.contentView = root
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(
+                equalTo: root.leadingAnchor,
+                constant: 10
+            ),
+            stack.trailingAnchor.constraint(
+                equalTo: root.trailingAnchor,
+                constant: -10
+            ),
+            stack.topAnchor.constraint(
+                equalTo: root.topAnchor,
+                constant: 8
+            ),
+            stack.bottomAnchor.constraint(
+                equalTo: root.bottomAnchor,
+                constant: -8
+            ),
+            subtitleStack.widthAnchor.constraint(
+                equalTo: stack.widthAnchor
+            ),
+            controls.widthAnchor.constraint(
+                equalTo: stack.widthAnchor
+            ),
+        ])
+        applyPinnedState()
+    }
+
+    private func applyPinnedState() {
+        panel.level = isPinned ? .floating : .normal
+        panel.collectionBehavior = isPinned
+            ? [.canJoinAllSpaces, .fullScreenAuxiliary]
+            : []
+        ReadingTTSControlStyle.setSymbol(
+            pinButton,
+            name: isPinned ? "pin.fill" : "pin.slash.fill",
+            accessibilityDescription:
+                isPinned ? "取消听音挂件置顶" : "置顶听音挂件"
+        )
+        pinButton.toolTip =
+            isPinned ? "取消默认置顶" : "恢复默认置顶"
+        pinButton.state = isPinned ? .on : .off
+    }
+
+    private func restoreFrameIfNeeded() {
+        guard !hasRestoredFrame else {
+            return
+        }
+        hasRestoredFrame = true
+        let defaults = UserDefaults.standard
+        let hasX = defaults.object(forKey: Self.originXKey) != nil
+        let hasY = defaults.object(forKey: Self.originYKey) != nil
+        let hasWidth = defaults.object(forKey: Self.widthKey) != nil
+        let hasHeight = defaults.object(forKey: Self.heightKey) != nil
+        let restoredSize = NSSize(
+            width: min(
+                max(
+                    hasWidth
+                        ? defaults.double(forKey: Self.widthKey)
+                        : panel.frame.width,
+                    Self.minimumSize.width
+                ),
+                Self.maximumSize.width
+            ),
+            height: min(
+                max(
+                    hasHeight
+                        ? defaults.double(forKey: Self.heightKey)
+                        : panel.frame.height,
+                    Self.minimumSize.height
+                ),
+                Self.maximumSize.height
+            )
+        )
+        isAdjustingFrame = true
+        panel.setFrame(
+            NSRect(origin: panel.frame.origin, size: restoredSize),
+            display: false
+        )
+        if hasX, hasY {
+            let proposed = NSPoint(
+                x: defaults.double(forKey: Self.originXKey),
+                y: defaults.double(forKey: Self.originYKey)
+            )
+            panel.setFrameOrigin(clampedOrigin(proposed))
+        } else {
+            panel.center()
+        }
+        isAdjustingFrame = false
+        updateSubtitleLineCapacity()
+        snapToVisibleScreenEdge()
+        persistFrame()
+    }
+
+    private static func subtitleLineCapacity(
+        forPanelHeight panelHeight: CGFloat
+    ) -> Int {
+        let usableHeight = max(
+            subtitleLineHeight * CGFloat(minimumSubtitleLines),
+            panelHeight - fixedVerticalChromeHeight
+        )
+        return min(
+            maximumSubtitleLines,
+            max(
+                minimumSubtitleLines,
+                Int(floor(usableHeight / subtitleLineHeight))
+            )
+        )
+    }
+
+    private func updateSubtitleLineCapacity() {
+        let panelHeight =
+            panel.contentView?.bounds.height ?? panel.frame.height
+        let capacity = Self.subtitleLineCapacity(
+            forPanelHeight: panelHeight
+        )
+        guard capacity != currentSubtitleLineCapacity else {
+            return
+        }
+        currentSubtitleLineCapacity = capacity
+        subtitleLabel.maximumNumberOfLines = capacity
+        subtitleLabel.invalidateIntrinsicContentSize()
+        panel.contentView?.needsLayout = true
+    }
+
+    private func clampedOrigin(_ origin: NSPoint) -> NSPoint {
+        let proposedFrame = NSRect(
+            origin: origin,
+            size: panel.frame.size
+        )
+        let screen =
+            NSScreen.screens.first(where: {
+                $0.visibleFrame.intersects(proposedFrame)
+            })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let visible = screen?.visibleFrame else {
+            return origin
+        }
+        return NSPoint(
+            x: min(
+                max(origin.x, visible.minX),
+                max(visible.minX, visible.maxX - panel.frame.width)
+            ),
+            y: min(
+                max(origin.y, visible.minY),
+                max(visible.minY, visible.maxY - panel.frame.height)
+            )
+        )
+    }
+
+    private func snapToVisibleScreenEdge() {
+        guard let screen = panel.screen
+                ?? NSScreen.main
+                ?? NSScreen.screens.first
+        else {
+            return
+        }
+        let visible = screen.visibleFrame
+        var origin = clampedOrigin(panel.frame.origin)
+        let rightX = visible.maxX - panel.frame.width
+        let topY = visible.maxY - panel.frame.height
+        if abs(origin.x - visible.minX) <= Self.edgeSnapDistance {
+            origin.x = visible.minX
+        } else if abs(origin.x - rightX) <= Self.edgeSnapDistance {
+            origin.x = rightX
+        }
+        if abs(origin.y - visible.minY) <= Self.edgeSnapDistance {
+            origin.y = visible.minY
+        } else if abs(origin.y - topY) <= Self.edgeSnapDistance {
+            origin.y = topY
+        }
+        guard origin != panel.frame.origin else {
+            return
+        }
+        isAdjustingFrame = true
+        panel.setFrameOrigin(origin)
+        isAdjustingFrame = false
+    }
+
+    private func persistFrame() {
+        let defaults = UserDefaults.standard
+        defaults.set(
+            Double(panel.frame.origin.x),
+            forKey: Self.originXKey
+        )
+        defaults.set(
+            Double(panel.frame.origin.y),
+            forKey: Self.originYKey
+        )
+        defaults.set(
+            Double(panel.frame.width),
+            forKey: Self.widthKey
+        )
+        defaults.set(
+            Double(panel.frame.height),
+            forKey: Self.heightKey
+        )
+    }
+
+    @objc private func togglePinned(_ sender: Any?) {
+        isPinned.toggle()
+        UserDefaults.standard.set(
+            isPinned,
+            forKey: Self.pinnedKey
+        )
+        applyPinnedState()
+    }
+
+    @objc private func previous(_ sender: Any?) {
+        onPrevious()
+    }
+
+    @objc private func togglePlayback(_ sender: Any?) {
+        onTogglePlayback()
+    }
+
+    @objc private func next(_ sender: Any?) {
+        onNext()
+    }
+
+    @objc private func showTimer(_ sender: NSButton) {
+        onTimer(sender)
+    }
+
+    @objc private func returnToReading(_ sender: Any?) {
+        onReturn()
+    }
+
+    @objc private func closeListening(_ sender: Any?) {
+        onClose()
+    }
+}
+
+final class SystemMediaSessionController {
+    private let nowPlayingInfoCenter =
+        MPNowPlayingInfoCenter.default()
+    private let remoteCommandCenter =
+        MPRemoteCommandCenter.shared()
+    private let onPlay: () -> Void
+    private let onPause: () -> Void
+    private let onTogglePlayback: () -> Void
+    private let onPrevious: () -> Void
+    private let onNext: () -> Void
+    private var commandTokens: [(MPRemoteCommand, Any)] = []
+    private var commandsInstalled = false
+
+    init(
+        onPlay: @escaping () -> Void,
+        onPause: @escaping () -> Void,
+        onTogglePlayback: @escaping () -> Void,
+        onPrevious: @escaping () -> Void,
+        onNext: @escaping () -> Void
+    ) {
+        self.onPlay = onPlay
+        self.onPause = onPause
+        self.onTogglePlayback = onTogglePlayback
+        self.onPrevious = onPrevious
+        self.onNext = onNext
+    }
+
+    deinit {
+        clear()
+    }
+
+    func update(
+        title: String,
+        chapter: String,
+        state: ReadingAudioSessionState
+    ) {
+        installCommandsIfNeeded()
+        nowPlayingInfoCenter.nowPlayingInfo = [
+            MPMediaItemPropertyTitle: title,
+            MPMediaItemPropertyAlbumTitle: chapter,
+            MPMediaItemPropertyArtist: "Click",
+            MPNowPlayingInfoPropertyPlaybackRate:
+                state == .playing || state == .preparing
+                ? 1.0
+                : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+        ]
+        switch state {
+        case .playing, .preparing:
+            nowPlayingInfoCenter.playbackState = .playing
+        case .paused, .recoverableError:
+            nowPlayingInfoCenter.playbackState = .paused
+        case .idle, .completed, .stopped:
+            nowPlayingInfoCenter.playbackState = .stopped
+        }
+    }
+
+    func clear() {
+        for (command, token) in commandTokens {
+            command.removeTarget(token)
+            command.isEnabled = false
+        }
+        commandTokens.removeAll()
+        commandsInstalled = false
+        nowPlayingInfoCenter.nowPlayingInfo = nil
+        nowPlayingInfoCenter.playbackState = .stopped
+    }
+
+    private func installCommandsIfNeeded() {
+        guard !commandsInstalled else {
+            return
+        }
+        commandsInstalled = true
+        register(remoteCommandCenter.playCommand, action: onPlay)
+        register(remoteCommandCenter.pauseCommand, action: onPause)
+        register(
+            remoteCommandCenter.togglePlayPauseCommand,
+            action: onTogglePlayback
+        )
+        register(
+            remoteCommandCenter.previousTrackCommand,
+            action: onPrevious
+        )
+        register(
+            remoteCommandCenter.nextTrackCommand,
+            action: onNext
+        )
+    }
+
+    private func register(
+        _ command: MPRemoteCommand,
+        action: @escaping () -> Void
+    ) {
+        command.isEnabled = true
+        let token = command.addTarget { _ in
+            DispatchQueue.main.async(execute: action)
+            return .success
+        }
+        commandTokens.append((command, token))
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
+    private enum LibraryOpenSurfaceState {
+        case library
+        case opening(bookID: String, requestID: String)
+        case reading(bookID: String)
+        case failed(bookID: String, requestID: String)
+    }
+
+    private enum Gate1AcceptancePhase {
+        case waitingForFixture
+        case waitingForFirstBridge
+        case checkingCancelledClick
+        case checkingCommittedClick
+        case waitingForNextChapter
+        case waitingForPreviousChapter
+        case finished
+    }
+
+    private enum Gate2ANAcceptancePhase: String {
+        case batch
+        case audible
+    }
+
+    private struct Gate2ANSample {
+        let id: String
+        let text: String
+        let textSHA256: String
+        let voice: String
+        let chapterLocator: String
+        let startLocator: String
+        let endLocator: String
+        let locatorRange: String
+    }
+
+    private struct PendingReadingMove {
+        let identity: ReadingJumpIdentity
+        let targetChapterIndex: Int
+        let targetLocator: String?
+        let edge: ReadingChapterEdge
+    }
+
+    private enum ReadingTTSSleepMode {
+        case off
+        case deadline(Date)
+        case endOfChapter
+    }
+
+    private static let gate1AcceptanceModeValue = "reading-core-v1"
+    private static let gate1AcceptanceFixtureSHA256 =
+        "38a906da7d84078309abe454ae3c68640983a9d52789c633b1119147480a39f4"
+    private static let gate1AcceptanceWatchdogSeconds: TimeInterval = 30
+    private static let gate2ANAcceptanceModeValue = "first-sound-v1"
+    private static let gate2ANAuthorizationValue =
+        "public-gate1-fixture-only-v1"
+    private static let gate2ANAcceptanceWatchdogSeconds: TimeInterval = 900
+    private static let gate2ANResourceAckSeconds: TimeInterval = 90
+    private static let stageBVisibleAcceptanceModeValue =
+        "reading-ui-v1"
+    private static let stageBVisibleAuthorizationValue =
+        "public-stageb-fixture-only-v1"
+    private static let stageBVisibleFixtureSHA256 =
+        "e03e6866f513597f37d6d64a4ac0d13577954d72550608cbff21fa43cac3ab3c"
+
     private var window: NSWindow!
     private var webView: WKWebView!
+    private var comicReader: MacComicSpreadController!
+    private var isComicReadingMode = false
+    private var pdfReader: MacPDFReaderController!
+    private var isPDFReadingMode = false
+    private var suppressPDFPositionSave = true
+    private var pdfPositionRestoreWorkItem: DispatchWorkItem?
+    private let pdfPositionSaveQueue = DispatchQueue(label: "local.sentence-reader.pdf-position-save")
+    private var pdfPositionSaveWorkItem: DispatchWorkItem?
+    private var lastQueuedPDFPositionSignature: String?
+    private var pdfAnnotationRefreshGeneration = 0
+    private var pdfAudioPollWorkItems: [String: DispatchWorkItem] = [:]
     private var notesRail: NSVisualEffectView!
     private var notesRailWidthConstraint: NSLayoutConstraint!
     private var notesRailToggleButton: NSButton!
@@ -1751,11 +17298,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var notesFilterControl: NSSegmentedControl!
     private var notesSummaryLabel: NSTextField!
     private var cognitiveDashboardWindowController: CognitiveDashboardWindowController?
+    private let clickTTSGate0ProbeController = ClickTTSGate0ProbeController()
     private var runtimeEnvironmentWindowController: RuntimeEnvironmentWindowController?
     private var libraryWindowController: NSWindowController?
     private var libraryWindowUsesWebUI = false
     private var mainRootView: NSView?
     private var libraryHomeWebView: WKWebView?
+    private var mainLibraryStartupRetryAttempt = 0
+    private var mainLibraryStartupRetryWorkItem: DispatchWorkItem?
+    private weak var libraryOpenSourceWebView: WKWebView?
+    private var libraryOpenSurfaceState: LibraryOpenSurfaceState = .library
     private var mainTitlebarDragView: NSView?
     private var libraryTableView: NSTableView?
     private var librarySummaryLabel: NSTextField?
@@ -1765,15 +17317,174 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var chapters: [URL] = []
     private var chapterTitles: [String] = []
     private var tocEntries: [TocEntry] = []
+    private var readingTextProvider: EPUBReadingTextProvider?
+    private let readingAudioSession = ReadingAudioSession()
+    private lazy var readingTTSProductController =
+        ReadingTTSProductController(
+            playerVolume:
+                isStageBVisibleAcceptanceRequested ? 0 : 1
+        ) { [weak self] event in
+            self?.handleReadingTTSProductEvent(event)
+        }
+    private lazy var readingChapterSnapshotLoader =
+        ReadingChapterSnapshotLoader(script: Self.readerScript)
+    private var readingTTSPlayerView: NSVisualEffectView?
+    private var readerWebViewBottomConstraint: NSLayoutConstraint?
+    private let readingTTSButton = NSButton(
+        title: "朗读",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSPreviousButton = NSButton(
+        title: "上一段",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSPlayPauseButton = NSButton(
+        title: "暂停",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSNextButton = NSButton(
+        title: "下一段",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSRatePopup = NSPopUpButton(
+        frame: .zero,
+        pullsDown: false
+    )
+    private let readingTTSVoicePopup = NSPopUpButton(
+        frame: .zero,
+        pullsDown: false
+    )
+    private let readingTTSVoicePreviewButton = NSButton(
+        title: "试听",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSTimerButton = NSButton(
+        title: "定时",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSListeningButton = NSButton(
+        title: "听音",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSReturnButton = NSButton(
+        title: "回到朗读位置",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSCloseButton = NSButton(
+        title: "×",
+        target: nil,
+        action: nil
+    )
+    private let readingTTSStatusLabel = NSTextField(
+        labelWithString: "正在准备"
+    )
+    private var readingTTSAutoFollow = true
+    private var readingTTSSleepMode: ReadingTTSSleepMode = .off
+    private var readingTTSSleepPendingAtBoundary = false
+    private var readingTTSSleepPauseRequested = false
+    private var readingTTSSleepTimer: Timer?
+    private var readingTTSLastBoundaryChapterIndex: Int?
+    private var readingTTSLastLocator: String?
+    private var readingTTSPendingVoiceSentence:
+        ReadingSentence?
+    private var readingTTSSelectionPlaybackGeneration = UUID()
+    private var pendingReadingMove: PendingReadingMove?
+    private var readerRendererSuspended = false
+    private var listeningRestoreLocator: String?
+    private var mainWindowOrderedOutForListening = false
+    private lazy var listeningModeWindowController =
+        ListeningModeWindowController(
+            onPrevious: { [weak self] in
+                self?.readingTTSPreviousParagraph(nil)
+            },
+            onTogglePlayback: { [weak self] in
+                self?.toggleReadingTTSPlayback(nil)
+            },
+            onNext: { [weak self] in
+                self?.readingTTSNextParagraph(nil)
+            },
+            onTimer: { [weak self] button in
+                self?.showReadingTTSTimerMenu(button)
+            },
+            onReturn: { [weak self] in
+                self?.exitListeningModeIfNeeded(
+                    restoreWindow: true
+                )
+            },
+            onClose: { [weak self] in
+                self?.closeReadingTTS(nil)
+            }
+        )
+    private lazy var systemMediaSessionController =
+        SystemMediaSessionController(
+            onPlay: { [weak self] in
+                self?.resumeReadingTTSFromSystem()
+            },
+            onPause: { [weak self] in
+                self?.pauseReadingTTSFromSystem()
+            },
+            onTogglePlayback: { [weak self] in
+                self?.toggleReadingTTSPlayback(nil)
+            },
+            onPrevious: { [weak self] in
+                self?.readingTTSPreviousParagraph(nil)
+            },
+            onNext: { [weak self] in
+                self?.readingTTSNextParagraph(nil)
+            }
+        )
+    private lazy var readingJumpCoordinator = ReadingJumpCoordinator { [weak self] candidate in
+        self?.commitReadingJumpCandidate(candidate)
+    }
+    private var gate1AcceptancePhase: Gate1AcceptancePhase = .waitingForFixture
+    private var gate1AcceptanceFixtureURL: URL?
+    private var gate1AcceptanceEvents: [[String: Any]] = []
+    private var gate1AcceptanceWatchdog: DispatchWorkItem?
+    private var gate2ANAcceptanceFixtureURL: URL?
+    private var gate2ANAcceptanceEvents: [[String: Any]] = []
+    private var gate2ANAcceptanceResults: [[String: Any]] = []
+    private var gate2ANCachedResults: [[String: Any]] = []
+    private var gate2ANAcceptanceWatchdog: DispatchWorkItem?
+    private var gate2ANStartWaitWorkItem: DispatchWorkItem?
+    private var gate2ANResourceAckWaitWorkItem: DispatchWorkItem?
+    private var gate2ANResolvedResultURL: URL?
+    private var stageBVisibleAcceptanceFixtureURL: URL?
+    private var stageBVisibleFixtureImportStarted = false
+    private var gate2ANSamples: [Gate2ANSample] = []
+    private var gate2ANCurrentSampleIndex = 0
+    private var gate2ANRunNamespace = ""
+    private var gate2ANResourceAckDeadlineUptime: TimeInterval?
+    private var gate2ANPreparingMSBySample: [String: Double] = [:]
+    private var gate2ANFirstSoundMSBySample: [String: Double] = [:]
+    private var gate2ANCachedPreparingMSBySample: [String: Double] = [:]
+    private var gate2ANCachedFirstSoundMSBySample: [String: Double] = [:]
+    private var gate2ANTimeoutExerciseResult: [String: Any]?
+    private var gate2ANTimeoutExerciseStarted = false
+    private var gate2ANBatchStarted = false
+    private var gate2ANFinished = false
+    private var lastFocusedReadingLocator: String?
+    private var installedReadingBridgeChapterIndex: Int?
     private var allNoteRows: [NoteRow] = []
     private var visibleNoteRows: [NoteRow] = []
     private var currentChapterIndex = 0
     private var pendingInitialPage: InitialPage = .start
     private var suppressReadingPositionSave = true
     private var noteSpeechController: NoteSpeechController?
+    private var backgroundNoteSpeechControllers: [String: NoteSpeechController] = [:]
     private var readerAPIProcess: Process?
+    private var readerLANService: NetService?
+    private var documentsAccessURL: URL?
     private var funASRServerProcess: Process?
     private var funASRWarmupStarted = false
+    private var funASRWarmGeneration = UUID()
     private var readerHeaderView: NSView?
     private var readerFooterView: NSView?
     private var readerChromeEventMonitor: Any?
@@ -1783,8 +17494,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var readerAPILANModeEnabled = false
     private var readerBookID: String?
     private var redAnnotationIDs: [String: String] = [:]
-    private var pendingNoteJumpIndex: String?
+    private var pdfHighlightIDs: [String: [String]] = [:]
+    private var pendingNoteJump: NoteRow?
     private var pendingExternalEPUBURLs: [URL] = []
+    private var pendingExternalBookIDs: [String] = []
     private var didFinishLaunching = false
     private var bookEntries: [BookEntry] = []
     private var currentBookEntry: BookEntry?
@@ -1793,14 +17506,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private let speechSynthesizer = AVSpeechSynthesizer()
     private var lookupAudioPlayer: AVPlayer?
     private var lookupAudioDataPlayer: AVAudioPlayer?
+    private var pdfAudioPlayer: AVAudioPlayer?
+    private var playingPDFAudioNoteID: String?
     private var lookupSoundPlayer: NSSound?
     private var lookupAudioProcess: Process?
     private var lookupActionTargets: [LookupActionTarget] = []
     private let readingPositionKeyPrefix = "SentenceReader.lastReadingPosition.v1"
     private let bookLibraryKey = "SentenceReader.bookLibrary.v1"
     private let readerSettingsKey = "SentenceReader.readerSettings.v1"
+    private let readingTTSVoiceDefaultsKey =
+        "Click.ReaderTTS.voice.v1"
+    private let readingTTSRateDefaultsKey =
+        "Click.ReaderTTS.playbackRate.v1"
+    private let comicPageModeKeyPrefix = "SentenceReader.comicPageMode.v1"
+    private let pdfPageModeKeyPrefix = "SentenceReader.pdfPageMode.v1"
     private let funASRPythonDefaultsKey = "SentenceReader.funASRPythonPath.v1"
     private let funASRWorkerDefaultsKey = "SentenceReader.funASRWorkerPath.v1"
+    private let documentsAccessBookmarkKey = "SentenceReader.documentsAccessBookmark.v1"
     private let funASRPythonDefaultPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/SentenceReader/FunASR/.venv/bin/python")
     private let funASRWorkerDefaultPath = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/SentenceReader/FunASR/funasr_worker.py")
     private let funASRServerPort = 18081
@@ -1816,6 +17538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private let settingsButton = NSButton(title: "设置", target: nil, action: nil)
     private let contentsButton = NSButton(title: "目录", target: nil, action: nil)
     private let notesButton = NSButton(title: "笔记", target: nil, action: nil)
+    private let pdfAreaButton = NSButton(title: "区域批注", target: nil, action: nil)
     private let readerMoreButton = NSButton(title: "更多", target: nil, action: nil)
     private let statusLabel = NSTextField(labelWithString: "英文单击查词 · 双击备注 · 右键/双指点按整句标红")
     private let redLabel = NSTextField(labelWithString: "红标 0")
@@ -1849,6 +17572,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let epubPath: String
         let bookRootPath: String
         let isBundled: Bool
+        var sourceKind: String? = nil
+        var canonicalFilePath: String? = nil
+        var apiBookID: String? = nil
+
+        var effectiveSourceKind: String {
+            sourceKind?.lowercased() == "pdf" || epubPath.lowercased().hasSuffix(".pdf") ? "pdf" : "epub"
+        }
+
+        var sourceFilePath: String {
+            canonicalFilePath?.isEmpty == false ? canonicalFilePath! : epubPath
+        }
     }
 
     private struct ReaderSettings: Codable {
@@ -1868,6 +17602,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let chapterTitle: String
         let chapterLocator: String
         let sentenceIndex: String
+        let sentenceLocator: String
+        let sentenceSourceText: String
+        let sentenceTargets: [[String: Any]]
+        let selectionFragments: [[String: Any]]
+        let audioNotes: [[String: Any]]
 
         var isRedHighlight: Bool {
             kind == "red_highlight"
@@ -1882,8 +17621,206 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
 
         var secondaryText: String {
-            sourceText
+            guard !audioNotes.isEmpty else { return sourceText }
+            let statuses = Set(audioNotes.compactMap { $0["status"] as? String })
+            let audioStatus = statuses.contains("failed") ? "语音失败" : statuses.contains("pending") ? "语音转写中" : "语音已完成"
+            return sourceText.isEmpty ? audioStatus : "\(sourceText) · \(audioStatus)"
         }
+    }
+
+    private var isGate1AcceptanceMode: Bool {
+        ProcessInfo.processInfo.environment["CLICK_GATE1_ACCEPTANCE_MODE"]
+            == Self.gate1AcceptanceModeValue
+    }
+
+    private var isGate2ANAcceptanceMode: Bool {
+        ProcessInfo.processInfo.environment[
+            "CLICK_GATE2AN_ACCEPTANCE_MODE"
+        ] == Self.gate2ANAcceptanceModeValue
+    }
+
+    private var isStageBVisibleAcceptanceRequested: Bool {
+        ProcessInfo.processInfo.environment[
+            "CLICK_STAGEB_VISIBLE_ACCEPTANCE_MODE"
+        ] != nil
+    }
+
+    private var gate2ANAcceptancePhase: Gate2ANAcceptancePhase? {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "CLICK_GATE2AN_ACCEPTANCE_PHASE"
+        ] else {
+            return nil
+        }
+        return Gate2ANAcceptancePhase(rawValue: raw)
+    }
+
+    private var isAutomatedAcceptanceMode: Bool {
+        isGate1AcceptanceMode
+            || isGate2ANAcceptanceMode
+            || isStageBVisibleAcceptanceRequested
+    }
+
+    static func validatedStageBVisibleAcceptanceFixtureURL(
+        environment: [String: String]
+    ) -> URL? {
+        guard environment[
+            "CLICK_STAGEB_VISIBLE_ACCEPTANCE_MODE"
+        ] == stageBVisibleAcceptanceModeValue,
+        environment[
+            "CLICK_STAGEB_PUBLIC_FIXTURE_AUTHORIZATION"
+        ] == stageBVisibleAuthorizationValue,
+        let rawPath = environment[
+            "CLICK_STAGEB_PUBLIC_FIXTURE"
+        ],
+        !rawPath.isEmpty
+        else {
+            return nil
+        }
+
+        let fixtureURL = URL(fileURLWithPath: rawPath)
+            .standardizedFileURL
+        let resolvedURL = fixtureURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        guard fixtureURL.path == rawPath,
+              fixtureURL.pathExtension == "epub",
+              resolvedURL.path == fixtureURL.path,
+              let values = try? fixtureURL.resourceValues(
+                  forKeys: [
+                      .isRegularFileKey,
+                      .isSymbolicLinkKey,
+                  ]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let sha256 = try? ClickTTSGate0Contract
+                  .sha256File(fixtureURL),
+              sha256 == stageBVisibleFixtureSHA256
+        else {
+            return nil
+        }
+        return fixtureURL
+    }
+
+    static func validatedGate1AcceptanceResultURL(
+        rawPath: String
+    ) -> URL? {
+        let resultURL = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let parent = resultURL.deletingLastPathComponent()
+        let lexicalPrivateTmpPath = "/private/tmp"
+        let privateTmp = URL(
+            fileURLWithPath: lexicalPrivateTmpPath,
+            isDirectory: true
+        ).standardizedFileURL
+        let resolvedPrivateTmp = privateTmp
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedParent = parent
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let parentName = parent.lastPathComponent
+        let prefix = "click-gate1-acceptance-"
+        let suffix = parentName.dropFirst(prefix.count)
+        let parentValues = try? parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let expectedResolvedParent = resolvedPrivateTmp
+            .appendingPathComponent(parentName, isDirectory: true)
+            .standardizedFileURL
+        guard resultURL.path == rawPath,
+              resultURL.lastPathComponent
+                == "click-gate1-installed-acceptance.json",
+              parent.deletingLastPathComponent().path
+                == lexicalPrivateTmpPath,
+              parentName.hasPrefix(prefix),
+              !suffix.isEmpty,
+              suffix.allSatisfy({
+                $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"
+              }),
+              parentValues?.isDirectory == true,
+              parentValues?.isSymbolicLink != true,
+              resolvedParent.path == expectedResolvedParent.path
+        else {
+            return nil
+        }
+        return resultURL
+    }
+
+    private var gate1AcceptanceResultURL: URL? {
+        guard isGate1AcceptanceMode,
+              let rawPath = ProcessInfo.processInfo.environment[
+                "CLICK_GATE1_ACCEPTANCE_RESULT"
+              ]
+        else {
+            return nil
+        }
+        return Self.validatedGate1AcceptanceResultURL(rawPath: rawPath)
+    }
+
+    static func validatedGate2ANAcceptanceResultURL(
+        rawPath: String
+    ) -> URL? {
+        let resultURL = URL(fileURLWithPath: rawPath).standardizedFileURL
+        let parent = resultURL.deletingLastPathComponent()
+        let lexicalPrivateTmpPath = "/private/tmp"
+        let privateTmp = URL(
+            fileURLWithPath: lexicalPrivateTmpPath,
+            isDirectory: true
+        ).standardizedFileURL
+        let resolvedPrivateTmp = privateTmp
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedParent = parent
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let parentName = parent.lastPathComponent
+        let prefix = "click-gate2an-acceptance-"
+        let suffix = parentName.dropFirst(prefix.count)
+        let parentValues = try? parent.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        let expectedResolvedParent = resolvedPrivateTmp
+            .appendingPathComponent(parentName, isDirectory: true)
+            .standardizedFileURL
+        guard resultURL.path == rawPath,
+              resultURL.lastPathComponent
+                == "click-gate2an-installed-acceptance.json",
+              parent.deletingLastPathComponent().path
+                == lexicalPrivateTmpPath,
+              parentName.hasPrefix(prefix),
+              !suffix.isEmpty,
+              suffix.allSatisfy({
+                  $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_"
+              }),
+              parentValues?.isDirectory == true,
+              parentValues?.isSymbolicLink != true,
+              resolvedParent.path == expectedResolvedParent.path
+        else {
+            return nil
+        }
+        return resultURL
+    }
+
+    private var gate2ANAcceptanceResultURL: URL? {
+        guard isGate2ANAcceptanceMode,
+              let rawPath = ProcessInfo.processInfo.environment[
+                  "CLICK_GATE2AN_ACCEPTANCE_RESULT"
+              ]
+        else {
+            return nil
+        }
+        return Self.validatedGate2ANAcceptanceResultURL(rawPath: rawPath)
+    }
+
+    private func resolvedGate2ANResultURL() -> URL? {
+        if let gate2ANResolvedResultURL {
+            return gate2ANResolvedResultURL
+        }
+        guard let resultURL = gate2ANAcceptanceResultURL else {
+            return nil
+        }
+        gate2ANResolvedResultURL = resultURL
+        return resultURL
     }
 
     private func installApplicationMenu() {
@@ -1912,51 +17849,384 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         buildWindow()
         installCommandUndoMonitor()
         installReaderChromeMonitor()
+        if isStageBVisibleAcceptanceRequested {
+            beginStageBVisibleAcceptance()
+            return
+        }
+        if isGate1AcceptanceMode {
+            armGate1AcceptanceWatchdog()
+            finishApplicationLaunch()
+            return
+        }
+        if isGate2ANAcceptanceMode {
+            armGate2ANAcceptanceWatchdog()
+            guard gate2ANAcceptancePhase != nil,
+                  resolvedGate2ANResultURL() != nil,
+                  ProcessInfo.processInfo.environment[
+                      "CLICK_GATE2AN_PUBLIC_FIXTURE_AUTHORIZATION"
+                  ] == Self.gate2ANAuthorizationValue
+            else {
+                failGate2ANAcceptance(
+                    "Gate 2A-N acceptance environment is incomplete or unsafe"
+                )
+                return
+            }
+            finishApplicationLaunch()
+            return
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        if restoreDocumentsAccess() || canReadDocumentsDirectory() {
+            finishApplicationLaunch()
+        } else {
+            requestDocumentsAccess { _ in
+                self.finishApplicationLaunch()
+            }
+        }
+    }
+
+    private func beginStageBVisibleAcceptance() {
+        let environment = ProcessInfo.processInfo.environment
+        guard !isGate1AcceptanceMode,
+              !isGate2ANAcceptanceMode,
+              let fixtureURL = Self
+                  .validatedStageBVisibleAcceptanceFixtureURL(
+                      environment: environment
+                  )
+        else {
+            failStageBVisibleAcceptance(
+                "可见验收已拒绝：模式、授权或公开 EPUB 不安全"
+            )
+            return
+        }
+
+        stageBVisibleAcceptanceFixtureURL = fixtureURL
+        pendingExternalEPUBURLs = [fixtureURL]
+        statusLabel.stringValue = "正在打开公开可见验收 EPUB…"
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        finishApplicationLaunch()
+    }
+
+    private func failStageBVisibleAcceptance(_ message: String) {
+        pendingExternalEPUBURLs.removeAll()
+        pendingExternalBookIDs.removeAll()
+        didFinishLaunching = true
+        statusLabel.stringValue = message
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func rejectStageBVisibleExternalOpen() {
+        statusLabel.stringValue =
+            "可见验收已锁定公开 EPUB；额外打开请求已拒绝"
+    }
+
+    private func finishApplicationLaunch() {
+        if isAutomatedAcceptanceMode {
+            didFinishLaunching = true
+            openPendingExternalEPUBs()
+            return
+        }
         ensureReaderAPIAvailable()
         loadBundledBook()
         showMainLibrary()
         didFinishLaunching = true
         openPendingExternalEPUBs()
-        NSApp.activate(ignoringOtherApps: true)
+        openPendingExternalReaderBooks()
         showFirstRunGuideIfNeeded()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.refreshSpeechWarmServiceForCurrentProvider()
+    }
+
+    private func documentsDirectoryURL() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents", isDirectory: true)
+    }
+
+    private func canReadDocumentsDirectory() -> Bool {
+        (try? FileManager.default.contentsOfDirectory(
+            at: documentsDirectoryURL(),
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) != nil
+    }
+
+    private func persistDocumentsBookmark(for url: URL) -> Bool {
+        do {
+            let data = try url.bookmarkData(
+                options: [.withSecurityScope],
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            UserDefaults.standard.set(data, forKey: documentsAccessBookmarkKey)
+            return true
+        } catch {
+            statusLabel.stringValue = "文稿目录授权未能保存：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    private func restoreDocumentsAccess() -> Bool {
+        guard let data = UserDefaults.standard.data(forKey: documentsAccessBookmarkKey) else {
+            return false
+        }
+        var stale = false
+        do {
+            let url = try URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            )
+            let started = url.startAccessingSecurityScopedResource()
+            guard started || canReadDocumentsDirectory() else {
+                return false
+            }
+            documentsAccessURL = url
+            if stale {
+                _ = persistDocumentsBookmark(for: url)
+            }
+            return canReadDocumentsDirectory()
+        } catch {
+            return false
+        }
+    }
+
+    private func requestDocumentsAccess(completion: @escaping (Bool) -> Void) {
+        let panel = NSOpenPanel()
+        panel.title = "允许 Click 访问文稿"
+        panel.message = "请选择“文稿”文件夹。Click 只用它读取 KnowledgeBase，并保存 Recordings。"
+        panel.prompt = "允许访问"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK, let selected = panel.url else {
+                self.statusLabel.stringValue = "未授权文稿目录：同步与录音暂不可用"
+                completion(false)
+                return
+            }
+            let expected = self.documentsDirectoryURL().standardizedFileURL.path
+            guard selected.standardizedFileURL.path == expected else {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "请选择“文稿”文件夹"
+                alert.informativeText = "KnowledgeBase 和 Recordings 同在文稿目录下，选择子文件夹不能完整授权。"
+                alert.addButton(withTitle: "知道了")
+                alert.beginSheetModal(for: self.window) { _ in
+                    completion(false)
+                }
+                return
+            }
+            let started = selected.startAccessingSecurityScopedResource()
+            self.documentsAccessURL = selected
+            let saved = self.persistDocumentsBookmark(for: selected)
+            let available = started || self.canReadDocumentsDirectory()
+            self.statusLabel.stringValue = available && saved ? "文稿目录已授权" : "文稿目录授权未生效"
+            completion(available)
         }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        enqueueExternalEPUBs(urls)
+        if isStageBVisibleAcceptanceRequested {
+            rejectStageBVisibleExternalOpen()
+            return
+        }
+        let bookIDs = urls.compactMap(nativeLibraryBookID(from:))
+        if !bookIDs.isEmpty {
+            pendingExternalBookIDs.append(contentsOf: bookIDs)
+            openPendingExternalReaderBooks()
+        }
+        enqueueExternalEPUBs(urls.filter { nativeLibraryBookID(from: $0) == nil })
     }
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        if isStageBVisibleAcceptanceRequested {
+            rejectStageBVisibleExternalOpen()
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
         let urls = filenames.map { URL(fileURLWithPath: $0) }
         enqueueExternalEPUBs(urls)
         sender.reply(toOpenOrPrint: .success)
     }
 
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        if isStageBVisibleAcceptanceRequested {
+            rejectStageBVisibleExternalOpen()
+            return false
+        }
         enqueueExternalEPUBs([URL(fileURLWithPath: filename)])
         return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        if !flag {
+            if mainWindowOrderedOutForListening
+                || readingAudioSession.surfaceMode == .listening
+                || readerRendererSuspended {
+                exitListeningModeIfNeeded(restoreWindow: true)
+            } else {
+                restoreMainReadingWindow()
+            }
+        }
+        return true
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let minimizedWindow = notification.object as? NSWindow,
+              minimizedWindow === window,
+              readingTTSIsActive
+        else {
+            return
+        }
+        enterListeningModeIfNeeded()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let restoredWindow = notification.object as? NSWindow,
+              restoredWindow === window
+        else {
+            return
+        }
+        exitListeningModeIfNeeded(restoreWindow: false)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window else {
+            return true
+        }
+        mainWindowOrderedOutForListening = false
+        if readingTTSIsActive
+            || readingAudioSession.surfaceMode == .listening {
+            closeReadingTTS(nil)
+        }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        mainWindowOrderedOutForListening = false
+        gate1AcceptanceWatchdog?.cancel()
+        gate1AcceptanceWatchdog = nil
+        gate2ANAcceptanceWatchdog?.cancel()
+        gate2ANAcceptanceWatchdog = nil
+        gate2ANStartWaitWorkItem?.cancel()
+        gate2ANStartWaitWorkItem = nil
+        gate2ANResourceAckWaitWorkItem?.cancel()
+        gate2ANResourceAckWaitWorkItem = nil
+        readingJumpCoordinator.cancel()
+        _ = readingTTSProductController.shutdown(timeout: 3)
+        readingChapterSnapshotLoader.stop()
+        clearReadingTTSSleepTimer()
+        readingAudioSession.stop()
+        listeningModeWindowController.hide()
+        systemMediaSessionController.clear()
+        clickTTSGate0ProbeController.cancelAndWait(timeout: 2)
         if let readerChromeEventMonitor {
             NSEvent.removeMonitor(readerChromeEventMonitor)
             self.readerChromeEventMonitor = nil
         }
         stopFunASRWarmService()
+        if let process = readerAPIProcess, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        readerAPIProcess = nil
+        readerLANService?.stop()
+        readerLANService = nil
+        documentsAccessURL?.stopAccessingSecurityScopedResource()
+        documentsAccessURL = nil
     }
 
     private func enqueueExternalEPUBs(_ urls: [URL]) {
-        let epubURLs = urls.filter { $0.pathExtension.lowercased() == "epub" }
-        guard !epubURLs.isEmpty else {
+        let bookURLs = urls.filter { ["epub", "pdf"].contains($0.pathExtension.lowercased()) }
+        guard !bookURLs.isEmpty else {
             return
         }
-        pendingExternalEPUBURLs.append(contentsOf: epubURLs)
+        if isGate1AcceptanceMode {
+            guard gate1AcceptanceResultURL != nil else {
+                failGate1Acceptance("missing or unsafe acceptance result path")
+                return
+            }
+            guard bookURLs.count == 1,
+                  bookURLs[0].pathExtension.lowercased() == "epub"
+            else {
+                failGate1Acceptance(
+                    "acceptance mode requires exactly one EPUB document"
+                )
+                return
+            }
+            let fixtureURL = bookURLs[0].standardizedFileURL
+            if let verifiedURL = gate1AcceptanceFixtureURL {
+                if verifiedURL == fixtureURL {
+                    return
+                }
+                failGate1Acceptance(
+                    "acceptance mode received more than one document"
+                )
+                return
+            }
+            guard let sha256 = try? ClickTTSGate0Contract.sha256File(
+                fixtureURL
+            ),
+            sha256 == Self.gate1AcceptanceFixtureSHA256 else {
+                failGate1Acceptance("official Gate 1 fixture SHA-256 mismatch")
+                return
+            }
+            gate1AcceptanceFixtureURL = fixtureURL
+            gate1AcceptancePhase = .waitingForFirstBridge
+            gate1AcceptanceEvents.append([
+                "event": "fixture_verified",
+                "sha256": sha256,
+            ])
+        } else if isGate2ANAcceptanceMode {
+            guard resolvedGate2ANResultURL() != nil else {
+                failGate2ANAcceptance(
+                    "missing or unsafe Gate 2A-N acceptance result path"
+                )
+                return
+            }
+            guard bookURLs.count == 1,
+                  bookURLs[0].pathExtension.lowercased() == "epub"
+            else {
+                failGate2ANAcceptance(
+                    "Gate 2A-N requires exactly one EPUB document"
+                )
+                return
+            }
+            let fixtureURL = bookURLs[0].standardizedFileURL
+            if let verifiedURL = gate2ANAcceptanceFixtureURL {
+                if verifiedURL == fixtureURL {
+                    return
+                }
+                failGate2ANAcceptance(
+                    "Gate 2A-N received more than one document"
+                )
+                return
+            }
+            guard let sha256 = try? ClickTTSGate0Contract.sha256File(
+                fixtureURL
+            ),
+            sha256 == Self.gate1AcceptanceFixtureSHA256 else {
+                failGate2ANAcceptance(
+                    "official public Gate 1 fixture SHA-256 mismatch"
+                )
+                return
+            }
+            gate2ANAcceptanceFixtureURL = fixtureURL
+            gate2ANAcceptanceEvents.append([
+                "event": "fixture_verified",
+                "sha256": sha256,
+            ])
+        }
+        pendingExternalEPUBURLs.append(contentsOf: bookURLs)
         openPendingExternalEPUBs()
     }
 
@@ -1967,12 +18237,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let urls = pendingExternalEPUBURLs
         pendingExternalEPUBURLs.removeAll()
         for url in urls {
-            importEPUB(url)
+            importBook(url)
         }
     }
 
     private func installReaderChromeMonitor() {
-        readerChromeEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .keyDown]) { [weak self] event in
+        readerChromeEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .keyDown, .leftMouseDown, .leftMouseDragged, .scrollWheel]
+        ) { [weak self] event in
             guard let self,
                   let contentView = self.window.contentView
             else {
@@ -1987,6 +18259,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
             guard event.window === self.window else {
                 return event
+            }
+
+            if event.type == .leftMouseDown
+                || event.type == .leftMouseDragged
+                || event.type == .scrollWheel
+                || event.type == .keyDown {
+                self.readingJumpCoordinator.cancel()
             }
 
             if self.libraryHomeWebView?.isHidden == false {
@@ -2147,17 +18426,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func configureReaderChromeButton(_ button: NSButton) {
-        button.bezelStyle = .rounded
+        button.bezelStyle = .texturedRounded
         button.controlSize = .regular
-        button.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14, weight: .medium)
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
         button.contentTintColor = .white
         button.setContentHuggingPriority(.required, for: .horizontal)
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 62).isActive = true
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: 30).isActive = true
+        button.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 36).isActive = true
+    }
+
+    private func configureReaderChromeButton(
+        _ button: NSButton,
+        symbolName: String,
+        accessibilityLabel: String
+    ) {
+        configureReaderChromeButton(button)
+        ReadingTTSControlStyle.setSymbol(
+            button,
+            name: symbolName,
+            accessibilityDescription: accessibilityLabel
+        )
+        button.setAccessibilityLabel(accessibilityLabel)
+        button.toolTip = accessibilityLabel
     }
 
     private func makeMainLibraryWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
+        if isAutomatedAcceptanceMode {
+            config.websiteDataStore = .nonPersistent()
+        }
+        config.userContentController.add(self, name: "sentenceReader")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -2166,23 +18465,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func mainLibraryURL() -> URL? {
-        URL(string: "http://127.0.0.1:18180/library?surface=mac-app")
+        var components = URLComponents(url: ReaderAPIClient.configuredBaseURL().appendingPathComponent("library"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "surface", value: "mac-app")]
+        return components?.url
     }
 
     private func showMainLibrary() {
-        guard ensureReaderAPIForLibraryUI(),
-              let libraryHomeWebView,
-              let url = mainLibraryURL()
-        else {
+        guard let libraryHomeWebView,
+              let url = mainLibraryURL() else {
             statusLabel.stringValue = "主界面需要 Reader API，当前无法打开书库"
             return
         }
-        libraryHomeWebView.isHidden = false
+        guard ensureReaderAPIForLibraryUI() else {
+            statusLabel.stringValue = "正在启动书架，请稍候..."
+            scheduleMainLibraryStartupRetry(webView: libraryHomeWebView, url: url)
+            return
+        }
+        presentMainLibrary(webView: libraryHomeWebView, url: url)
+    }
+
+    private func presentMainLibrary(webView: WKWebView, url: URL) {
+        mainLibraryStartupRetryWorkItem?.cancel()
+        mainLibraryStartupRetryWorkItem = nil
+        mainLibraryStartupRetryAttempt = 0
+        webView.isHidden = false
         mainTitlebarDragView?.isHidden = false
-        libraryHomeWebView.load(URLRequest(url: url))
+        webView.load(URLRequest(url: url))
+        libraryOpenSourceWebView = nil
+        libraryOpenSurfaceState = .library
         setReaderChromeVisible(false)
         window.title = "Click 书库"
         statusLabel.stringValue = "已进入主界面；选择书籍后会在本窗口打开正文"
+    }
+
+    private func scheduleMainLibraryStartupRetry(webView: WKWebView, url: URL) {
+        mainLibraryStartupRetryWorkItem?.cancel()
+        guard mainLibraryStartupRetryAttempt < 16 else {
+            statusLabel.stringValue = "书架启动超时；点书库可重新连接"
+            return
+        }
+        mainLibraryStartupRetryAttempt += 1
+        let attempt = mainLibraryStartupRetryAttempt
+        let item = DispatchWorkItem { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            let ready = self.readerAPI.health(requiredCapabilities: ["reader.library.v1"])
+            DispatchQueue.main.async { [weak self, weak webView] in
+                guard let self, let webView,
+                      self.mainLibraryStartupRetryAttempt == attempt else { return }
+                if ready {
+                    self.presentMainLibrary(webView: webView, url: url)
+                } else {
+                    self.statusLabel.stringValue = "正在启动书架，请稍候..."
+                    self.scheduleMainLibraryStartupRetry(webView: webView, url: url)
+                }
+            }
+        }
+        mainLibraryStartupRetryWorkItem = item
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + 0.75,
+            execute: item
+        )
     }
 
     private func hideMainLibraryForReading() {
@@ -2192,23 +18534,335 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         revealReaderChromeTemporarily()
     }
 
+    private func revealMainLibraryAfterFailedOpen(from sourceWebView: WKWebView?) {
+        guard sourceWebView === libraryHomeWebView else { return }
+        libraryHomeWebView?.isHidden = false
+        mainTitlebarDragView?.isHidden = false
+        setReaderChromeVisible(false)
+        window.title = "Click 书库"
+    }
+
+    private func configureReadingTTSControls() {
+        readingTTSButton.target = self
+        readingTTSButton.action = #selector(startOrFocusReadingTTS(_:))
+        readingTTSButton.bezelStyle = .rounded
+        readingTTSButton.controlSize = .small
+        readingTTSButton.font =
+            NSFont(name: "Microsoft YaHei", size: 12)
+            ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        readingTTSButton.contentTintColor = .white
+        readingTTSButton.toolTip =
+            "从当前句开始使用 Microsoft Edge 在线语音朗读"
+        readingTTSButton.setAccessibilityLabel("朗读")
+        readingTTSButton.isHidden = true
+
+        readingTTSPreviousButton.target = self
+        readingTTSPreviousButton.action =
+            #selector(readingTTSPreviousParagraph(_:))
+        readingTTSPlayPauseButton.target = self
+        readingTTSPlayPauseButton.action =
+            #selector(toggleReadingTTSPlayback(_:))
+        readingTTSNextButton.target = self
+        readingTTSNextButton.action =
+            #selector(readingTTSNextParagraph(_:))
+        readingTTSVoicePreviewButton.target = self
+        readingTTSVoicePreviewButton.action =
+            #selector(previewSelectedReadingTTSVoice(_:))
+        readingTTSTimerButton.target = self
+        readingTTSTimerButton.action =
+            #selector(showReadingTTSTimerMenu(_:))
+        readingTTSListeningButton.target = self
+        readingTTSListeningButton.action =
+            #selector(enterListeningModeFromButton(_:))
+        readingTTSReturnButton.target = self
+        readingTTSReturnButton.action =
+            #selector(returnToReadingTTSPosition(_:))
+        readingTTSCloseButton.target = self
+        readingTTSCloseButton.action =
+            #selector(closeReadingTTS(_:))
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSPreviousButton,
+            symbolName: "backward.end.fill",
+            accessibilityLabel: "上一段",
+            toolTip: "上一段",
+            size: 44
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSPlayPauseButton,
+            symbolName: "pause.fill",
+            accessibilityLabel: "播放或暂停朗读",
+            toolTip: "暂停",
+            size: 48
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSNextButton,
+            symbolName: "forward.end.fill",
+            accessibilityLabel: "下一段",
+            toolTip: "下一段",
+            size: 44
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSVoicePreviewButton,
+            symbolName: "speaker.wave.2.fill",
+            accessibilityLabel: "试听声音",
+            toolTip: "试听声音",
+            size: 40
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSTimerButton,
+            symbolName: "timer",
+            accessibilityLabel: "朗读定时",
+            toolTip: "朗读定时",
+            size: 40
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSListeningButton,
+            symbolName: "headphones",
+            accessibilityLabel: "听音模式",
+            toolTip: "进入听音模式",
+            size: 40
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSReturnButton,
+            symbolName: "scope",
+            accessibilityLabel: "回到朗读位置",
+            toolTip: "回到朗读位置",
+            size: 40
+        )
+        ReadingTTSControlStyle.configureIconButton(
+            readingTTSCloseButton,
+            symbolName: "xmark",
+            accessibilityLabel: "结束朗读",
+            toolTip: "结束本次朗读",
+            size: 40
+        )
+        ReadingTTSControlStyle.updatePlaybackButton(
+            readingTTSPlayPauseButton,
+            title: "暂停"
+        )
+        readingTTSReturnButton.isHidden = true
+
+        readingTTSRatePopup.removeAllItems()
+        readingTTSRatePopup.addItems(
+            withTitles: NativeAudioPlaybackRate.allCases.map {
+                "\($0.rawValue)×"
+            }
+        )
+        let savedRate =
+            UserDefaults.standard.string(
+                forKey: readingTTSRateDefaultsKey
+            )
+            .flatMap(NativeAudioPlaybackRate.init(rawValue:))
+            ?? .x10
+        readingTTSRatePopup.selectItem(
+            withTitle: "\(savedRate.rawValue)×"
+        )
+        readingTTSRatePopup.target = self
+        readingTTSRatePopup.action =
+            #selector(changeReadingTTSRate(_:))
+        readingTTSRatePopup.controlSize = .small
+        readingTTSRatePopup.setAccessibilityLabel("朗读速度")
+
+        readingTTSVoicePopup.removeAllItems()
+        readingTTSVoicePopup.addItems(
+            withTitles: [
+                "晓晓·女声",
+                "云健·男声",
+            ]
+        )
+        let storedVoice = UserDefaults.standard.string(
+            forKey: readingTTSVoiceDefaultsKey
+        )
+        let savedVoice = [
+            "zh-CN-XiaoxiaoNeural",
+            "zh-CN-YunjianNeural",
+        ].contains(storedVoice)
+            ? storedVoice!
+            : "zh-CN-XiaoxiaoNeural"
+        readingTTSVoicePopup.selectItem(
+            at: savedVoice == "zh-CN-XiaoxiaoNeural" ? 0 : 1
+        )
+        readingTTSVoicePopup.target = self
+        readingTTSVoicePopup.action =
+            #selector(changeReadingTTSVoice(_:))
+        readingTTSVoicePopup.controlSize = .small
+        readingTTSVoicePopup.toolTip =
+            "Microsoft Edge 在线声音"
+        readingTTSVoicePopup.setAccessibilityLabel("朗读声音")
+
+        readingTTSStatusLabel.font =
+            NSFont(name: "Microsoft YaHei", size: 11)
+            ?? NSFont.systemFont(ofSize: 11)
+        readingTTSStatusLabel.textColor =
+            NSColor.white.withAlphaComponent(0.82)
+        readingTTSStatusLabel.lineBreakMode = .byTruncatingTail
+    }
+
+    private func setReadingTTSPlayPauseTitle(_ title: String) {
+        ReadingTTSControlStyle.updatePlaybackButton(
+            readingTTSPlayPauseButton,
+            title: title
+        )
+    }
+
+    private func setReadingTTSTimerTitle(_ title: String) {
+        readingTTSTimerButton.title = title
+        ReadingTTSControlStyle.setSymbol(
+            readingTTSTimerButton,
+            name: "timer",
+            accessibilityDescription: title
+        )
+        readingTTSTimerButton.imagePosition = .imageOnly
+        readingTTSTimerButton.toolTip = title
+    }
+
+    private func makeReadingTTSPlayerView() -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .hudWindow
+        view.blendingMode = .withinWindow
+        view.state = .active
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 12
+        view.layer?.masksToBounds = true
+        view.layer?.borderWidth = 1
+        view.layer?.borderColor =
+            NSColor.white.withAlphaComponent(0.12).cgColor
+
+        let stack = NSStackView(
+            views: [
+                readingTTSPreviousButton,
+                readingTTSPlayPauseButton,
+                readingTTSNextButton,
+                readingTTSRatePopup,
+                readingTTSVoicePopup,
+                readingTTSVoicePreviewButton,
+                readingTTSTimerButton,
+                readingTTSListeningButton,
+                readingTTSReturnButton,
+                readingTTSStatusLabel,
+                readingTTSCloseButton,
+            ]
+        )
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(
+                equalTo: view.leadingAnchor,
+                constant: 10
+            ),
+            stack.trailingAnchor.constraint(
+                equalTo: view.trailingAnchor,
+                constant: -10
+            ),
+            stack.centerYAnchor.constraint(
+                equalTo: view.centerYAnchor
+            ),
+            readingTTSStatusLabel.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: 135
+            ),
+            readingTTSStatusLabel.widthAnchor.constraint(
+                lessThanOrEqualToConstant: 220
+            ),
+            readingTTSVoicePopup.widthAnchor.constraint(
+                equalToConstant: 92
+            ),
+            readingTTSRatePopup.widthAnchor.constraint(
+                equalToConstant: 62
+            ),
+        ])
+        view.isHidden = true
+        return view
+    }
+
     private func buildWindow() {
         let config = WKWebViewConfiguration()
+        if isAutomatedAcceptanceMode {
+            config.websiteDataStore = .nonPersistent()
+        }
         let userContent = WKUserContentController()
         userContent.addUserScript(WKUserScript(source: Self.readerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         userContent.add(self, name: "sentenceReader")
         config.userContentController = userContent
 
         webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
+
+        comicReader = MacComicSpreadController()
+        comicReader.webView.isHidden = true
+        comicReader.onPageChanged = { [weak self] pageIndex, total, isDouble in
+            guard let self else { return }
+            self.currentChapterIndex = pageIndex
+            let visibleCount = isDouble && pageIndex + 1 < total ? 2 : 1
+            let endPage = min(total, pageIndex + visibleCount)
+            self.statusLabel.stringValue = visibleCount == 2
+                ? "漫画双页 · 第 \(pageIndex + 1)–\(endPage) / \(total) 页"
+                : "漫画单页 · 第 \(pageIndex + 1) / \(total) 页"
+            self.redLabel.stringValue = visibleCount == 2 ? "双页" : "单页"
+            self.saveReadingPosition(pageIndex: 0, totalPages: 1)
+        }
+        comicReader.onPageReady = { [weak self] _ in
+            self?.completePendingLibraryBookOpenIfReady()
+        }
+        comicReader.onChromeToggle = { [weak self] in
+            self?.revealReaderChromeTemporarily()
+        }
+
+        pdfReader = MacPDFReaderController()
+        pdfReader.view.isHidden = true
+        pdfReader.onPositionChanged = { [weak self] locator in
+            self?.savePDFReadingPosition(locator)
+        }
+        pdfReader.onToggleHighlight = { [weak self] target in
+            self?.togglePDFHighlight(target)
+        }
+        pdfReader.onNote = { [weak self] target in
+            self?.showPDFNotePanel(target)
+        }
+        pdfReader.onRead = { [weak self] text in
+            self?.speakPDFTextLocally(text)
+        }
+        pdfReader.onLookup = { [weak self] word, context in
+            self?.showLookupPanel(word: word, sentence: context, sentenceIndex: "")
+        }
+        pdfReader.onManageAnnotations = { [weak self] context in
+            self?.showPDFAnnotationInspector(context)
+        }
+        pdfReader.onAreaSelectionModeChanged = { [weak self] enabled in
+            guard let self else { return }
+            let label = enabled ? "退出区域批注" : "区域批注"
+            ReadingTTSControlStyle.setSymbol(
+                self.pdfAreaButton,
+                name: enabled ? "xmark.circle.fill" : "square.dashed.inset.filled",
+                accessibilityDescription: label
+            )
+            self.pdfAreaButton.setAccessibilityLabel(label)
+            self.pdfAreaButton.toolTip = label
+        }
+        pdfReader.onChromeToggle = { [weak self] in
+            self?.revealReaderChromeTemporarily()
+        }
+        pdfReader.onStatus = { [weak self] text in
+            self?.statusLabel.stringValue = text
+            if let reader = self?.pdfReader {
+                self?.redLabel.stringValue = "\(reader.currentPageIndex + 1)/\(max(1, reader.pageCount))"
+            }
+        }
 
         let root = NSView()
         root.wantsLayer = true
         root.layer?.backgroundColor = NSColor.black.cgColor
+        configureReadingTTSControls()
 
-        let header = NSView()
+        let header = WindowDragView()
         header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor.black.cgColor
+        header.layer?.backgroundColor = NSColor(
+            calibratedWhite: 0.035,
+            alpha: 0.88
+        ).cgColor
 
         bookTitleLabel.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
         bookTitleLabel.textColor = .white
@@ -2295,6 +18949,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         notesButton.font = NSFont(name: "Microsoft YaHei", size: 12) ?? NSFont.systemFont(ofSize: 12, weight: .medium)
         notesButton.contentTintColor = .white
 
+        pdfAreaButton.target = self
+        pdfAreaButton.action = #selector(togglePDFAreaSelection(_:))
+        pdfAreaButton.bezelStyle = .rounded
+        pdfAreaButton.controlSize = .small
+        pdfAreaButton.font = NSFont(name: "Microsoft YaHei", size: 12) ?? NSFont.systemFont(ofSize: 12, weight: .medium)
+        pdfAreaButton.contentTintColor = .white
+        pdfAreaButton.toolTip = "扫描或混合 PDF 区域批注"
+        pdfAreaButton.isHidden = true
+
         readerMoreButton.target = self
         readerMoreButton.action = #selector(showReaderMoreMenu(_:))
         readerMoreButton.bezelStyle = .rounded
@@ -2302,13 +18965,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         readerMoreButton.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14, weight: .medium)
         readerMoreButton.contentTintColor = .white
 
-        notesButton.title = "笔记"
-        [libraryButton, contentsButton, notesButton, settingsButton, readerMoreButton].forEach {
-            configureReaderChromeButton($0)
-        }
+        configureReaderChromeButton(
+            libraryButton,
+            symbolName: "books.vertical.fill",
+            accessibilityLabel: "书架"
+        )
+        configureReaderChromeButton(
+            contentsButton,
+            symbolName: "list.bullet",
+            accessibilityLabel: "目录"
+        )
+        configureReaderChromeButton(
+            notesButton,
+            symbolName: "note.text",
+            accessibilityLabel: "笔记"
+        )
+        configureReaderChromeButton(
+            pdfAreaButton,
+            symbolName: "square.dashed.inset.filled",
+            accessibilityLabel: "区域批注"
+        )
+        configureReaderChromeButton(
+            settingsButton,
+            symbolName: "textformat.size",
+            accessibilityLabel: "排版"
+        )
+        configureReaderChromeButton(
+            readerMoreButton,
+            symbolName: "ellipsis",
+            accessibilityLabel: "更多"
+        )
         bookTitleLabel.font = NSFont(name: "Microsoft YaHei", size: 15) ?? NSFont.systemFont(ofSize: 15, weight: .semibold)
 
-        let headerStack = NSStackView(views: [libraryButton, bookTitleLabel, NSView(), contentsButton, notesButton, settingsButton, readerMoreButton])
+        let headerStack = NSStackView(
+            views: [
+                libraryButton,
+                bookTitleLabel,
+                WindowDragView(),
+                readingTTSButton,
+                contentsButton,
+                notesButton,
+                pdfAreaButton,
+                settingsButton,
+                readerMoreButton,
+            ]
+        )
         headerStack.orientation = .horizontal
         headerStack.alignment = .centerY
         headerStack.spacing = 14
@@ -2330,26 +19031,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         footerStack.spacing = 10
 
         notesRail = makeNotesRail()
+        let ttsPlayer = makeReadingTTSPlayerView()
+        readingTTSPlayerView = ttsPlayer
 
         let libraryWebView = makeMainLibraryWebView()
         let titlebarDragView = WindowDragView()
         titlebarDragView.wantsLayer = true
         titlebarDragView.layer?.backgroundColor = NSColor.black.cgColor
 
-        [header, headerStack, webView, notesRail, footer, footerStack, libraryWebView, titlebarDragView].forEach {
+        [header, headerStack, webView, comicReader.webView, pdfReader.view, notesRail, footer, footerStack, ttsPlayer, libraryWebView, titlebarDragView].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
         }
         notesRailWidthConstraint = notesRail.widthAnchor.constraint(equalToConstant: 0)
         notesRail.isHidden = true
 
         root.addSubview(webView)
+        root.addSubview(comicReader.webView)
+        root.addSubview(pdfReader.view)
         root.addSubview(notesRail)
         root.addSubview(header)
         header.addSubview(headerStack)
         root.addSubview(footer)
         footer.addSubview(footerStack)
+        root.addSubview(ttsPlayer)
         root.addSubview(libraryWebView)
         root.addSubview(titlebarDragView)
+
+        readerWebViewBottomConstraint = webView.bottomAnchor
+            .constraint(
+                equalTo: root.bottomAnchor
+            )
+        let ttsPlayerMinimumWidthConstraint =
+            ttsPlayer.widthAnchor.constraint(
+                greaterThanOrEqualToConstant: 660
+            )
+        ttsPlayerMinimumWidthConstraint.priority = .defaultHigh
 
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: root.topAnchor),
@@ -2364,7 +19080,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             webView.topAnchor.constraint(equalTo: root.topAnchor),
             webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: notesRail.leadingAnchor),
-            webView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            readerWebViewBottomConstraint!,
+
+            comicReader.webView.topAnchor.constraint(equalTo: root.topAnchor),
+            comicReader.webView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            comicReader.webView.trailingAnchor.constraint(equalTo: notesRail.leadingAnchor),
+            comicReader.webView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+
+            pdfReader.view.topAnchor.constraint(equalTo: root.topAnchor),
+            pdfReader.view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            pdfReader.view.trailingAnchor.constraint(equalTo: notesRail.leadingAnchor),
+            pdfReader.view.bottomAnchor.constraint(equalTo: root.bottomAnchor),
 
             notesRail.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
             notesRail.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -2379,6 +19105,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             footerStack.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 10),
             footerStack.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -10),
             footerStack.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+
+            ttsPlayer.centerXAnchor.constraint(
+                equalTo: webView.centerXAnchor
+            ),
+            ttsPlayer.bottomAnchor.constraint(
+                equalTo: footer.topAnchor,
+                constant: -8
+            ),
+            ttsPlayer.heightAnchor.constraint(
+                equalToConstant: 64
+            ),
+            ttsPlayerMinimumWidthConstraint,
+            ttsPlayer.widthAnchor.constraint(
+                lessThanOrEqualTo: webView.widthAnchor,
+                constant: -32
+            ),
 
             titlebarDragView.topAnchor.constraint(equalTo: root.topAnchor),
             titlebarDragView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 86),
@@ -2403,7 +19145,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         window.styleMask.insert(.fullSizeContentView)
         window.isMovableByWindowBackground = true
         window.acceptsMouseMovedEvents = true
+        window.isRestorable = !isAutomatedAcceptanceMode
+        window.delegate = self
         window.contentView = root
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(readerWindowDidResize(_:)),
+            name: NSWindow.didResizeNotification,
+            object: window
+        )
         window.center()
         mainRootView = root
         libraryHomeWebView = libraryWebView
@@ -2413,7 +19163,1137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         readerHeaderView = header
         readerFooterView = footer
         setReaderChromeVisible(false)
+        if isAutomatedAcceptanceMode {
+            window.orderOut(nil)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func selectedReadingTTSVoiceID() -> String {
+        if readingTTSVoicePopup.numberOfItems > 0 {
+            return readingTTSVoicePopup.indexOfSelectedItem == 0
+                ? "zh-CN-XiaoxiaoNeural"
+                : "zh-CN-YunjianNeural"
+        }
+        let saved = UserDefaults.standard.string(
+            forKey: readingTTSVoiceDefaultsKey
+        )
+        return [
+            "zh-CN-XiaoxiaoNeural",
+            "zh-CN-YunjianNeural",
+        ].contains(saved)
+            ? saved!
+            : "zh-CN-XiaoxiaoNeural"
+    }
+
+    private func selectReadingTTSVoice(_ voiceID: String) {
+        readingTTSVoicePopup.selectItem(
+            at: voiceID == "zh-CN-YunjianNeural" ? 1 : 0
+        )
+    }
+
+    private func selectedReadingTTSRate()
+        -> NativeAudioPlaybackRate
+    {
+        let title = readingTTSRatePopup
+            .titleOfSelectedItem?
+            .replacingOccurrences(of: "×", with: "")
+        return title.flatMap(NativeAudioPlaybackRate.init(rawValue:))
+            ?? .x10
+    }
+
+    private func readingTTSProfile()
+        -> ReadingSpeechSynthesisProfile
+    {
+        ReadingSpeechSynthesisProfile(
+            voiceID: selectedReadingTTSVoiceID(),
+            rate: "+0%",
+            volume: "+0%",
+            pitch: "+0Hz",
+            voiceCacheEpoch: "1",
+            prosodyRevision: "1"
+        )
+    }
+
+    private var readingTTSIsActive: Bool {
+        switch readingTTSProductController.snapshot().state {
+        case .preparing, .playing, .paused, .recoverableError:
+            return true
+        case .idle, .completed, .stopped:
+            return false
+        }
+    }
+
+    private func setReadingTTSPlayerVisible(_ visible: Bool) {
+        readingTTSPlayerView?.isHidden = !visible
+        if visible,
+           readingAudioSession.surfaceMode == .reading {
+            revealReaderChromeTemporarily()
+        }
+        if readingAudioSession.surfaceMode == .reading {
+            window.contentView?.layoutSubtreeIfNeeded()
+        }
+    }
+
+    @objc private func enterListeningModeFromButton(_ sender: Any?) {
+        guard readingTTSIsActive else {
+            statusLabel.stringValue =
+                "请先开始朗读，再进入听音模式"
+            NSSound.beep()
+            return
+        }
+        enterListeningModeIfNeeded()
+        mainWindowOrderedOutForListening = true
+        window.orderOut(sender)
+    }
+
+    private func enterListeningModeIfNeeded() {
+        guard readingTTSIsActive else {
+            return
+        }
+        if readingAudioSession.surfaceMode != .listening {
+            listeningRestoreLocator =
+                readingAudioSession.currentLocator
+                ?? readingTTSProductController
+                    .snapshot().currentLocator
+                ?? readingTTSLastLocator
+            readingAudioSession.setSurfaceMode(.listening)
+            suspendReaderRendererForListening()
+            if !hasActiveUserAudioWork() {
+                stopFunASRWarmService()
+            }
+        }
+        updateReadingTTSSurfaces()
+        listeningModeWindowController.show()
+    }
+
+    private func exitListeningModeIfNeeded(
+        restoreWindow: Bool,
+        restoreChapter: Bool = true
+    ) {
+        let wasListening =
+            readingAudioSession.surfaceMode == .listening
+            || readerRendererSuspended
+            || listeningModeWindowController.isVisible
+            || mainWindowOrderedOutForListening
+        let shouldRestoreOrderedOutWindow =
+            mainWindowOrderedOutForListening
+        guard wasListening else {
+            if restoreWindow {
+                mainWindowOrderedOutForListening = false
+                restoreMainReadingWindow()
+            }
+            return
+        }
+        readingAudioSession.setSurfaceMode(.reading)
+        listeningModeWindowController.hide()
+        if restoreChapter {
+            restoreReaderRendererAfterListening()
+        } else {
+            restoreReaderRendererAfterListening(
+                loadCurrentChapter: false
+            )
+        }
+        listeningRestoreLocator = nil
+        mainWindowOrderedOutForListening = false
+        updateReadingTTSSurfaces()
+        if restoreWindow {
+            restoreMainReadingWindow()
+        } else if shouldRestoreOrderedOutWindow {
+            window.orderFront(nil)
+        }
+    }
+
+    private func restoreMainReadingWindow() {
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func suspendReaderRendererForListening() {
+        guard !readerRendererSuspended else {
+            return
+        }
+        readerRendererSuspended = true
+        webView.stopLoading()
+        webView.configuration.userContentController
+            .removeAllUserScripts()
+        webView.loadHTMLString(
+            "<!doctype html><meta charset='utf-8'><style>html,body{margin:0;background:#000}</style>",
+            baseURL: nil
+        )
+        libraryHomeWebView?.stopLoading()
+        libraryHomeWebView?.loadHTMLString(
+            "<!doctype html><meta charset='utf-8'><style>html,body{margin:0;background:#000}</style>",
+            baseURL: nil
+        )
+        comicReader?.webView.stopLoading()
+    }
+
+    private func restoreReaderRendererAfterListening(
+        loadCurrentChapter: Bool = true
+    ) {
+        guard readerRendererSuspended else {
+            return
+        }
+        readerRendererSuspended = false
+        let userContent =
+            webView.configuration.userContentController
+        userContent.removeAllUserScripts()
+        userContent.addUserScript(
+            WKUserScript(
+                source: Self.readerScript,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: false
+            )
+        )
+        guard loadCurrentChapter,
+              let provider = readingTextProvider
+        else {
+            return
+        }
+        let locator =
+            readingAudioSession.currentLocator
+            ?? readingTTSProductController
+                .snapshot().currentLocator
+            ?? readingTTSLastLocator
+            ?? listeningRestoreLocator
+        let chapterIndex = locator
+            .flatMap { provider.sentence(at: $0)?.chapterIndex }
+            ?? currentChapterIndex
+        guard chapters.indices.contains(chapterIndex) else {
+            return
+        }
+        readingTTSAutoFollow = true
+        loadChapter(
+            at: chapterIndex,
+            initialPage: .start,
+            preservingPendingReadingMove: true
+        )
+    }
+
+    private func updateReadingTTSSurfaces() {
+        let snapshot = readingTTSProductController.snapshot()
+        guard readingTTSIsActive else {
+            listeningModeWindowController.hide()
+            systemMediaSessionController.clear()
+            return
+        }
+        let locator =
+            readingAudioSession.currentLocator
+            ?? snapshot.currentLocator
+            ?? readingTTSLastLocator
+        let sentence = locator.flatMap {
+            readingTTSProductController.sentence(at: $0)
+        }
+        let chapterIndex =
+            sentence?.chapterIndex
+            ?? readingTTSLastBoundaryChapterIndex
+            ?? currentChapterIndex
+        let chapter = chapterTitles.indices.contains(chapterIndex)
+            ? chapterTitles[chapterIndex]
+            : "第 \(chapterIndex + 1) 章"
+        let title =
+            currentBookEntry?.title
+            ?? bookTitleLabel.stringValue
+        let playPauseTitle: String
+        switch snapshot.state {
+        case .paused:
+            playPauseTitle = "继续"
+        case .recoverableError:
+            playPauseTitle = "重试"
+        case .idle, .completed, .stopped:
+            playPauseTitle = "播放"
+        case .preparing, .playing:
+            playPauseTitle = "暂停"
+        }
+        listeningModeWindowController.update(
+            title: title,
+            chapter: chapter,
+            sentence: sentence?.text ?? "",
+            status: readingTTSStatusLabel.stringValue,
+            playPauseTitle: playPauseTitle,
+            timerTitle: readingTTSTimerButton.title
+        )
+        systemMediaSessionController.update(
+            title: title,
+            chapter: chapter,
+            state: snapshot.state
+        )
+    }
+
+    private func pauseReadingTTSFromSystem() {
+        let state = readingTTSProductController.snapshot().state
+        guard state == .playing || state == .preparing else {
+            return
+        }
+        readingTTSProductController.pause()
+    }
+
+    private func resumeReadingTTSFromSystem() {
+        switch readingTTSProductController.snapshot().state {
+        case .paused:
+            guard clickTTSGate0ProbeController
+                .cancelAndWait(timeout: 2)
+            else {
+                return
+            }
+            readingTTSProductController.resume()
+        case .recoverableError:
+            guard clickTTSGate0ProbeController
+                .cancelAndWait(timeout: 2)
+            else {
+                return
+            }
+            readingTTSProductController.retry()
+        case .idle, .completed, .stopped:
+            startOrFocusReadingTTS(nil)
+        case .preparing, .playing:
+            return
+        }
+    }
+
+    private func hasActiveUserAudioWork() -> Bool {
+        if noteSpeechController?.isUserAudioWorkActive == true {
+            return true
+        }
+        return backgroundNoteSpeechControllers.values.contains {
+            $0.isUserAudioWorkActive
+        }
+    }
+
+    private func stopFunASRWarmServiceForListeningIfSafe() {
+        guard !hasActiveUserAudioWork() else {
+            return
+        }
+        stopFunASRWarmService()
+    }
+
+    @objc private func startOrFocusReadingTTS(_ sender: Any?) {
+        guard !isPDFReadingMode,
+              !isComicReadingMode,
+              let provider = readingTextProvider,
+              installedReadingBridgeChapterIndex == currentChapterIndex
+        else {
+            statusLabel.stringValue =
+                "当前正文尚未建立可朗读的稳定句子定位"
+            NSSound.beep()
+            return
+        }
+        if readingTTSIsActive {
+            returnToReadingTTSPosition(sender)
+            return
+        }
+        if let locator = lastFocusedReadingLocator,
+           let sentence = provider.sentence(at: locator) {
+            startReadingTTS(at: sentence)
+            return
+        }
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderReadingStartLocator && window.__sentenceReaderReadingStartLocator();"
+        ) { [weak self] result, error in
+            guard let self,
+                  error == nil,
+                  let locator = result as? String,
+                  !locator.isEmpty,
+                  let provider = self.readingTextProvider,
+                  let sentence = provider.sentence(at: locator)
+            else {
+                self?.statusLabel.stringValue =
+                    "当前页面没有可开始朗读的完整句子"
+                NSSound.beep()
+                return
+            }
+            self.startReadingTTS(at: sentence)
+        }
+    }
+
+    private func startReadingTTS(at sentence: ReadingSentence) {
+        guard let provider = readingTextProvider,
+              provider.document.revision
+                == readingAudioSession.documentRevision
+        else {
+            statusLabel.stringValue = "朗读文本会话尚未就绪"
+            return
+        }
+        readingTTSPendingVoiceSentence = nil
+        let wasActive = readingTTSIsActive
+        guard clickTTSGate0ProbeController
+            .cancelAndWait(timeout: 2)
+        else {
+            statusLabel.stringValue =
+                "声音试听尚未安全结束，Click 没有启动正式朗读"
+            readingTTSStatusLabel.stringValue =
+                "等待声音试听安全结束"
+            NSSound.beep()
+            return
+        }
+        if !wasActive {
+            clearReadingTTSSleepTimer()
+        } else if readingTTSSleepPauseRequested {
+            readingTTSSleepPauseRequested = false
+            readingTTSSleepPendingAtBoundary = true
+        }
+        if !readingAudioSession.isJumpEligible {
+            guard readingAudioSession.activate(
+                at: sentence.locator,
+                provider: provider
+            ) else {
+                statusLabel.stringValue = "无法从当前句建立朗读会话"
+                return
+            }
+        } else {
+            _ = readingAudioSession.seek(
+                to: sentence,
+                provider: provider
+            )
+        }
+        readingTTSAutoFollow = true
+        readingTTSReturnButton.isHidden = true
+        readingTTSLastBoundaryChapterIndex = sentence.chapterIndex
+        readingTTSLastLocator = sentence.locator
+        setReadingTTSPlayPauseTitle("暂停")
+        readingTTSStatusLabel.stringValue = "正在准备"
+        setReadingTTSPlayerVisible(true)
+        if readingAudioSession.surfaceMode == .reading {
+            applyReadingTTSHighlight(
+                locator: sentence.locator,
+                follow: true
+            )
+        }
+        readingTTSProductController.start(
+            document: provider.document,
+            sentence: sentence,
+            profile: readingTTSProfile(),
+            rate: selectedReadingTTSRate(),
+            chapterLoader: {
+                [weak self] index, completion in
+                self?.loadReadingTTSChapter(
+                    at: index,
+                    completion: completion
+                )
+            },
+            networkAuthorizer: {
+                [weak self] completion in
+                guard let self, let window = self.window else {
+                    completion(false)
+                    return
+                }
+                self.clickTTSGate0ProbeController
+                    .authorizeContinuousReading(
+                        parentWindow: window,
+                        completion: completion
+                    )
+            }
+        )
+        if case .endOfChapter = readingTTSSleepMode {
+            readingTTSProductController
+                .setPauseBeforeNextChapter(true)
+        }
+    }
+
+    private func loadReadingTTSChapter(
+        at index: Int,
+        completion: @escaping (
+            Result<ReadingChapter, Error>
+        ) -> Void
+    ) {
+        precondition(Thread.isMainThread)
+        guard let provider = readingTextProvider,
+              provider.document.chapters.indices.contains(index),
+              let bookRootURL,
+              chapters.indices.contains(index)
+        else {
+            completion(
+                .failure(
+                    ReadingSpeechBlockBuilderError.chapterMismatch
+                )
+            )
+            return
+        }
+        if let chapter = provider.chapter(at: index) {
+            completion(.success(chapter))
+            return
+        }
+        readingChapterSnapshotLoader.load(
+            chapterIndex: index,
+            chapterURL: chapters[index],
+            bookRootURL: bookRootURL
+        ) { [weak self, weak provider] result in
+            guard let self,
+                  let provider,
+                  provider === self.readingTextProvider
+            else {
+                completion(
+                    .failure(
+                        ReadingSpeechGenerationError.canceled
+                    )
+                )
+                return
+            }
+            switch result {
+            case let .success(records):
+                do {
+                    completion(
+                        .success(
+                            try provider.installRenderedChapter(
+                                descriptorIndex: index,
+                                records: records
+                            )
+                        )
+                    )
+                } catch {
+                    completion(.failure(error))
+                }
+            case let .failure(error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    private func handleReadingTTSProductEvent(
+        _ event: ReadingTTSProductEvent
+    ) {
+        precondition(Thread.isMainThread)
+        var message = event.message
+        switch event.kind {
+        case .preparing, .authorizationRequired, .batchStarted:
+            setReadingTTSPlayPauseTitle("暂停")
+        case .blockReady, .playing, .resumed:
+            readingAudioSession.markPlaying()
+            setReadingTTSPlayPauseTitle("暂停")
+        case .buffering:
+            setReadingTTSPlayPauseTitle("暂停")
+        case .paused:
+            readingAudioSession.pause()
+            setReadingTTSPlayPauseTitle("继续")
+        case .sentenceBoundaryPaused:
+            readingAudioSession.pause()
+            setReadingTTSPlayPauseTitle("继续")
+            if readingTTSSleepPauseRequested {
+                readingTTSPendingVoiceSentence = nil
+                if let currentVoice =
+                    readingTTSProductController
+                        .snapshot().voiceID {
+                    selectReadingTTSVoice(currentVoice)
+                }
+                clearReadingTTSSleepTimer()
+                message =
+                    "定时结束，已在当前句结束后暂停"
+            } else if let nextSentence =
+                readingTTSPendingVoiceSentence {
+                readingTTSPendingVoiceSentence = nil
+                message = "本句已读完，正在切换声音"
+                DispatchQueue.main.async { [weak self] in
+                    self?.startReadingTTS(at: nextSentence)
+                }
+            } else {
+                clearReadingTTSSleepTimer()
+                message = "定时结束，已在当前句结束后暂停"
+            }
+        case .chapterBoundaryPaused:
+            readingAudioSession.pause()
+            setReadingTTSPlayPauseTitle("继续")
+            clearReadingTTSSleepTimer()
+            message = "本章已读完，已在跨章前暂停"
+        case .bufferWarning:
+            break
+        case .recoverableError:
+            readingAudioSession.markRecoverableError()
+            setReadingTTSPlayPauseTitle("重试")
+        case .sentenceBoundary:
+            handleReadingTTSSentenceBoundary(event)
+        case .completed:
+            readingAudioSession.markCompleted()
+            setReadingTTSPlayPauseTitle("播放")
+            readingChapterSnapshotLoader.stop()
+            clearReadingTTSSleepTimer()
+            exitListeningModeIfNeeded(restoreWindow: false)
+        case .stopped:
+            setReadingTTSPlayPauseTitle("播放")
+            readingChapterSnapshotLoader.stop()
+        case .batchCompleted:
+            readingChapterSnapshotLoader.stop()
+        case .horizonChanged:
+            break
+        }
+        readingTTSStatusLabel.stringValue =
+            "\(message) · \(readingTTSHorizonText(event.horizonMS))"
+        statusLabel.stringValue = message
+        updateReadingTTSSurfaces()
+    }
+
+    private func handleReadingTTSSentenceBoundary(
+        _ event: ReadingTTSProductEvent
+    ) {
+        guard let locator = event.locator,
+              let sentence = readingTTSProductController.sentence(
+                at: locator
+              ),
+              let provider = readingTextProvider
+        else {
+            return
+        }
+        _ = readingAudioSession.seek(
+            to: sentence,
+            provider: provider
+        )
+        readingTTSLastLocator = locator
+
+        readingTTSLastBoundaryChapterIndex =
+            sentence.chapterIndex
+        if readingTTSSleepPendingAtBoundary,
+           readingTTSProductController
+            .pauseAfterCurrentSentence() {
+            readingTTSSleepPendingAtBoundary = false
+            readingTTSSleepPauseRequested = true
+            setReadingTTSTimerTitle("本句结束")
+        }
+
+        if readingAudioSession.surfaceMode == .listening {
+            updateReadingTTSSurfaces()
+            return
+        }
+
+        if sentence.chapterIndex == currentChapterIndex {
+            applyReadingTTSHighlight(
+                locator: locator,
+                follow: readingTTSAutoFollow
+            )
+        } else if readingTTSAutoFollow {
+            loadChapter(
+                at: sentence.chapterIndex,
+                initialPage: .start,
+                preservingPendingReadingMove: true
+            )
+        } else {
+            readingTTSReturnButton.isHidden = false
+        }
+    }
+
+    private func applyReadingTTSHighlight(
+        locator: String,
+        follow: Bool
+    ) {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: [locator]
+        ),
+        let json = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderSetPlayingLocator && window.__sentenceReaderSetPlayingLocator(\(json)[0], \(follow ? "true" : "false"));"
+        )
+    }
+
+    private func restoreReadingTTSHighlightIfNeeded() {
+        guard let locator = readingTTSLastLocator,
+              let sentence = readingTTSProductController.sentence(
+                at: locator
+              ),
+              sentence.chapterIndex == currentChapterIndex
+        else {
+            return
+        }
+        applyReadingTTSHighlight(
+            locator: locator,
+            follow: readingTTSAutoFollow
+        )
+    }
+
+    private func readingTTSHorizonText(_ horizonMS: Int) -> String {
+        if horizonMS < 60_000 {
+            return "缓存不足 1 分钟"
+        }
+        return String(
+            format: "可播 %.0f 分钟",
+            Double(horizonMS) / 60_000
+        )
+    }
+
+    @objc private func toggleReadingTTSPlayback(_ sender: Any?) {
+        let snapshot = readingTTSProductController.snapshot()
+        switch snapshot.state {
+        case .playing, .preparing:
+            readingTTSProductController.pause()
+        case .paused:
+            guard clickTTSGate0ProbeController
+                .cancelAndWait(timeout: 2)
+            else {
+                statusLabel.stringValue =
+                    "声音试听尚未安全结束，Click 没有恢复正式朗读"
+                NSSound.beep()
+                return
+            }
+            readingTTSProductController.resume()
+        case .recoverableError:
+            guard clickTTSGate0ProbeController
+                .cancelAndWait(timeout: 2)
+            else {
+                statusLabel.stringValue =
+                    "声音试听尚未安全结束，Click 没有重试正式朗读"
+                NSSound.beep()
+                return
+            }
+            readingTTSProductController.retry()
+        case .completed, .stopped, .idle:
+            startOrFocusReadingTTS(sender)
+        }
+    }
+
+    @objc private func closeReadingTTS(_ sender: Any?) {
+        exitListeningModeIfNeeded(restoreWindow: false)
+        readingTTSProductController.stop()
+        readingAudioSession.stop()
+        readingChapterSnapshotLoader.stop()
+        clearReadingTTSSleepTimer()
+        readingTTSLastLocator = nil
+        readingTTSLastBoundaryChapterIndex = nil
+        readingTTSPendingVoiceSentence = nil
+        readingTTSSelectionPlaybackGeneration = UUID()
+        readingTTSAutoFollow = true
+        readingTTSReturnButton.isHidden = true
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderClearPlayingLocator && window.__sentenceReaderClearPlayingLocator();"
+        )
+        setReadingTTSPlayerVisible(false)
+        listeningModeWindowController.hide()
+        systemMediaSessionController.clear()
+        let previewStopped = clickTTSGate0ProbeController
+            .cancelAndWait(timeout: 2)
+        statusLabel.stringValue = previewStopped
+            ? "本次朗读已结束"
+            : "正式朗读已结束；声音试听尚未安全停止"
+    }
+
+    @objc private func changeReadingTTSRate(_ sender: Any?) {
+        let rate = selectedReadingTTSRate()
+        UserDefaults.standard.set(
+            rate.rawValue,
+            forKey: readingTTSRateDefaultsKey
+        )
+        readingTTSProductController.setRate(rate)
+    }
+
+    @objc private func changeReadingTTSVoice(_ sender: Any?) {
+        let voice = selectedReadingTTSVoiceID()
+        let snapshot = readingTTSProductController.snapshot()
+        guard readingTTSIsActive else {
+            UserDefaults.standard.set(
+                voice,
+                forKey: readingTTSVoiceDefaultsKey
+            )
+            statusLabel.stringValue =
+                "已选择 Microsoft Edge 在线声音"
+            return
+        }
+        guard voice != snapshot.voiceID else {
+            statusLabel.stringValue = "当前已经使用这个声音"
+            return
+        }
+        guard !readingTTSSleepPauseRequested,
+              !readingTTSSleepPendingAtBoundary,
+              let locator = snapshot.currentLocator
+        else {
+            if let currentVoice = snapshot.voiceID {
+                selectReadingTTSVoice(currentVoice)
+            }
+            statusLabel.stringValue =
+                "定时暂停正在收尾，请暂停完成后再切换声音"
+            return
+        }
+        let nextSentence =
+            readingTTSProductController.adjacentSentence(
+                from: locator,
+                direction: 1
+            ) ?? {
+                guard let provider = readingTextProvider,
+                      case let .sentence(sentence) =
+                        provider.next(after: locator)
+                else {
+                    return nil
+                }
+                return sentence
+            }()
+        guard let nextSentence,
+              readingTTSProductController
+                .pauseAfterCurrentSentence()
+        else {
+            if let currentVoice = snapshot.voiceID {
+                selectReadingTTSVoice(currentVoice)
+            }
+            statusLabel.stringValue =
+                "后续句子尚未准备，声音没有切换"
+            NSSound.beep()
+            return
+        }
+        readingTTSPendingVoiceSentence = nextSentence
+        UserDefaults.standard.set(
+            voice,
+            forKey: readingTTSVoiceDefaultsKey
+        )
+        readingTTSStatusLabel.stringValue =
+            "将在本句结束后切换声音"
+        statusLabel.stringValue =
+            "将在本句结束后切换 Microsoft Edge 在线声音"
+    }
+
+    @objc private func previewSelectedReadingTTSVoice(
+        _ sender: Any?
+    ) {
+        let state = readingTTSProductController.snapshot().state
+        guard [.paused, .completed, .stopped, .idle]
+            .contains(state),
+              readingTTSProductController
+                .isQuiescentForVoicePreview
+        else {
+            statusLabel.stringValue =
+                "请先暂停并等待生成任务结束，再试听固定公开样例"
+            NSSound.beep()
+            return
+        }
+        clickTTSGate0ProbeController.run(
+            text:
+                "这是 Click 的公开声音试听样例，不包含书籍正文。",
+            voice: selectedReadingTTSVoiceID(),
+            parentWindow: window,
+            fixtureID: "reader-voice-preview-public-v1",
+            chapterLocator: "fixture:voice-preview",
+            locatorRange: "0:full"
+        ) { [weak self] message, _ in
+            self?.statusLabel.stringValue = message
+        }
+    }
+
+    private func readSelectionSentence(
+        from payload: [String: Any]
+    ) {
+        let targets = sentenceTargets(from: payload)
+        let locators = Set(
+            targets.compactMap { target -> String? in
+                let locator = (
+                    target["sentenceLocator"] as? String
+                        ?? ""
+                ).trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                return locator.isEmpty ? nil : locator
+            }
+        )
+        guard locators.count == 1,
+              let locator = locators.first,
+              let sentence = readingTextProvider?
+                .sentence(at: locator),
+              !sentence.text.isEmpty,
+              sentence.text.count <= 4_000
+        else {
+            statusLabel.stringValue =
+                "“朗读本句”一次只支持同一句中的选中文字"
+            NSSound.beep()
+            return
+        }
+
+        let generation = UUID()
+        readingTTSSelectionPlaybackGeneration = generation
+        let state = readingTTSProductController.snapshot().state
+        if [.preparing, .playing, .recoverableError]
+            .contains(state) {
+            readingTTSProductController.pause()
+        }
+        statusLabel.stringValue = "正在准备朗读本句"
+        waitToReadSelectionSentence(
+            sentence,
+            generation: generation,
+            deadline: Date().addingTimeInterval(2)
+        )
+    }
+
+    private func waitToReadSelectionSentence(
+        _ sentence: ReadingSentence,
+        generation: UUID,
+        deadline: Date
+    ) {
+        guard generation
+                == readingTTSSelectionPlaybackGeneration
+        else {
+            return
+        }
+        guard readingTTSProductController
+                .isQuiescentForVoicePreview
+        else {
+            guard Date() < deadline else {
+                statusLabel.stringValue =
+                    "正式朗读尚未安全暂停，本句没有另行播放"
+                NSSound.beep()
+                return
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 0.05
+            ) { [weak self] in
+                self?.waitToReadSelectionSentence(
+                    sentence,
+                    generation: generation,
+                    deadline: deadline
+                )
+            }
+            return
+        }
+        guard clickTTSGate0ProbeController
+                .cancelAndWait(timeout: 2)
+        else {
+            statusLabel.stringValue =
+                "已有声音任务尚未安全结束，本句没有播放"
+            NSSound.beep()
+            return
+        }
+
+        let privateChapterIdentity =
+            ReadingIdentity.sha256(sentence.chapterLocator)
+        clickTTSGate0ProbeController.run(
+            text: sentence.text,
+            voice: selectedReadingTTSVoiceID(),
+            parentWindow: window,
+            fixtureID: "reader-selection-sentence-v1",
+            chapterLocator:
+                "reader:\(privateChapterIdentity.prefix(16))",
+            locatorRange: sentence.locator,
+            playbackFinished: { [weak self] succeeded in
+                guard let self,
+                      generation
+                        == self.readingTTSSelectionPlaybackGeneration
+                else {
+                    return
+                }
+                self.statusLabel.stringValue = succeeded
+                    ? "本句朗读完成"
+                    : "本句没有完整播放"
+            }
+        ) { [weak self] message, succeeded in
+            guard let self,
+                  generation
+                    == self.readingTTSSelectionPlaybackGeneration
+            else {
+                return
+            }
+            self.statusLabel.stringValue = succeeded
+                ? "正在朗读本句"
+                : message
+        }
+    }
+
+    @objc private func readingTTSPreviousParagraph(
+        _ sender: Any?
+    ) {
+        moveReadingTTSByParagraph(direction: -1)
+    }
+
+    @objc private func readingTTSNextParagraph(_ sender: Any?) {
+        moveReadingTTSByParagraph(direction: 1)
+    }
+
+    private func moveReadingTTSByParagraph(direction: Int) {
+        guard direction == -1 || direction == 1,
+              let locator = readingTTSProductController
+                .snapshot().currentLocator,
+              let sentence = adjacentReadingTTSParagraph(
+                from: locator,
+                direction: direction
+              )
+        else {
+            statusLabel.stringValue =
+                direction < 0 ? "已经到第一段" : "后续段落尚未缓存"
+            NSSound.beep()
+            return
+        }
+        startReadingTTS(at: sentence)
+    }
+
+    private func adjacentReadingTTSParagraph(
+        from locator: String,
+        direction: Int
+    ) -> ReadingSentence? {
+        readingTTSProductController.adjacentParagraph(
+            from: locator,
+            direction: direction
+        )
+    }
+
+    @objc private func returnToReadingTTSPosition(
+        _ sender: Any?
+    ) {
+        guard let locator = readingTTSProductController
+                .snapshot().currentLocator,
+              let sentence = readingTTSProductController
+                .sentence(at: locator)
+        else {
+            return
+        }
+        readingTTSAutoFollow = true
+        readingTTSReturnButton.isHidden = true
+        if sentence.chapterIndex != currentChapterIndex {
+            loadChapter(
+                at: sentence.chapterIndex,
+                initialPage: .start,
+                preservingPendingReadingMove: true
+            )
+        } else {
+            applyReadingTTSHighlight(
+                locator: locator,
+                follow: true
+            )
+        }
+    }
+
+    private func markReadingTTSManualBrowse() {
+        guard readingTTSIsActive else {
+            return
+        }
+        readingTTSAutoFollow = false
+        readingTTSReturnButton.isHidden = false
+    }
+
+    @objc private func showReadingTTSTimerMenu(
+        _ sender: NSButton
+    ) {
+        guard readingTTSIsActive else {
+            statusLabel.stringValue = "请先开始朗读，再设置倒计时"
+            NSSound.beep()
+            return
+        }
+        let menu = NSMenu(title: "睡眠定时")
+        let choices: [(String, Int)] = [
+            ("15 分钟", 15),
+            ("30 分钟", 30),
+            ("60 分钟", 60),
+            ("本章结束", -1),
+            ("自定义…", -2),
+            ("关闭定时", 0),
+        ]
+        for (title, tag) in choices {
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(selectReadingTTSTimer(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = tag
+            menu.addItem(item)
+        }
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 0, y: sender.bounds.height + 4),
+            in: sender
+        )
+    }
+
+    @objc private func selectReadingTTSTimer(
+        _ sender: NSMenuItem
+    ) {
+        if sender.tag > 0 {
+            setReadingTTSTimer(minutes: sender.tag)
+        } else if sender.tag == -1 {
+            clearReadingTTSSleepTimer()
+            readingTTSSleepMode = .endOfChapter
+            readingTTSProductController
+                .setPauseBeforeNextChapter(true)
+            setReadingTTSTimerTitle("本章结束")
+            updateReadingTTSSurfaces()
+        } else if sender.tag == -2 {
+            showCustomReadingTTSTimer()
+        } else {
+            clearReadingTTSSleepTimer()
+        }
+    }
+
+    private func setReadingTTSTimer(minutes: Int) {
+        guard minutes > 0 else {
+            return
+        }
+        clearReadingTTSSleepTimer()
+        let deadline = Date().addingTimeInterval(
+            TimeInterval(minutes * 60)
+        )
+        readingTTSSleepMode = .deadline(deadline)
+        readingTTSSleepTimer = Timer.scheduledTimer(
+            withTimeInterval: 1,
+            repeats: true
+        ) { [weak self] _ in
+            self?.updateReadingTTSTimer()
+        }
+        updateReadingTTSTimer()
+    }
+
+    private func updateReadingTTSTimer() {
+        guard case let .deadline(deadline) =
+                readingTTSSleepMode
+        else {
+            return
+        }
+        let remaining = max(0, deadline.timeIntervalSinceNow)
+        let totalSeconds = Int(ceil(remaining))
+        setReadingTTSTimerTitle(
+            String(
+                format: "%02d:%02d",
+                totalSeconds / 60,
+                totalSeconds % 60
+            )
+        )
+        if remaining <= 0 {
+            readingTTSSleepPendingAtBoundary = true
+            readingTTSSleepTimer?.invalidate()
+            readingTTSSleepTimer = nil
+            if readingTTSProductController
+                .pauseAfterCurrentSentence() {
+                readingTTSSleepPendingAtBoundary = false
+                readingTTSSleepPauseRequested = true
+                setReadingTTSTimerTitle("本句结束")
+            } else {
+                setReadingTTSTimerTitle("等待本句")
+            }
+        }
+        updateReadingTTSSurfaces()
+    }
+
+    private func showCustomReadingTTSTimer() {
+        let alert = NSAlert()
+        alert.messageText = "自定义睡眠定时"
+        alert.informativeText =
+            "到点后会读完当前句，再暂停朗读。"
+        alert.addButton(withTitle: "开始")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(
+            frame: NSRect(x: 0, y: 0, width: 240, height: 26)
+        )
+        field.placeholderString = "分钟（1–480）"
+        alert.accessoryView = field
+        alert.beginSheetModal(for: window) {
+            [weak self] response in
+            guard response == .alertFirstButtonReturn,
+                  let minutes = Int(field.stringValue),
+                  (1...480).contains(minutes)
+            else {
+                return
+            }
+            self?.setReadingTTSTimer(minutes: minutes)
+        }
+    }
+
+    private func clearReadingTTSSleepTimer() {
+        readingTTSSleepTimer?.invalidate()
+        readingTTSSleepTimer = nil
+        readingTTSSleepMode = .off
+        readingTTSSleepPendingAtBoundary = false
+        readingTTSSleepPauseRequested = false
+        readingTTSProductController
+            .cancelPauseAfterCurrentSentence()
+        readingTTSProductController
+            .setPauseBeforeNextChapter(false)
+        setReadingTTSTimerTitle("定时")
+        updateReadingTTSSurfaces()
     }
 
     private func loadBundledBook() {
@@ -2422,37 +20302,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
 
-        let bookRoot = resourceURL.appendingPathComponent("default-book", isDirectory: true)
-        let defaultEntry = BookEntry(
-            title: "Click 示例书",
-            author: "Click",
-            bookHash: "sentence-reader-default-good-strategy-bad-strategy-v1",
-            epubPath: resourceURL.appendingPathComponent("default-fixture.epub").path,
-            bookRootPath: bookRoot.path,
-            isBundled: true
-        )
+        guard let defaultEntry = writableBundledBookEntry(resourceURL: resourceURL) else {
+            statusLabel.stringValue = "内置示例书准备失败"
+            return
+        }
         bookEntries = loadBookLibrary(defaultEntry: defaultEntry)
         saveBookLibrary()
         let entry = currentBookEntry ?? bookEntries.first ?? defaultEntry
         loadBookEntry(entry)
     }
 
-    private func loadBookEntry(_ entry: BookEntry) {
+    @discardableResult
+    private func loadBookEntry(_ entry: BookEntry) -> Bool {
+        resetReadingCore()
+        pdfAnnotationRefreshGeneration += 1
+        pdfAudioPollWorkItems.values.forEach { $0.cancel() }
+        pdfAudioPollWorkItems.removeAll()
+        pdfAudioPlayer?.stop()
+        pdfAudioPlayer = nil
+        playingPDFAudioNoteID = nil
+        if entry.effectiveSourceKind == "pdf" {
+            return loadPDFBookEntry(entry)
+        }
+        pdfPositionRestoreWorkItem?.cancel()
+        pdfPositionRestoreWorkItem = nil
+        pdfPositionSaveWorkItem?.cancel()
+        pdfPositionSaveWorkItem = nil
+        lastQueuedPDFPositionSignature = nil
+        suppressPDFPositionSave = true
+        isPDFReadingMode = false
+        pdfReader.view.isHidden = true
+        pdfReader.setAreaSelectionMode(false)
+        pdfAreaButton.isHidden = true
         if !entry.isBundled {
             let epubURL = URL(fileURLWithPath: entry.epubPath)
-            guard isOwnedImportedBookFile(epubURL),
+        guard isOwnedImportedBookFile(epubURL),
                   FileManager.default.fileExists(atPath: epubURL.path)
             else {
                 statusLabel.stringValue = "书籍内部副本缺失，请重新导入：\(entry.title)"
-                return
+                return false
             }
         }
 
         let bookRoot = URL(fileURLWithPath: entry.bookRootPath, isDirectory: true)
         guard FileManager.default.fileExists(atPath: bookRoot.path) else {
             statusLabel.stringValue = "没有找到书籍目录：\(entry.title)"
-            return
+            return false
         }
+
+        EPUBTextRuntimeNormalizer.normalizeMarkup(in: bookRoot)
 
         currentBookEntry = entry
         bookTitleLabel.stringValue = entry.title
@@ -2471,16 +20369,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 filePath: entry.epubPath
             )
             : nil
+        isComicReadingMode = comicReader.configure(
+            chapters: chapters,
+            rootURL: bookRoot,
+            pageMode: comicPageMode(for: entry),
+            viewportWidth: window.contentView?.bounds.width ?? window.frame.width
+        )
+        webView.isHidden = isComicReadingMode
+        comicReader.webView.isHidden = !isComicReadingMode
+        readingTTSButton.isHidden = true
+        if !isComicReadingMode {
+            redLabel.stringValue = "红标 0"
+        }
         redAnnotationIDs = [:]
-        pendingNoteJumpIndex = nil
+        pendingNoteJump = nil
         refreshNotes()
         tocEntries = collectTOCEntries(in: bookRoot, chapters: chapters)
-        contentsButton.title = tocEntries.isEmpty ? "目录(\(chapters.count))" : "目录(\(tocEntries.count))"
+        let rootTOCCount = tocEntries.filter { $0.level == 0 }.count
+        let contentsLabel = rootTOCCount > 0
+            ? "目录，\(rootTOCCount) 组"
+            : "目录，\(chapters.count) 章"
+        contentsButton.setAccessibilityLabel(contentsLabel)
+        contentsButton.toolTip = contentsLabel
 
         guard !chapters.isEmpty else {
+            readingTTSButton.isHidden = true
             statusLabel.stringValue = "没有找到 EPUB 正文 HTML"
-            return
+            return false
         }
+        configureReadingCore(for: entry)
 
         if let position = loadSavedReadingPosition(),
            let restoredIndex = chapterIndex(for: position) {
@@ -2492,7 +20409,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     totalPages: max(1, position.totalPages)
                 )
             )
-            return
+            return true
         }
 
         if entry.isBundled {
@@ -2502,6 +20419,178 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             currentChapterIndex = 0
         }
         loadChapter(at: currentChapterIndex, initialPage: .start)
+        return true
+    }
+
+    private func resetReadingCore() {
+        let shouldRestoreOrderedOutWindow =
+            mainWindowOrderedOutForListening
+        mainWindowOrderedOutForListening = false
+        listeningRestoreLocator = nil
+        readingJumpCoordinator.cancel()
+        pendingReadingMove = nil
+        readingAudioSession.setSurfaceMode(.reading)
+        listeningModeWindowController.hide()
+        systemMediaSessionController.clear()
+        restoreReaderRendererAfterListening(
+            loadCurrentChapter: false
+        )
+        readingTTSProductController.stop()
+        readingChapterSnapshotLoader.stop()
+        clearReadingTTSSleepTimer()
+        readingTTSLastLocator = nil
+        readingTTSLastBoundaryChapterIndex = nil
+        readingTTSAutoFollow = true
+        readingTTSReturnButton.isHidden = true
+        setReadingTTSPlayerVisible(false)
+        readingTTSButton.isHidden = true
+        if shouldRestoreOrderedOutWindow {
+            window.orderFront(nil)
+        }
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderClearPlayingLocator && window.__sentenceReaderClearPlayingLocator();"
+        )
+        readingAudioSession.stop()
+        readingTextProvider = nil
+        lastFocusedReadingLocator = nil
+        installedReadingBridgeChapterIndex = nil
+    }
+
+    private func configureReadingCore(for entry: BookEntry) {
+        let descriptors = chapters.enumerated().map { index, chapterURL in
+            ReadingChapterDescriptor(
+                index: index,
+                locator: relativeChapterPath(for: chapterURL),
+                title: chapterTitles.indices.contains(index)
+                    ? chapterTitles[index]
+                    : "第 \(index + 1) 章"
+            )
+        }
+        let document = ReadingDocument.make(
+            bookID: entry.bookHash,
+            bookHash: entry.bookHash,
+            title: entry.title,
+            chapters: descriptors
+        )
+        let provider = EPUBReadingTextProvider(
+            document: document,
+            maximumCachedChapters: 3
+        )
+        readingTextProvider = provider
+        readingAudioSession.bind(to: document)
+    }
+
+    @discardableResult
+    private func loadPDFBookEntry(_ entry: BookEntry) -> Bool {
+        let sourceURL = URL(fileURLWithPath: entry.sourceFilePath)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            statusLabel.stringValue = "PDF 文件缺失，请重新导入：\(entry.title)"
+            return false
+        }
+
+        currentBookEntry = entry
+        pdfPositionRestoreWorkItem?.cancel()
+        pdfPositionRestoreWorkItem = nil
+        pdfPositionSaveWorkItem?.cancel()
+        pdfPositionSaveWorkItem = nil
+        lastQueuedPDFPositionSignature = nil
+        suppressPDFPositionSave = true
+        bookTitleLabel.stringValue = entry.title
+        bookSwitcherButton.title = bookEntries.count > 1 ? "书籍(\(bookEntries.count))" : "书籍"
+        refreshLibraryWindow()
+        isPDFReadingMode = true
+        isComicReadingMode = false
+        readingTTSButton.isHidden = true
+        webView.isHidden = true
+        comicReader.webView.isHidden = true
+        pdfReader.view.isHidden = false
+        pdfAreaButton.isHidden = false
+        ReadingTTSControlStyle.setSymbol(
+            pdfAreaButton,
+            name: "square.dashed.inset.filled",
+            accessibilityDescription: "区域批注"
+        )
+        pdfAreaButton.setAccessibilityLabel("区域批注")
+        pdfAreaButton.toolTip = "区域批注"
+        bookRootURL = nil
+        chapters = []
+        chapterTitles = []
+        tocEntries = []
+        readerBookID = entry.apiBookID
+        if readerBookID == nil, readerAPIAvailable {
+            let byteSize = (try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? nil
+            readerBookID = readerAPI.createBook(
+                title: entry.title,
+                author: entry.author,
+                bookHash: entry.bookHash,
+                filePath: sourceURL.path,
+                sourceKind: "pdf",
+                fileHash: entry.bookHash,
+                byteSize: byteSize
+            )
+        }
+
+        let loaded = pdfReader.load(
+            url: sourceURL,
+            mode: pdfPageMode(for: entry),
+            viewportWidth: window.contentView?.bounds.width ?? window.frame.width
+        )
+        guard loaded else {
+            if !pdfReader.requiresPassword {
+                suppressPDFPositionSave = false
+            }
+            if pdfReader.requiresPassword {
+                promptForPDFPassword(entry: entry)
+                return true
+            } else {
+                statusLabel.stringValue = pdfReader.lastError
+            }
+            return false
+        }
+        contentsButton.setAccessibilityLabel("目录")
+        contentsButton.toolTip = "目录"
+        redAnnotationIDs = [:]
+        pdfHighlightIDs = [:]
+        pendingNoteJump = nil
+        restorePDFReadingPosition()
+        refreshNotes()
+        restorePDFAnnotations()
+        finishPDFPositionRestore(for: entry)
+        statusLabel.stringValue = "PDF 已打开 · 第 \(pdfReader.currentPageIndex + 1) / \(max(1, pdfReader.pageCount)) 页"
+        redLabel.stringValue = "\(pdfReader.currentPageIndex + 1)/\(max(1, pdfReader.pageCount))"
+        completePendingLibraryBookOpenIfReady()
+        return true
+    }
+
+    private func promptForPDFPassword(entry: BookEntry) {
+        let alert = NSAlert()
+        alert.messageText = "PDF 需要密码"
+        alert.informativeText = "《\(entry.title)》已安全导入，但阅读前需要输入文档密码。密码只用于本机解锁，不会保存。"
+        alert.addButton(withTitle: "解锁")
+        alert.addButton(withTitle: "取消")
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        field.placeholderString = "PDF 密码"
+        alert.accessoryView = field
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else {
+                self.pdfPositionRestoreWorkItem?.cancel()
+                self.pdfPositionRestoreWorkItem = nil
+                self.suppressPDFPositionSave = false
+                self.failPendingLibraryBookOpenIfNeeded(message: "已取消 PDF 解锁")
+                return
+            }
+            if self.pdfReader.unlock(password: field.stringValue) {
+                self.restorePDFReadingPosition()
+                self.refreshNotes()
+                self.restorePDFAnnotations()
+                self.finishPDFPositionRestore(for: entry)
+                self.statusLabel.stringValue = "PDF 已解锁"
+                self.completePendingLibraryBookOpenIfReady()
+            } else {
+                self.statusLabel.stringValue = self.pdfReader.lastError
+                self.promptForPDFPassword(entry: entry)
+            }
+        }
     }
 
     private func loadBookLibrary(defaultEntry: BookEntry) -> [BookEntry] {
@@ -2524,6 +20613,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if entry.isBundled {
             return entry
         }
+        if entry.effectiveSourceKind == "pdf" {
+            let sourceURL = URL(fileURLWithPath: entry.sourceFilePath)
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else { return nil }
+            return entry
+        }
         guard let root = ownedBookRootURL(for: entry.bookHash) else {
             return nil
         }
@@ -2544,7 +20638,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             bookHash: entry.bookHash,
             epubPath: epubCopy.path,
             bookRootPath: extractedRoot.path,
-            isBundled: false
+            isBundled: false,
+            sourceKind: "epub",
+            canonicalFilePath: epubCopy.path,
+            apiBookID: entry.apiBookID
         )
     }
 
@@ -2599,9 +20696,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         webView?.evaluateJavaScript("window.__sentenceReaderApplySettings && window.__sentenceReaderApplySettings(\(json));")
     }
 
+    private func comicPageMode(for entry: BookEntry) -> MacComicPageMode {
+        let key = "\(comicPageModeKeyPrefix).\(entry.bookHash)"
+        guard let raw = UserDefaults.standard.string(forKey: key),
+              let mode = MacComicPageMode(rawValue: raw)
+        else {
+            return .automatic
+        }
+        return mode
+    }
+
+    private func saveComicPageMode(_ mode: MacComicPageMode) {
+        guard let entry = currentBookEntry else { return }
+        let key = "\(comicPageModeKeyPrefix).\(entry.bookHash)"
+        UserDefaults.standard.set(mode.rawValue, forKey: key)
+        comicReader.setPageMode(mode)
+        statusLabel.stringValue = "漫画分页已保存：\(mode.title)"
+    }
+
+    private func pdfPageMode(for entry: BookEntry) -> MacPDFPageMode {
+        let key = "\(pdfPageModeKeyPrefix).\(entry.bookHash)"
+        guard let raw = UserDefaults.standard.string(forKey: key),
+              let mode = MacPDFPageMode(rawValue: raw)
+        else { return .automatic }
+        return mode
+    }
+
+    private func savePDFPageMode(_ mode: MacPDFPageMode) {
+        guard let entry = currentBookEntry else { return }
+        UserDefaults.standard.set(mode.rawValue, forKey: "\(pdfPageModeKeyPrefix).\(entry.bookHash)")
+        pdfReader.setPageMode(mode)
+        statusLabel.stringValue = "PDF 分页已保存：\(mode.title)"
+    }
+
+    @objc private func readerWindowDidResize(_ notification: Notification) {
+        let width = window.contentView?.bounds.width ?? window.frame.width
+        if isComicReadingMode {
+            comicReader.updateViewport(width: width)
+        } else if isPDFReadingMode {
+            pdfReader.updateViewport(width: width)
+        }
+    }
+
     @objc private func showReaderSettings(_ sender: NSButton) {
         let menu = NSMenu(title: "阅读设置")
         menu.autoenablesItems = false
+
+        if isPDFReadingMode {
+            let mode = pdfReader.pageMode
+            let summary = NSMenuItem(
+                title: "PDF 分页 · \(mode.title) · 当前\(pdfReader.effectiveDoublePage ? "双页" : "单页")",
+                action: nil,
+                keyEquivalent: ""
+            )
+            summary.isEnabled = false
+            menu.addItem(summary)
+            menu.addItem(.separator())
+            addReaderSettingItem("自动分页", action: "pdfAuto", to: menu, isOn: mode == .automatic)
+            addReaderSettingItem("固定单页", action: "pdfSingle", to: menu, isOn: mode == .single)
+            addReaderSettingItem("固定双页", action: "pdfDouble", to: menu, isOn: mode == .double)
+            addReaderSettingItem("连续滚动", action: "pdfContinuous", to: menu, isOn: mode == .continuous)
+            menu.addItem(.separator())
+            addReaderSettingItem(
+                pdfReader.pdfView.areaSelectionMode ? "关闭区域批注" : "扫描页区域批注",
+                action: "pdfArea",
+                to: menu,
+                isOn: pdfReader.pdfView.areaSelectionMode
+            )
+            addReaderSettingItem("搜索 PDF...", action: "pdfSearch", to: menu)
+            menu.popUp(positioning: menu.items.first, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+            return
+        }
+
+        if isComicReadingMode {
+            let mode = comicReader.pageMode
+            let summary = NSMenuItem(
+                title: "漫画分页 · \(mode.title) · 当前\(comicReader.usesDoublePage ? "双页" : "单页")",
+                action: nil,
+                keyEquivalent: ""
+            )
+            summary.isEnabled = false
+            menu.addItem(summary)
+            menu.addItem(.separator())
+            addReaderSettingItem("自动分页", action: "comicAuto", to: menu, isOn: mode == .automatic)
+            addReaderSettingItem("固定单页", action: "comicSingle", to: menu, isOn: mode == .single)
+            addReaderSettingItem("固定双页", action: "comicDouble", to: menu, isOn: mode == .double)
+            menu.popUp(positioning: menu.items.first, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+            return
+        }
 
         let summary = NSMenuItem(title: "字号 \(readerSettings.fontSize) · 行距 \(String(format: "%.2f", readerSettings.lineHeight)) · 边距 \(readerSettings.marginX)", action: nil, keyEquivalent: "")
         summary.isEnabled = false
@@ -2623,6 +20805,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         menu.popUp(positioning: menu.items.first, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
     }
 
+    @objc private func togglePDFAreaSelection(_ sender: NSButton) {
+        guard isPDFReadingMode else { return }
+        pdfReader.setAreaSelectionMode(!pdfReader.pdfView.areaSelectionMode)
+        revealReaderChromeTemporarily()
+    }
+
     private func addReaderSettingItem(_ title: String, action: String, to menu: NSMenu, isOn: Bool = false) {
         let item = NSMenuItem(title: title, action: #selector(changeReaderSetting(_:)), keyEquivalent: "")
         item.target = self
@@ -2635,6 +20823,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     @objc private func changeReaderSetting(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? String else {
             return
+        }
+        switch action {
+        case "pdfAuto":
+            savePDFPageMode(.automatic)
+            return
+        case "pdfSingle":
+            savePDFPageMode(.single)
+            return
+        case "pdfDouble":
+            savePDFPageMode(.double)
+            return
+        case "pdfContinuous":
+            savePDFPageMode(.continuous)
+            return
+        case "pdfArea":
+            togglePDFAreaSelection(pdfAreaButton)
+            return
+        case "pdfSearch":
+            showPDFSearchPanel()
+            return
+        case "comicAuto":
+            saveComicPageMode(.automatic)
+            return
+        case "comicSingle":
+            saveComicPageMode(.single)
+            return
+        case "comicDouble":
+            saveComicPageMode(.double)
+            return
+        default:
+            break
         }
         switch action {
         case "fontPlus":
@@ -2668,6 +20887,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func openRuntimeEnvironmentWindow() {
+        if let controller = runtimeEnvironmentWindowController,
+           controller.window != nil
+        {
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+            return
+        }
         let paths = currentFunASRRuntimePaths()
         let controller = RuntimeEnvironmentWindowController(
             funasrPython: paths.python,
@@ -2685,7 +20911,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             },
             openPath: { path in
                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            }
+            },
+            ttsProbeController: clickTTSGate0ProbeController
         )
         runtimeEnvironmentWindowController = controller
         controller.showWindow(nil)
@@ -2802,21 +21029,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         guard !funASRWarmupStarted else {
             return
         }
+        let warmGeneration = UUID()
+        funASRWarmGeneration = warmGeneration
         funASRWarmupStarted = true
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
+            func generationIsCurrent() -> Bool {
+                DispatchQueue.main.sync {
+                    self.funASRWarmGeneration == warmGeneration
+                        && self.funASRWarmupStarted
+                }
+            }
             let paths = self.currentFunASRRuntimePaths()
             let pythonURL = URL(fileURLWithPath: self.expandedPath(paths.python))
             let workerURL = URL(fileURLWithPath: self.expandedPath(paths.worker))
             guard FileManager.default.isExecutableFile(atPath: pythonURL.path),
                   FileManager.default.fileExists(atPath: workerURL.path)
             else {
+                DispatchQueue.main.async {
+                    guard self.funASRWarmGeneration
+                            == warmGeneration
+                    else {
+                        return
+                    }
+                    self.funASRWarmupStarted = false
+                }
                 return
             }
 
             if self.isFunASRServerHealthy(timeout: 0.8) {
                 DispatchQueue.main.async {
+                    guard self.funASRWarmGeneration
+                            == warmGeneration,
+                          self.funASRWarmupStarted
+                    else {
+                        return
+                    }
                     self.statusLabel.stringValue = "FunASR 后台服务已就绪"
                 }
                 return
@@ -2850,16 +21099,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 ]
                 process.standardOutput = logHandle
                 process.standardError = logHandle
+                guard generationIsCurrent() else {
+                    try? logHandle.close()
+                    return
+                }
                 try process.run()
 
                 DispatchQueue.main.async {
+                    guard self.funASRWarmGeneration
+                            == warmGeneration,
+                          self.funASRWarmupStarted
+                    else {
+                        if process.isRunning {
+                            process.terminate()
+                        }
+                        return
+                    }
                     self.funASRServerProcess = process
                     self.statusLabel.stringValue = "FunASR 正在后台预热..."
                 }
 
                 for _ in 0..<120 {
+                    guard generationIsCurrent() else {
+                        if process.isRunning {
+                            process.terminate()
+                        }
+                        return
+                    }
                     if self.isFunASRServerHealthy(timeout: 1.0) {
                         DispatchQueue.main.async {
+                            guard self.funASRWarmGeneration
+                                    == warmGeneration,
+                                  self.funASRWarmupStarted
+                            else {
+                                return
+                            }
                             self.statusLabel.stringValue = "FunASR 后台服务已就绪"
                         }
                         return
@@ -2869,6 +21143,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                             if self.funASRServerProcess === process {
                                 self.funASRServerProcess = nil
                             }
+                            if self.funASRWarmGeneration
+                                == warmGeneration {
+                                self.funASRWarmupStarted = false
+                            }
                         }
                         return
                     }
@@ -2876,12 +21154,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 }
 
                 DispatchQueue.main.async {
-                    if process.isRunning {
-                        self.statusLabel.stringValue = "FunASR 仍在后台加载，首次语音可能稍慢"
+                    guard self.funASRWarmGeneration
+                            == warmGeneration,
+                          self.funASRWarmupStarted,
+                          process.isRunning
+                    else {
+                        return
                     }
+                    self.statusLabel.stringValue = "FunASR 仍在后台加载，首次语音可能稍慢"
                 }
             } catch {
                 DispatchQueue.main.async {
+                    guard self.funASRWarmGeneration
+                            == warmGeneration
+                    else {
+                        return
+                    }
+                    self.funASRWarmupStarted = false
                     self.statusLabel.stringValue = "FunASR 后台预热未启动，语音会自动使用原转写路径"
                 }
             }
@@ -2889,6 +21178,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func stopFunASRWarmService() {
+        funASRWarmGeneration = UUID()
+        funASRWarmupStarted = false
         guard let process = funASRServerProcess else {
             return
         }
@@ -2900,7 +21191,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     private func restartFunASRWarmServiceAfterConfigurationChange() {
         stopFunASRWarmService()
-        funASRWarmupStarted = false
         refreshSpeechWarmServiceForCurrentProvider()
     }
 
@@ -3027,20 +21317,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
     @objc private func openBookPanel(_ sender: NSButton) {
         let panel = NSOpenPanel()
-        panel.title = "打开 EPUB"
+        panel.title = "打开 EPUB 或 PDF"
         panel.prompt = "打开"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if let epubType = UTType(filenameExtension: "epub") {
-            panel.allowedContentTypes = [epubType]
-        }
+        panel.allowedContentTypes = [UTType.epub, UTType.pdf]
         guard panel.runModal() == .OK,
               let url = panel.url
         else {
             return
         }
-        importEPUB(url)
+        importBook(url)
     }
 
     @objc private func showLibraryWindow(_ sender: Any?) {
@@ -3048,6 +21336,305 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    #if false // Legacy embedded Voice Inbox ownership moved to Click Voice.app.
+    private func voiceInboxURL() -> URL? {
+        var components = URLComponents(url: ReaderAPIClient.configuredBaseURL().appendingPathComponent("voice-inbox"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "surface", value: "mac-app")]
+        return components?.url
+    }
+
+    private func isVoiceInboxVisible() -> Bool {
+        guard libraryHomeWebView?.isHidden == false,
+              libraryHomeWebView?.url?.path == "/voice-inbox"
+        else {
+            return false
+        }
+        return true
+    }
+
+    @objc private func openVoiceInboxFromMenu(_ sender: Any?) {
+        showVoiceInbox(autoStartRecording: false)
+    }
+
+    @objc private func toggleVoiceInboxRecordingFromMenu(_ sender: Any?) {
+        showVoiceInbox(autoStartRecording: true)
+    }
+
+    private func showVoiceInbox(autoStartRecording: Bool) {
+        guard ensureReaderAPIForLibraryUI(),
+              let libraryHomeWebView,
+              let url = voiceInboxURL()
+        else {
+            statusLabel.stringValue = "Voice Inbox 需要 Reader API，当前无法打开"
+            refreshVoiceInboxMenu()
+            return
+        }
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        libraryHomeWebView.isHidden = false
+        mainTitlebarDragView?.isHidden = false
+        setReaderChromeVisible(false)
+        window.title = "Click Voice Inbox"
+
+        if isVoiceInboxVisible() {
+            if autoStartRecording {
+                triggerVoiceInboxRecordingToggle(after: 0.05)
+            }
+            statusLabel.stringValue = autoStartRecording ? "Voice Inbox 录音快捷键已触发" : "已打开 Voice Inbox"
+            refreshVoiceInboxMenu()
+            return
+        }
+
+        pendingVoiceInboxAutoRecord = autoStartRecording
+        libraryHomeWebView.load(URLRequest(url: url))
+        statusLabel.stringValue = autoStartRecording ? "正在打开 Voice Inbox 并准备录音..." : "正在打开 Voice Inbox..."
+        refreshVoiceInboxMenu()
+    }
+
+    private func triggerVoiceInboxRecordingToggle(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  let libraryHomeWebView
+            else {
+                return
+            }
+            let script = """
+            (function(){
+              if (window.__clickVoiceInboxToggleRecording) {
+                window.__clickVoiceInboxToggleRecording();
+                return 'ok';
+              }
+              var start = document.getElementById('start');
+              if (start) { start.click(); return 'fallback-start'; }
+              return 'missing';
+            })();
+            """
+            libraryHomeWebView.evaluateJavaScript(script) { result, error in
+                if let error {
+                    self.statusLabel.stringValue = "Voice Inbox 录音触发失败：\(error.localizedDescription)"
+                } else if String(describing: result ?? "") == "missing" {
+                    self.statusLabel.stringValue = "Voice Inbox 页面尚未准备好，请再按一次录音快捷键"
+                } else {
+                    self.statusLabel.stringValue = "Voice Inbox 录音入口已触发"
+                }
+                self.refreshVoiceInboxMenu()
+            }
+        }
+    }
+
+    private func installVoiceInboxMenuBar() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.title = "Click Voice"
+        item.button?.toolTip = "Click Voice Inbox"
+        voiceStatusItem = item
+        let menu = NSMenu(title: "Click Voice Inbox")
+        menu.autoenablesItems = false
+        item.menu = menu
+        voiceStatusMenu = menu
+        rebuildVoiceInboxMenu(status: "Reader API 正在检查", records: [])
+    }
+
+    private func rebuildVoiceInboxMenu(status: String, records: [[String: Any]]) {
+        guard let menu = voiceStatusMenu else { return }
+        menu.removeAllItems()
+
+        let openItem = NSMenuItem(title: "打开 Voice Inbox", action: #selector(openVoiceInboxFromMenu(_:)), keyEquivalent: "v")
+        openItem.keyEquivalentModifierMask = [.control, .option]
+        openItem.target = self
+        menu.addItem(openItem)
+
+        let recordItem = NSMenuItem(title: "开始/停止录音", action: #selector(toggleVoiceInboxRecordingFromMenu(_:)), keyEquivalent: "r")
+        recordItem.keyEquivalentModifierMask = [.control, .option]
+        recordItem.target = self
+        menu.addItem(recordItem)
+
+        let libraryItem = NSMenuItem(title: "打开 Click 首页", action: #selector(showLibraryWindow(_:)), keyEquivalent: "")
+        libraryItem.target = self
+        menu.addItem(libraryItem)
+
+        let refreshItem = NSMenuItem(title: "刷新状态", action: #selector(refreshVoiceInboxMenuFromMenu(_:)), keyEquivalent: "")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
+
+        menu.addItem(NSMenuItem.separator())
+        let statusItem = NSMenuItem(title: status, action: nil, keyEquivalent: "")
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+        let hotKeyItem = NSMenuItem(title: voiceHotKeyStatus, action: nil, keyEquivalent: "")
+        hotKeyItem.isEnabled = false
+        menu.addItem(hotKeyItem)
+
+        menu.addItem(NSMenuItem.separator())
+        let recentTitle = NSMenuItem(title: "最近语音", action: nil, keyEquivalent: "")
+        recentTitle.isEnabled = false
+        menu.addItem(recentTitle)
+        if records.isEmpty {
+            let empty = NSMenuItem(title: "暂无可见记录", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        } else {
+            for record in records.prefix(5) {
+                let title = String(describing: record["title"] ?? "未命名语音")
+                let status = voiceRecordStatusTitle(String(describing: record["status"] ?? "unknown"))
+                let source = voiceRecordSourceTitle(String(describing: record["source"] ?? "unknown"))
+                let item = NSMenuItem(title: "\(status) · \(source) · \(title)", action: #selector(openVoiceInboxFromMenu(_:)), keyEquivalent: "")
+                item.target = self
+                menu.addItem(item)
+            }
+        }
+
+        menu.addItem(NSMenuItem.separator())
+        let quitItem = NSMenuItem(title: "退出 Click", action: #selector(quitApplication(_:)), keyEquivalent: "q")
+        quitItem.keyEquivalentModifierMask = [.command]
+        quitItem.target = self
+        menu.addItem(quitItem)
+    }
+
+    @objc private func refreshVoiceInboxMenuFromMenu(_ sender: Any?) {
+        refreshVoiceInboxMenu()
+    }
+
+    private func refreshVoiceInboxMenu() {
+        DispatchQueue.global(qos: .utility).async { [readerAPI = self.readerAPI, weak self] in
+            let apiOK = readerAPI.health()
+            let diagnostics = apiOK ? readerAPI.mobileDiagnostics() : nil
+            let records = apiOK ? readerAPI.listVoiceRecords(limit: 5) : []
+            let status: String
+            if apiOK {
+                let hermes = Self.diagnosticTitle(diagnostics, key: "hermes")
+                let funasr = Self.diagnosticTitle(diagnostics, key: "funasr")
+                status = "Reader API 可用 · Hermes \(hermes) · FunASR \(funasr)"
+            } else {
+                status = "Reader API 未连接，打开入口时会尝试启动"
+            }
+            DispatchQueue.main.async {
+                self?.rebuildVoiceInboxMenu(status: status, records: records)
+            }
+        }
+    }
+
+    private static func diagnosticTitle(_ diagnostics: [String: Any]?, key: String) -> String {
+        guard let section = diagnostics?[key] as? [String: Any] else {
+            return "未检查"
+        }
+        return section["ok"] as? Bool == true ? "可用" : "未连接"
+    }
+
+    private func voiceRecordStatusTitle(_ status: String) -> String {
+        switch status {
+        case "transcribe_pending": return "待转写"
+        case "understand_pending": return "待理解"
+        case "needs_user_confirmation": return "需确认"
+        case "needs_followup": return "需追问"
+        case "action_applied": return "已处理"
+        case "settled": return "已沉淀"
+        case "archived": return "已归档"
+        case "failed_transcribe": return "转写失败"
+        case "failed_understand": return "理解失败"
+        case "failed_action": return "动作失败"
+        default: return status
+        }
+    }
+
+    private func voiceRecordSourceTitle(_ source: String) -> String {
+        switch source {
+        case "mac": return "Mac"
+        case "click_mobile": return "手机"
+        case "import": return "导入"
+        case "platform_forward": return "平台"
+        case "browser": return "浏览器"
+        default: return source
+        }
+    }
+
+    private func installVoiceInboxHotKeys() {
+        var eventSpec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let handlerStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, eventRef, userData in
+                guard let eventRef,
+                      let userData
+                else {
+                    return noErr
+                }
+                var hotKeyID = EventHotKeyID()
+                let status = GetEventParameter(
+                    eventRef,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKeyID
+                )
+                guard status == noErr else {
+                    return status
+                }
+                let appDelegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    appDelegate.handleVoiceInboxHotKey(id: hotKeyID.id)
+                }
+                return noErr
+            },
+            1,
+            &eventSpec,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &voiceHotKeyHandlerRef
+        )
+        guard handlerStatus == noErr else {
+            voiceHotKeyStatus = "快捷键注册失败：\(handlerStatus)"
+            return
+        }
+
+        voiceOpenHotKeyRef = registerVoiceInboxHotKey(keyCode: kVK_ANSI_V, id: VoiceInboxHotKey.openID)
+        voiceRecordHotKeyRef = registerVoiceInboxHotKey(keyCode: kVK_ANSI_R, id: VoiceInboxHotKey.recordID)
+        if voiceOpenHotKeyRef == nil || voiceRecordHotKeyRef == nil {
+            voiceHotKeyStatus = "快捷键部分被占用：菜单栏仍可用"
+        }
+    }
+
+    private func registerVoiceInboxHotKey(keyCode: Int, id: UInt32) -> EventHotKeyRef? {
+        let hotKeyID = EventHotKeyID(signature: VoiceInboxHotKey.signature, id: id)
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            UInt32(keyCode),
+            UInt32(controlKey | optionKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &ref
+        )
+        return status == noErr ? ref : nil
+    }
+
+    private func handleVoiceInboxHotKey(id: UInt32) {
+        switch id {
+        case VoiceInboxHotKey.openID:
+            showVoiceInbox(autoStartRecording: false)
+        case VoiceInboxHotKey.recordID:
+            showVoiceInbox(autoStartRecording: true)
+        default:
+            break
+        }
+    }
+
+    private func uninstallVoiceInboxHotKeys() {
+        if let voiceOpenHotKeyRef {
+            UnregisterEventHotKey(voiceOpenHotKeyRef)
+            self.voiceOpenHotKeyRef = nil
+        }
+        if let voiceRecordHotKeyRef {
+            UnregisterEventHotKey(voiceRecordHotKeyRef)
+            self.voiceRecordHotKeyRef = nil
+        }
+        if let voiceHotKeyHandlerRef {
+            RemoveEventHandler(voiceHotKeyHandlerRef)
+            self.voiceHotKeyHandlerRef = nil
+        }
+    }
+    #endif
 
     private func ensureReaderAPIForLibraryUI() -> Bool {
         if readerAPI.health() {
@@ -3078,12 +21665,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         window.title = "Click 书库"
         window.minSize = NSSize(width: 920, height: 620)
         let config = WKWebViewConfiguration()
+        config.userContentController.add(self, name: "sentenceReader")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
         window.contentView = webView
-        if let url = URL(string: "http://127.0.0.1:18180/library?surface=mac-app") {
+        if let url = mainLibraryURL() {
             webView.load(URLRequest(url: url))
         }
         window.center()
@@ -3098,21 +21686,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         completionHandler: @escaping ([URL]?) -> Void
     ) {
         let panel = NSOpenPanel()
-        panel.title = "导入 EPUB"
+        panel.title = "导入 EPUB 或 PDF"
         panel.prompt = "导入"
         panel.allowsMultipleSelection = parameters.allowsMultipleSelection
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.allowedContentTypes = [.epub]
+        panel.allowedContentTypes = [.epub, .pdf]
         panel.begin { response in
             completionHandler(response == .OK ? panel.urls : nil)
         }
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        let isMainLibraryWebView = libraryHomeWebView.map { webView === $0 } ?? false
-        let isDetachedLibraryWebView = (libraryWindowController?.window?.contentView as? WKWebView).map { webView === $0 } ?? false
-        guard (isMainLibraryWebView || isDetachedLibraryWebView),
+        if webView === self.webView,
+           navigationAction.navigationType == .linkActivated,
+           let url = navigationAction.request.url,
+           let chapterIndex = readerChapterIndex(forNavigationURL: url) {
+            if url.fragment != nil,
+               let currentURL = webView.url,
+               readerNavigationResourceURL(currentURL) == readerNavigationResourceURL(url) {
+                decisionHandler(.allow)
+                return
+            }
+            decisionHandler(.cancel)
+            markReadingTTSManualBrowse()
+            loadChapter(at: chapterIndex, initialPage: .start)
+            return
+        }
+
+        guard isLibraryWebView(webView),
               let url = navigationAction.request.url,
               let bookID = nativeLibraryBookID(from: url)
         else {
@@ -3121,7 +21723,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
 
         decisionHandler(.cancel)
-        openNativeReaderFromLibraryBookID(bookID)
+        openNativeReaderFromLibraryBookID(bookID, sourceWebView: webView)
+    }
+
+    private func readerChapterIndex(forNavigationURL url: URL) -> Int? {
+        guard let targetURL = readerNavigationResourceURL(url) else {
+            return nil
+        }
+        return nearestChapterIndex(for: targetURL, chapters: chapters)
+    }
+
+    private func readerNavigationResourceURL(_ url: URL) -> URL? {
+        guard url.isFileURL,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
+        components.fragment = nil
+        components.query = nil
+        return components.url?.standardizedFileURL
     }
 
     private func nativeLibraryBookID(from url: URL) -> String? {
@@ -3143,15 +21763,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return bookID
     }
 
-    private func openNativeReaderFromLibraryBookID(_ bookID: String) {
+    private func isLibraryWebView(_ candidate: WKWebView?) -> Bool {
+        guard let candidate else { return false }
+        if candidate === libraryHomeWebView { return true }
+        return candidate === (libraryWindowController?.window?.contentView as? WKWebView)
+    }
+
+    private func publishLibraryBookOpenState(
+        _ phase: String,
+        bookID: String,
+        requestID: String,
+        message: String,
+        to webView: WKWebView?
+    ) {
+        guard let webView,
+              let data = try? JSONSerialization.data(
+                  withJSONObject: [
+                      "phase": phase,
+                      "book_id": bookID,
+                      "request_id": requestID,
+                      "message": message,
+                  ],
+                  options: []
+              ),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return
+        }
+        webView.evaluateJavaScript("window.__clickNativeBookOpenState && window.__clickNativeBookOpenState(\(json));")
+    }
+
+    private func isPendingLibraryBookOpen(bookID: String, requestID: String) -> Bool {
+        guard case let .opening(activeBookID, activeRequestID) = libraryOpenSurfaceState else {
+            return false
+        }
+        return activeBookID == bookID && activeRequestID == requestID
+    }
+
+    private func failPendingLibraryBookOpenIfNeeded(message: String) {
+        guard case let .opening(bookID, requestID) = libraryOpenSurfaceState else {
+            return
+        }
+        let sourceWebView = libraryOpenSourceWebView
+        libraryOpenSurfaceState = .failed(bookID: bookID, requestID: requestID)
+        statusLabel.stringValue = message
+        publishLibraryBookOpenState("failed", bookID: bookID, requestID: requestID, message: message, to: sourceWebView)
+        revealMainLibraryAfterFailedOpen(from: sourceWebView)
+        libraryOpenSourceWebView = nil
+    }
+
+    private func completePendingLibraryBookOpenIfReady() {
+        guard case let .opening(bookID, requestID) = libraryOpenSurfaceState,
+              let entry = currentBookEntry,
+              entry.apiBookID == bookID || readerBookID == bookID
+        else {
+            return
+        }
+        let sourceWebView = libraryOpenSourceWebView
+        libraryOpenSurfaceState = .reading(bookID: bookID)
+        publishLibraryBookOpenState("opened", bookID: bookID, requestID: requestID, message: "正文已打开", to: sourceWebView)
+        libraryOpenSourceWebView = nil
+        hideMainLibraryForReading()
+        libraryWindowController?.window?.close()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        statusLabel.stringValue = "已用原生阅读器打开：\(entry.title)"
+    }
+
+    private func openNativeReaderFromLibraryBookID(
+        _ rawBookID: String,
+        sourceWebView: WKWebView? = nil,
+        requestID: String? = nil
+    ) {
+        let bookID = rawBookID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !bookID.isEmpty else { return }
+        let resolvedRequestID = requestID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? requestID!
+            : UUID().uuidString
+        if case let .opening(activeBookID, _) = libraryOpenSurfaceState {
+            let message = activeBookID == bookID ? "正在打开这本书..." : "正在打开另一本书，请稍候"
+            publishLibraryBookOpenState(
+                activeBookID == bookID ? "opening" : "failed",
+                bookID: bookID,
+                requestID: resolvedRequestID,
+                message: message,
+                to: sourceWebView
+            )
+            return
+        }
+        libraryOpenSurfaceState = .opening(bookID: bookID, requestID: resolvedRequestID)
+        libraryOpenSourceWebView = sourceWebView
         statusLabel.stringValue = "正在用原生阅读器打开书库书籍..."
+        publishLibraryBookOpenState("opening", bookID: bookID, requestID: resolvedRequestID, message: "正在打开正文...", to: sourceWebView)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             guard let dashboard = self.readerAPI.libraryDashboard(),
                   let book = self.libraryDashboardBook(bookID: bookID, dashboard: dashboard)
             else {
                 DispatchQueue.main.async {
-                    self.statusLabel.stringValue = "书库没有找到这本书：\(bookID)"
+                    guard self.isPendingLibraryBookOpen(bookID: bookID, requestID: resolvedRequestID) else { return }
+                    self.failPendingLibraryBookOpenIfNeeded(message: "书库没有找到这本书")
                 }
                 return
             }
@@ -3159,14 +21870,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             do {
                 let entry = try self.nativeBookEntry(fromLibraryBook: book)
                 DispatchQueue.main.async {
+                    guard self.isPendingLibraryBookOpen(bookID: bookID, requestID: resolvedRequestID) else { return }
                     self.upsertAndLoadNativeLibraryEntry(entry)
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.statusLabel.stringValue = "原生阅读器打开失败：\(error.localizedDescription)"
+                    guard self.isPendingLibraryBookOpen(bookID: bookID, requestID: resolvedRequestID) else { return }
+                    self.failPendingLibraryBookOpenIfNeeded(message: "原生阅读器打开失败：\(error.localizedDescription)")
                 }
             }
         }
+    }
+
+    private func openPendingExternalReaderBooks() {
+        guard didFinishLaunching, let bookID = pendingExternalBookIDs.last else {
+            return
+        }
+        pendingExternalBookIDs.removeAll()
+        openNativeReaderFromLibraryBookID(bookID)
     }
 
     private func libraryDashboardBook(bookID: String, dashboard: [String: Any]) -> [String: Any]? {
@@ -3181,16 +21902,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return nil
     }
 
+    private func nativeLibraryEntryCanLoad(_ entry: BookEntry) -> Bool {
+        let fileManager = FileManager.default
+        if entry.effectiveSourceKind == "pdf" {
+            return fileManager.fileExists(atPath: entry.sourceFilePath)
+        }
+        let epubURL = URL(fileURLWithPath: entry.epubPath)
+        let rootURL = URL(fileURLWithPath: entry.bookRootPath, isDirectory: true)
+        return isOwnedImportedBookFile(epubURL)
+            && fileManager.fileExists(atPath: epubURL.path)
+            && extractedEPUBRootIsUsable(rootURL)
+    }
+
     private func nativeBookEntry(fromLibraryBook book: [String: Any]) throws -> BookEntry {
         let title = ((book["title"] as? String) ?? "未命名").trimmingCharacters(in: .whitespacesAndNewlines)
         let author = book["author"] as? String
+        let sourceKind = ((book["source_kind"] as? String) ?? "epub").lowercased()
+        let apiBookID = book["id"] as? String
         guard let rawBookHash = book["book_hash"] as? String,
               !rawBookHash.isEmpty
         else {
             throw NSError(domain: "SentenceReader.LibraryBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "缺少 book_hash"])
         }
 
-        if let existing = bookEntries.first(where: { $0.bookHash == rawBookHash }) {
+        if let existing = bookEntries.first(where: { $0.bookHash == rawBookHash && $0.effectiveSourceKind == sourceKind }),
+           nativeLibraryEntryCanLoad(existing) {
             return existing
         }
 
@@ -3198,11 +21934,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         guard let filePath = file["file_path"] as? String,
               !filePath.isEmpty
         else {
-            throw NSError(domain: "SentenceReader.LibraryBridge", code: 2, userInfo: [NSLocalizedDescriptionKey: "缺少 EPUB 文件路径"])
+            throw NSError(domain: "SentenceReader.LibraryBridge", code: 2, userInfo: [NSLocalizedDescriptionKey: "缺少书籍文件路径"])
         }
         let sourceURL = URL(fileURLWithPath: filePath)
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
-            throw NSError(domain: "SentenceReader.LibraryBridge", code: 3, userInfo: [NSLocalizedDescriptionKey: "EPUB 文件不存在：\(filePath)"])
+            throw NSError(domain: "SentenceReader.LibraryBridge", code: 3, userInfo: [NSLocalizedDescriptionKey: "书籍文件不存在：\(filePath)"])
+        }
+
+        if sourceKind == "pdf" || sourceURL.pathExtension.lowercased() == "pdf" {
+            return BookEntry(
+                title: title.isEmpty ? sourceURL.deletingPathExtension().lastPathComponent : title,
+                author: author,
+                bookHash: rawBookHash,
+                epubPath: sourceURL.path,
+                bookRootPath: sourceURL.deletingLastPathComponent().path,
+                isBundled: false,
+                sourceKind: "pdf",
+                canonicalFilePath: sourceURL.path,
+                apiBookID: apiBookID
+            )
         }
 
         if let bundled = bundledBookEntryIfMatches(bookHash: rawBookHash, fileURL: sourceURL) {
@@ -3234,7 +21984,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             bookHash: rawBookHash,
             epubPath: epubURL.path,
             bookRootPath: extractedRoot.path,
-            isBundled: false
+            isBundled: false,
+            sourceKind: "epub",
+            canonicalFilePath: epubURL.path,
+            apiBookID: apiBookID
         )
     }
 
@@ -3247,13 +22000,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         guard bookHash == defaultHash || fileURL.standardizedFileURL.path == defaultEPUB.standardizedFileURL.path else {
             return nil
         }
+        return writableBundledBookEntry(resourceURL: resourceURL)
+    }
+
+    private func writableBundledBookEntry(resourceURL: URL) -> BookEntry? {
+        let defaultHash = "sentence-reader-default-good-strategy-bad-strategy-v1"
+        let packagedEPUB = resourceURL.appendingPathComponent("default-fixture.epub")
+        let packagedBookRoot = resourceURL.appendingPathComponent("default-book", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: packagedEPUB.path),
+              FileManager.default.fileExists(atPath: packagedBookRoot.path),
+              let packageHash = fileHash(for: packagedEPUB),
+              let booksDirectory = try? appSupportBooksDirectory()
+        else {
+            return nil
+        }
+
+        let version = String(packageHash.prefix(16))
+        let runtimeRoot = booksDirectory.appendingPathComponent(
+            "bundled-default-\(version)",
+            isDirectory: true
+        )
+        let runtimeEPUB = runtimeRoot.appendingPathComponent("book.epub")
+        let runtimeBookRoot = runtimeRoot.appendingPathComponent("book", isDirectory: true)
+        let readyMarker = runtimeRoot.appendingPathComponent(".click-bundled-copy-ready-v1")
+        let fileManager = FileManager.default
+
+        if !fileManager.fileExists(atPath: readyMarker.path) {
+            let stagingRoot = booksDirectory.appendingPathComponent(
+                ".bundled-default-\(version)-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            let stagingEPUB = stagingRoot.appendingPathComponent("book.epub")
+            let stagingBookRoot = stagingRoot.appendingPathComponent("book", isDirectory: true)
+            do {
+                try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+                try fileManager.copyItem(at: packagedEPUB, to: stagingEPUB)
+                try fileManager.copyItem(at: packagedBookRoot, to: stagingBookRoot)
+                try "click.bundled_book.runtime_copy.v1\n".write(
+                    to: stagingRoot.appendingPathComponent(readyMarker.lastPathComponent),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                if fileManager.fileExists(atPath: runtimeRoot.path) {
+                    // A prior incomplete generated copy is left untouched; use this valid staging copy.
+                    return BookEntry(
+                        title: "Click 示例书",
+                        author: "Click",
+                        bookHash: defaultHash,
+                        epubPath: stagingEPUB.path,
+                        bookRootPath: stagingBookRoot.path,
+                        isBundled: true,
+                        sourceKind: "epub",
+                        canonicalFilePath: stagingEPUB.path
+                    )
+                }
+                try fileManager.moveItem(at: stagingRoot, to: runtimeRoot)
+            } catch {
+                try? fileManager.removeItem(at: stagingRoot)
+                return nil
+            }
+        }
+
+        guard fileManager.fileExists(atPath: runtimeEPUB.path),
+              fileManager.fileExists(atPath: runtimeBookRoot.path)
+        else {
+            return nil
+        }
         return BookEntry(
             title: "Click 示例书",
             author: "Click",
             bookHash: defaultHash,
-            epubPath: defaultEPUB.path,
-            bookRootPath: resourceURL.appendingPathComponent("default-book", isDirectory: true).path,
-            isBundled: true
+            epubPath: runtimeEPUB.path,
+            bookRootPath: runtimeBookRoot.path,
+            isBundled: true,
+            sourceKind: "epub",
+            canonicalFilePath: runtimeEPUB.path
         )
     }
 
@@ -3271,12 +22092,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             bookEntries.append(entry)
         }
         saveBookLibrary()
-        loadBookEntry(entry)
-        hideMainLibraryForReading()
-        libraryWindowController?.window?.close()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        statusLabel.stringValue = "已用原生阅读器打开：\(entry.title)"
+        guard loadBookEntry(entry) else {
+            let detail = statusLabel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            failPendingLibraryBookOpenIfNeeded(message: detail.isEmpty ? "原生阅读器无法加载这本书" : detail)
+            return
+        }
+        if entry.effectiveSourceKind != "pdf" {
+            statusLabel.stringValue = "正在等待正文加载完成：\(entry.title)"
+        }
     }
 
     private func buildLibraryWindowController() -> NSWindowController {
@@ -3297,7 +22120,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         title.font = NSFont(name: "Microsoft YaHei", size: 20) ?? NSFont.systemFont(ofSize: 20, weight: .semibold)
         title.textColor = .labelColor
 
-        let subtitle = NSTextField(labelWithString: "所有导入的 EPUB 会复制进 Click 内部书库；导入成功后原 EPUB 可删除。")
+        let subtitle = NSTextField(labelWithString: "EPUB 进入 Click 内部书库；PDF 进入 KnowledgeBase canonical 原书目录。导入成功后原文件可删除。")
         subtitle.font = NSFont(name: "Microsoft YaHei", size: 12) ?? NSFont.systemFont(ofSize: 12)
         subtitle.textColor = .secondaryLabelColor
         subtitle.lineBreakMode = .byTruncatingTail
@@ -3307,7 +22130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         summary.textColor = .secondaryLabelColor
         librarySummaryLabel = summary
 
-        let importButton = NSButton(title: "导入 EPUB", target: self, action: #selector(importBookFromLibrary(_:)))
+        let importButton = NSButton(title: "导入书籍", target: self, action: #selector(importBookFromLibrary(_:)))
         let openButton = NSButton(title: "打开所选", target: self, action: #selector(openSelectedLibraryBook(_:)))
         let revealButton = NSButton(title: "显示内部副本", target: self, action: #selector(revealSelectedLibraryBook(_:)))
         let removeButton = NSButton(title: "从书库移除", target: self, action: #selector(removeSelectedLibraryBook(_:)))
@@ -3446,7 +22269,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if entry.isBundled {
             return "随 App 资源提供 · 不从书库移除"
         }
-        return "已托管：\(entry.epubPath) · 原 EPUB 可删除"
+        return entry.effectiveSourceKind == "pdf"
+            ? "PDF canonical：\(entry.sourceFilePath) · 批注独立保存"
+            : "已托管：\(entry.epubPath) · 原 EPUB 可删除"
     }
 
     private func selectedLibraryEntry() -> (index: Int, entry: BookEntry)? {
@@ -3478,9 +22303,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         guard let selected = selectedLibraryEntry() else {
             return
         }
-        let url = URL(fileURLWithPath: selected.entry.epubPath)
+        let url = URL(fileURLWithPath: selected.entry.sourceFilePath)
         NSWorkspace.shared.activateFileViewerSelecting([url])
-        statusLabel.stringValue = "已在 Finder 中显示内部 EPUB 副本"
+        statusLabel.stringValue = "已在 Finder 中显示 Click 托管原书"
     }
 
     @objc private func removeSelectedLibraryBook(_ sender: Any?) {
@@ -3494,7 +22319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         let alert = NSAlert()
         alert.messageText = "从书库移除《\(selected.entry.title)》？"
-        alert.informativeText = "这只会移除书库列表索引，不删除内部 EPUB 副本、阅读位置、标红、笔记或 PostgreSQL 数据。需要恢复时可以重新导入同一本 EPUB。"
+        alert.informativeText = "这只会移除书库列表索引，不删除托管原书、阅读位置、标红、笔记或 PostgreSQL 数据。需要恢复时可以重新导入同一本书。"
         alert.addButton(withTitle: "从书库移除")
         alert.addButton(withTitle: "取消")
         alert.alertStyle = .warning
@@ -3541,7 +22366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let openItem = NSMenuItem(title: "打开 EPUB...", action: #selector(openBookFromMenu(_:)), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "打开 EPUB / PDF...", action: #selector(openBookFromMenu(_:)), keyEquivalent: "")
         openItem.target = self
         openItem.isEnabled = true
         menu.addItem(openItem)
@@ -3562,7 +22387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     @objc private func showReaderMoreMenu(_ sender: NSButton) {
         let menu = NSMenu(title: "更多")
         let items: [(String, Selector)] = [
-            ("打开 EPUB...", #selector(openBookFromMenu(_:))),
+            ("打开 EPUB / PDF...", #selector(openBookFromMenu(_:))),
             ("切换书籍", #selector(showBookSwitcherFromMenu(_:))),
             ("单词本", #selector(showVocabularyFromMenu(_:))),
             ("导出笔记", #selector(exportCurrentBookFromMenu(_:))),
@@ -3632,6 +22457,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         statusLabel.stringValue = "已打开当前书的单词本"
     }
 
+    private func importBook(_ url: URL) {
+        if isStageBVisibleAcceptanceRequested {
+            guard let fixtureURL =
+                    stageBVisibleAcceptanceFixtureURL,
+                  !stageBVisibleFixtureImportStarted,
+                  url.standardizedFileURL.path
+                    == fixtureURL.path
+            else {
+                rejectStageBVisibleExternalOpen()
+                return
+            }
+            stageBVisibleFixtureImportStarted = true
+        }
+        switch url.pathExtension.lowercased() {
+        case "epub":
+            importEPUB(url)
+        case "pdf":
+            importPDF(url)
+        default:
+            statusLabel.stringValue = "只支持 EPUB 和 PDF 文件"
+        }
+    }
+
+    private func importPDF(_ url: URL) {
+        guard ensureReaderAPIForLibraryUI() else {
+            statusLabel.stringValue = "PDF 导入需要本机 Reader API"
+            return
+        }
+        statusLabel.stringValue = "正在导入 PDF 到 KnowledgeBase..."
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            guard let result = self.readerAPI.importBook(url: url),
+                  result["ok"] as? Bool == true,
+                  let book = result["book"] as? [String: Any],
+                  let bookHash = book["book_hash"] as? String,
+                  let canonicalPath = (result["canonical_source_file"] as? String) ?? (result["file_path"] as? String)
+            else {
+                DispatchQueue.main.async {
+                    self.statusLabel.stringValue = "PDF 导入失败：Reader API 未返回 canonical 文件"
+                }
+                return
+            }
+            let entry = BookEntry(
+                title: (book["title"] as? String) ?? url.deletingPathExtension().lastPathComponent,
+                author: book["author"] as? String,
+                bookHash: bookHash,
+                epubPath: canonicalPath,
+                bookRootPath: URL(fileURLWithPath: canonicalPath).deletingLastPathComponent().path,
+                isBundled: false,
+                sourceKind: "pdf",
+                canonicalFilePath: canonicalPath,
+                apiBookID: book["id"] as? String
+            )
+            DispatchQueue.main.async {
+                self.upsertAndLoadNativeLibraryEntry(entry)
+                self.statusLabel.stringValue = "PDF 已进入 KnowledgeBase：\(entry.title)"
+            }
+        }
+    }
+
     private func importEPUB(_ url: URL) {
         guard url.pathExtension.lowercased() == "epub" else {
             statusLabel.stringValue = "只支持 EPUB 文件"
@@ -3640,6 +22525,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         guard let bookHash = fileHash(for: url) else {
             statusLabel.stringValue = "读取 EPUB 失败"
             return
+        }
+        if isStageBVisibleAcceptanceRequested {
+            guard let importSHA256 = try? ClickTTSGate0Contract
+                    .sha256File(url),
+                  importSHA256 == Self.stageBVisibleFixtureSHA256
+            else {
+                statusLabel.stringValue =
+                    "可见验收已拒绝：公开 EPUB 内容在导入前发生变化"
+                return
+            }
         }
 
         do {
@@ -3662,7 +22557,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 bookHash: bookHash,
                 epubPath: epubCopy.path,
                 bookRootPath: extractedRoot.path,
-                isBundled: false
+                isBundled: false,
+                sourceKind: "epub",
+                canonicalFilePath: epubCopy.path,
+                apiBookID: nil
             )
             if let existingIndex = bookEntries.firstIndex(where: { $0.bookHash == bookHash }) {
                 bookEntries[existingIndex] = entry
@@ -3972,20 +22870,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return String(format: "reader-%016llx", hash)
     }
 
-    private func unzipEPUBIfNeeded(epubURL: URL, rootURL: URL) -> Bool {
+    private func extractedEPUBRootIsUsable(_ rootURL: URL) -> Bool {
         let containerURL = rootURL.appendingPathComponent("META-INF/container.xml")
-        if FileManager.default.fileExists(atPath: containerURL.path) {
+        return FileManager.default.fileExists(atPath: containerURL.path)
+            && !collectHTMLChapters(in: rootURL).isEmpty
+    }
+
+    private func unzipEPUBIfNeeded(epubURL: URL, rootURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        if extractedEPUBRootIsUsable(rootURL) {
             return true
         }
+        if fileManager.fileExists(atPath: rootURL.path) {
+            let incompleteRoot = rootURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(".book-incomplete-\(UUID().uuidString)", isDirectory: true)
+            do {
+                try fileManager.moveItem(at: rootURL, to: incompleteRoot)
+            } catch {
+                return false
+            }
+        }
         do {
-            try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true)
         } catch {
             return false
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        process.arguments = ["-q", epubURL.path, "-d", rootURL.path]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/bsdtar")
+        process.arguments = ["-xf", epubURL.path, "-C", rootURL.path]
         process.standardOutput = Pipe()
         process.standardError = Pipe()
         do {
@@ -3994,7 +22908,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         } catch {
             return false
         }
-        return process.terminationStatus == 0 && FileManager.default.fileExists(atPath: containerURL.path)
+        return process.terminationStatus == 0 && extractedEPUBRootIsUsable(rootURL)
     }
 
     private func loadSavedReadingPosition() -> ReadingPosition? {
@@ -4070,6 +22984,585 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
+    private func pdfReadingPositionKey() -> String {
+        "SentenceReader.pdfReadingPosition.v1.\(currentBookEntry?.bookHash ?? "unknown")"
+    }
+
+    private func restorePDFReadingPosition() {
+        var locator: [String: Any]?
+        if let bookID = readerBookID,
+           let row = readerAPI.getPosition(bookID: bookID) {
+            locator = row["locator"] as? [String: Any]
+            if locator?["page_index"] == nil, let pageIndex = row["page_index"] {
+                locator?["page_index"] = pageIndex
+            }
+        }
+        if locator == nil,
+           let data = UserDefaults.standard.data(forKey: pdfReadingPositionKey()) {
+            locator = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        if let locator {
+            pdfReader.restore(locator: locator)
+        } else {
+            pdfReader.goTo(pageIndex: 0)
+        }
+    }
+
+    private func finishPDFPositionRestore(for entry: BookEntry) {
+        pdfPositionRestoreWorkItem?.cancel()
+        let expectedBookHash = entry.bookHash
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.isPDFReadingMode,
+                  self.currentBookEntry?.bookHash == expectedBookHash
+            else { return }
+            self.suppressPDFPositionSave = false
+            self.savePDFReadingPosition(self.pdfReader.positionLocator())
+            self.pdfPositionRestoreWorkItem = nil
+        }
+        pdfPositionRestoreWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    private func savePDFReadingPosition(_ locator: [String: Any]) {
+        guard isPDFReadingMode, !suppressPDFPositionSave else { return }
+        let pageIndex = (locator["page_index"] as? NSNumber)?.intValue ?? 0
+        let totalPages = max(1, (locator["page_count"] as? NSNumber)?.intValue ?? pdfReader.pageCount)
+        let mode = locator["display_mode"] as? String ?? "automatic"
+        let scale = (locator["scale_factor"] as? NSNumber)?.doubleValue ?? 1
+        let signature = "\(readerBookID ?? "local")|\(pageIndex)|\(totalPages)|\(mode)|\(String(format: "%.3f", scale))"
+        guard signature != lastQueuedPDFPositionSignature else { return }
+        lastQueuedPDFPositionSignature = signature
+        if let data = try? JSONSerialization.data(withJSONObject: locator, options: [.sortedKeys]) {
+            UserDefaults.standard.set(data, forKey: pdfReadingPositionKey())
+        }
+        guard let bookID = readerBookID else { return }
+        let ratio = totalPages > 1 ? Double(pageIndex) / Double(totalPages - 1) : 0
+        let chapterLocator = String(format: "pdf:page:%06d", pageIndex + 1)
+        pdfPositionSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.isPDFReadingMode,
+                  self.readerBookID == bookID,
+                  self.lastQueuedPDFPositionSignature == signature
+            else { return }
+            self.pdfPositionSaveQueue.async { [readerAPI = self.readerAPI] in
+                readerAPI.savePosition(
+                    bookID: bookID,
+                    chapterLocator: chapterLocator,
+                    chapterIndex: pageIndex,
+                    pageIndex: pageIndex,
+                    totalPages: totalPages,
+                    pageRatio: ratio,
+                    locator: locator
+                )
+            }
+            self.pdfPositionSaveWorkItem = nil
+        }
+        pdfPositionSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+    }
+
+    private func restorePDFAnnotations() {
+        guard isPDFReadingMode, let bookID = readerBookID else { return }
+        pdfAnnotationRefreshGeneration += 1
+        let generation = pdfAnnotationRefreshGeneration
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotations = readerAPI.listAnnotations(bookID: bookID)
+            let audioNotes = readerAPI.listAudioNotes(bookID: bookID)
+            var highlightMap: [String: [String]] = [:]
+            for annotation in annotations where annotation["kind"] as? String == "red_highlight" {
+                guard let annotationID = annotation["id"] as? String else { continue }
+                let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+                let range = annotation["range_locator"] as? [String: Any] ?? [:]
+                let signature = metadata["pdf_locator_signature"] as? String ?? MacPDFReaderController.signature(for: range)
+                if !highlightMap[signature, default: []].contains(annotationID) {
+                    highlightMap[signature, default: []].append(annotationID)
+                }
+            }
+            DispatchQueue.main.async {
+                guard self.isPDFReadingMode,
+                      self.readerBookID == bookID,
+                      self.pdfAnnotationRefreshGeneration == generation
+                else { return }
+                self.pdfHighlightIDs = highlightMap
+                self.pdfReader.renderAnnotations(annotations, audioNotes: audioNotes)
+                self.redLabel.stringValue = "红标 \(highlightMap.values.reduce(0) { $0 + $1.count })"
+            }
+        }
+    }
+
+    private func togglePDFHighlight(_ target: PDFAnnotationTarget) {
+        guard let bookID = readerBookID else {
+            statusLabel.stringValue = "Reader API 未连接，PDF 标红未保存"
+            return
+        }
+        if let annotationIDs = pdfHighlightIDs[target.signature], !annotationIDs.isEmpty {
+            cancelPDFHighlights(annotationIDs: annotationIDs)
+            return
+        }
+        statusLabel.stringValue = "正在保存 PDF 标红..."
+        let metadata: [String: Any] = [
+            "source": "ClickPDFKit",
+            "mode": target.mode,
+            "pdf_locator_signature": target.signature,
+            "source_pdf_modified": false,
+        ]
+        pdfReader.renderPendingAnnotation(target, kind: "red_highlight")
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotationID = readerAPI.createAnnotation(
+                bookID: bookID,
+                kind: "red_highlight",
+                sourceText: target.sourceText,
+                noteText: nil,
+                color: "red",
+                chapterTitle: target.chapterTitle,
+                chapterLocator: target.chapterLocator,
+                sentenceIndex: target.sentenceIndex,
+                rangeLocator: target.rangeLocator,
+                metadata: metadata
+            )
+            DispatchQueue.main.async {
+                if let annotationID {
+                    self.pdfReader.promotePendingAnnotation(
+                        target,
+                        kind: "red_highlight",
+                        annotationID: annotationID
+                    )
+                    if !self.pdfHighlightIDs[target.signature, default: []].contains(annotationID) {
+                        self.pdfHighlightIDs[target.signature, default: []].append(annotationID)
+                    }
+                } else {
+                    self.pdfReader.discardPendingAnnotation(target, kind: "red_highlight")
+                }
+                self.statusLabel.stringValue = annotationID == nil ? "PDF 标红保存失败" : "PDF 标红已保存"
+                self.refreshNotes()
+                self.redLabel.stringValue = "红标 \(self.pdfHighlightIDs.values.reduce(0) { $0 + $1.count })"
+            }
+        }
+    }
+
+    private func showPDFNotePanel(_ target: PDFAnnotationTarget) {
+        let alert = NSAlert()
+        alert.messageText = "添加 PDF 备注"
+        alert.informativeText = target.sourceText
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 178))
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 44, width: 520, height: 134))
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14)
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+
+        let recordButton = NSButton(title: "开始录音", target: nil, action: nil)
+        recordButton.bezelStyle = .rounded
+        recordButton.frame = NSRect(x: 0, y: 6, width: 92, height: 28)
+        let providerPopup = NSPopUpButton(frame: NSRect(x: 104, y: 6, width: 92, height: 28), pullsDown: false)
+        providerPopup.addItems(withTitles: [SpeechTranscriptionProvider.funASR.title, SpeechTranscriptionProvider.appleSpeech.title])
+        providerPopup.selectItem(withTitle: SpeechTranscriptionProvider.current.title)
+        let speechStatus = NSTextField(labelWithString: "")
+        speechStatus.frame = NSRect(x: 208, y: 8, width: 312, height: 22)
+        speechStatus.font = NSFont(name: "Microsoft YaHei", size: 11) ?? NSFont.systemFont(ofSize: 11)
+        speechStatus.textColor = .secondaryLabelColor
+
+        let speechController = NoteSpeechController(
+            textView: textView,
+            statusLabel: speechStatus,
+            recordButton: recordButton,
+            providerPopup: providerPopup,
+            bookID: readerBookID,
+            readerAPI: readerAPI
+        )
+        recordButton.target = speechController
+        recordButton.action = #selector(NoteSpeechController.toggleRecording(_:))
+        providerPopup.target = speechController
+        providerPopup.action = #selector(NoteSpeechController.providerChanged(_:))
+        speechController.onTranscriptionFinished = { [weak alert, weak textView] _ in
+            guard let alert,
+                  let textView,
+                  !NoteTextNormalizer.normalized(textView.string).isEmpty
+            else {
+                return
+            }
+            alert.buttons.first?.performClick(nil)
+        }
+        noteSpeechController = speechController
+        [scroll, recordButton, providerPopup, speechStatus].forEach { accessory.addSubview($0) }
+        alert.accessoryView = accessory
+        alert.beginSheetModal(for: window) { response in
+            let controller = self.noteSpeechController
+            let audioNoteID = response == .alertFirstButtonReturn ? controller?.prepareForSave() : nil
+            if response == .alertFirstButtonReturn, let controller, let audioNoteID {
+                self.retainSpeechControllerForBackground(controller, audioNoteID: audioNoteID)
+            } else if response != .alertFirstButtonReturn {
+                controller?.cancel()
+            }
+            self.noteSpeechController = nil
+            guard response == .alertFirstButtonReturn else { return }
+            let normalized = NoteTextNormalizer.normalized(textView.string)
+            let noteText = normalized.isEmpty && audioNoteID != nil ? "语音转写中..." : normalized
+            self.persistPDFNote(target, noteText: noteText, audioNoteID: audioNoteID)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard self.noteSpeechController === speechController,
+                  self.window.attachedSheet === alert.window
+            else {
+                return
+            }
+            speechController.beginVoiceFirstRecording()
+        }
+    }
+
+    private func retainSpeechControllerForBackground(_ controller: NoteSpeechController, audioNoteID: String) {
+        guard controller.isTranscriptionInProgress else {
+            refreshNotes()
+            return
+        }
+        backgroundNoteSpeechControllers[audioNoteID] = controller
+        controller.onTranscriptionFinished = { [weak self, weak controller] finishedID in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let key = finishedID ?? audioNoteID
+                self.backgroundNoteSpeechControllers[key] = nil
+                if let controller, self.noteSpeechController === controller {
+                    self.noteSpeechController = nil
+                }
+                if self.readingAudioSession.surfaceMode
+                    == .listening {
+                    self.stopFunASRWarmServiceForListeningIfSafe()
+                }
+                self.refreshNotes()
+            }
+        }
+    }
+
+    private func showPDFAnnotationInspector(_ context: PDFAnnotationInteractionContext) {
+        guard window.attachedSheet == nil else {
+            statusLabel.stringValue = "请先完成当前操作"
+            return
+        }
+        let redAnnotations = context.annotations.filter { $0["kind"] as? String == "red_highlight" }
+        let audioByAnnotation = Dictionary(grouping: context.audioNotes) { $0["annotation_id"] as? String ?? "" }
+        let noteAnnotations = context.annotations.filter { annotation in
+            guard let annotationID = annotation["id"] as? String else { return false }
+            let noteText = (annotation["note_text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return annotation["kind"] as? String == "note" || !noteText.isEmpty || !(audioByAnnotation[annotationID] ?? []).isEmpty
+        }
+        let primaryNote = noteAnnotations.first
+        let primaryAudio = context.audioNotes.first
+        let sourceText = context.annotations.compactMap { $0["source_text"] as? String }.first ?? ""
+
+        let alert = NSAlert()
+        alert.messageText = "PDF 批注"
+        alert.informativeText = sourceText.isEmpty ? "当前位置的 Click 批注" : String(sourceText.prefix(220))
+
+        var detailLines: [String] = []
+        for annotation in noteAnnotations.prefix(4) {
+            let text = (annotation["note_text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { detailLines.append(text) }
+        }
+        for audio in context.audioNotes.prefix(4) {
+            let status = audio["status"] as? String ?? "pending"
+            let title = status == "transcribed" ? "语音已转写" : status == "failed" ? "语音转写失败" : "语音转写中"
+            let transcript = (audio["transcript"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            detailLines.append(transcript.isEmpty ? title : "\(title)：\(transcript)")
+        }
+        if detailLines.isEmpty {
+            detailLines.append(redAnnotations.isEmpty ? "此位置没有可管理的批注。" : "此位置已有红标。")
+        }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 150))
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.font = NSFont(name: "Microsoft YaHei", size: 14) ?? NSFont.systemFont(ofSize: 14)
+        textView.string = detailLines.joined(separator: "\n\n")
+        textView.isEditable = false
+        textView.drawsBackground = false
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        alert.accessoryView = scroll
+
+        var actions: [(title: String, handler: () -> Void)] = []
+        if !redAnnotations.isEmpty {
+            let ids = redAnnotations.compactMap { $0["id"] as? String }
+            actions.append((ids.count > 1 ? "取消红标（\(ids.count)）" : "取消红标", { [weak self] in
+                self?.cancelPDFHighlights(annotationIDs: ids)
+            }))
+        }
+        if let primaryNote,
+           let annotationID = primaryNote["id"] as? String {
+            let text = primaryNote["note_text"] as? String ?? ""
+            actions.append(("编辑备注", { [weak self] in
+                self?.showExistingNoteEditor(annotationID: annotationID, sourceText: sourceText, noteText: text)
+            }))
+            actions.append(((primaryNote["kind"] as? String == "red_highlight") ? "清除文字备注" : "删除备注", { [weak self] in
+                self?.deletePDFNoteAnnotation(primaryNote, audioNotes: audioByAnnotation[annotationID] ?? [])
+            }))
+        } else if let red = redAnnotations.first,
+                  let target = pdfTarget(from: red) {
+            actions.append(("添加备注", { [weak self] in self?.showPDFNotePanel(target) }))
+        }
+        if let primaryAudio,
+           let audioNoteID = primaryAudio["id"] as? String {
+            let title = playingPDFAudioNoteID == audioNoteID && pdfAudioPlayer?.isPlaying == true ? "停止语音" : "播放语音"
+            actions.append((title, { [weak self] in self?.playPDFAudioNote(primaryAudio) }))
+        }
+        actions.append(("关闭", {}))
+        actions.forEach { alert.addButton(withTitle: $0.title) }
+
+        alert.beginSheetModal(for: window) { response in
+            let index = Int(response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue)
+            guard actions.indices.contains(index) else { return }
+            actions[index].handler()
+        }
+    }
+
+    private func pdfTarget(from annotation: [String: Any]) -> PDFAnnotationTarget? {
+        guard let locator = annotation["range_locator"] as? [String: Any] else { return nil }
+        let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+        let signature = metadata["pdf_locator_signature"] as? String ?? MacPDFReaderController.signature(for: locator)
+        let pageIndex = (locator["page_index"] as? NSNumber)?.intValue
+            ?? ((locator["pages"] as? [[String: Any]])?.first?["page_index"] as? NSNumber)?.intValue
+            ?? 0
+        let mode = locator["mode"] as? String ?? metadata["mode"] as? String ?? "pdf_text_selection"
+        return PDFAnnotationTarget(
+            sourceText: annotation["source_text"] as? String ?? "第 \(pageIndex + 1) 页",
+            chapterLocator: annotation["chapter_locator"] as? String ?? String(format: "pdf:page:%06d", pageIndex + 1),
+            chapterTitle: annotation["chapter_title"] as? String ?? "第 \(pageIndex + 1) 页",
+            sentenceIndex: metadata["sentenceIndex"] as? String ?? "pdf-selection-\(signature.prefix(16))",
+            rangeLocator: locator,
+            signature: signature,
+            mode: mode
+        )
+    }
+
+    private func cancelPDFHighlights(annotationIDs: [String]) {
+        guard let bookID = readerBookID, !annotationIDs.isEmpty else { return }
+        for annotationID in annotationIDs {
+            pdfReader.removeHighlight(annotationID: annotationID)
+        }
+        statusLabel.stringValue = "正在取消 PDF 标红..."
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotations = readerAPI.listAnnotations(bookID: bookID)
+            let audioNotes = readerAPI.listAudioNotes(bookID: bookID)
+            var allOK = true
+            for annotationID in annotationIDs {
+                guard let annotation = annotations.first(where: { $0["id"] as? String == annotationID }),
+                      annotation["kind"] as? String == "red_highlight"
+                else {
+                    allOK = false
+                    continue
+                }
+                let linkedAudio = audioNotes.filter { $0["annotation_id"] as? String == annotationID }
+                let noteText = (annotation["note_text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if noteText.isEmpty && linkedAudio.isEmpty {
+                    allOK = readerAPI.deleteAnnotation(annotationID: annotationID) && allOK
+                    continue
+                }
+
+                let locator = annotation["range_locator"] as? [String: Any] ?? [:]
+                let metadata = annotation["metadata"] as? [String: Any] ?? [:]
+                let sentenceIndex = metadata["sentenceIndex"] as? String ?? "pdf-selection-\(MacPDFReaderController.signature(for: locator).prefix(16))"
+                guard let noteID = readerAPI.createAnnotation(
+                    bookID: bookID,
+                    kind: "note",
+                    sourceText: annotation["source_text"] as? String ?? "",
+                    noteText: noteText.isEmpty ? "语音备注" : noteText,
+                    color: nil,
+                    chapterTitle: annotation["chapter_title"] as? String,
+                    chapterLocator: annotation["chapter_locator"] as? String ?? "pdf:page:000001",
+                    sentenceIndex: sentenceIndex,
+                    rangeLocator: locator,
+                    metadata: metadata
+                ) else {
+                    allOK = false
+                    continue
+                }
+                var movedAudioIDs: [String] = []
+                var movedAllAudio = true
+                for audio in linkedAudio {
+                    guard let audioID = audio["id"] as? String,
+                          readerAPI.updateAudioNote(audioNoteID: audioID, annotationID: noteID, provider: nil, transcript: nil, status: nil, errorMessage: nil)
+                    else {
+                        movedAllAudio = false
+                        break
+                    }
+                    movedAudioIDs.append(audioID)
+                }
+                if movedAllAudio, readerAPI.deleteAnnotation(annotationID: annotationID) {
+                    continue
+                }
+                for audioID in movedAudioIDs {
+                    _ = readerAPI.updateAudioNote(audioNoteID: audioID, annotationID: annotationID, provider: nil, transcript: nil, status: nil, errorMessage: nil)
+                }
+                _ = readerAPI.deleteAnnotation(annotationID: noteID)
+                allOK = false
+            }
+            DispatchQueue.main.async {
+                self.statusLabel.stringValue = allOK ? "PDF 标红已取消" : "部分 PDF 标红取消失败，已恢复数据库状态"
+                self.refreshNotes()
+                self.restorePDFAnnotations()
+            }
+        }
+    }
+
+    private func deletePDFNoteAnnotation(_ annotation: [String: Any], audioNotes: [[String: Any]]) {
+        guard let annotationID = annotation["id"] as? String else { return }
+        let kind = annotation["kind"] as? String ?? "note"
+        let alert = NSAlert()
+        alert.messageText = kind == "red_highlight" ? "清除这条文字备注？" : "删除这条备注？"
+        alert.informativeText = audioNotes.isEmpty ? "批注位置会保留在原 PDF 中。" : "原录音文件会保留，不会被静默删除。"
+        alert.addButton(withTitle: kind == "red_highlight" ? "清除" : "删除")
+        alert.addButton(withTitle: "取消")
+        alert.alertStyle = .warning
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            DispatchQueue.global(qos: .utility).async { [readerAPI = self.readerAPI] in
+                let ok = kind == "red_highlight"
+                    ? readerAPI.updateAnnotation(annotationID: annotationID, noteText: "", color: "red")
+                    : readerAPI.deleteAnnotation(annotationID: annotationID)
+                DispatchQueue.main.async {
+                    self.statusLabel.stringValue = ok ? "PDF 备注已更新" : "PDF 备注操作失败"
+                    self.refreshNotes()
+                    self.restorePDFAnnotations()
+                }
+            }
+        }
+    }
+
+    private func playPDFAudioNote(_ audioNote: [String: Any]) {
+        guard let audioNoteID = audioNote["id"] as? String else { return }
+        if playingPDFAudioNoteID == audioNoteID, pdfAudioPlayer?.isPlaying == true {
+            pdfAudioPlayer?.stop()
+            playingPDFAudioNoteID = nil
+            statusLabel.stringValue = "PDF 语音备注已停止"
+            return
+        }
+        guard let audioPath = audioNote["audio_path"] as? String, !audioPath.isEmpty else {
+            statusLabel.stringValue = "PDF 语音备注没有可播放的本地音频"
+            return
+        }
+        let url = URL(fileURLWithPath: (audioPath as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            statusLabel.stringValue = "PDF 语音备注原音频不存在"
+            return
+        }
+        do {
+            pdfAudioPlayer?.stop()
+            let player = try AVAudioPlayer(contentsOf: url)
+            player.prepareToPlay()
+            guard player.play() else {
+                statusLabel.stringValue = "PDF 语音备注播放启动失败"
+                return
+            }
+            pdfAudioPlayer = player
+            playingPDFAudioNoteID = audioNoteID
+            statusLabel.stringValue = "正在播放 PDF 语音备注"
+        } catch {
+            statusLabel.stringValue = "PDF 语音备注播放失败：\(error.localizedDescription)"
+        }
+    }
+
+    private func startPDFAudioNotePolling(audioNoteID: String, attempt: Int = 0) {
+        pdfAudioPollWorkItems[audioNoteID]?.cancel()
+        guard attempt < 40 else {
+            pdfAudioPollWorkItems[audioNoteID] = nil
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let payload = self.readerAPI.getAudioNote(audioNoteID: audioNoteID)
+            DispatchQueue.main.async {
+                guard self.isPDFReadingMode else {
+                    self.pdfAudioPollWorkItems[audioNoteID] = nil
+                    return
+                }
+                let status = payload?["status"] as? String ?? "failed"
+                if let payload {
+                    self.pdfReader.updateAudioNoteStatus(payload)
+                }
+                self.refreshNotes()
+                if status == "pending" {
+                    self.startPDFAudioNotePolling(audioNoteID: audioNoteID, attempt: attempt + 1)
+                } else {
+                    self.pdfAudioPollWorkItems[audioNoteID] = nil
+                    self.statusLabel.stringValue = status == "transcribed" ? "PDF 语音备注转写完成" : "PDF 语音备注已保留，转写失败"
+                }
+            }
+        }
+        pdfAudioPollWorkItems[audioNoteID] = workItem
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.25, execute: workItem)
+    }
+
+    private func persistPDFNote(_ target: PDFAnnotationTarget, noteText: String, audioNoteID: String?) {
+        guard let bookID = readerBookID, !noteText.isEmpty else {
+            statusLabel.stringValue = noteText.isEmpty ? "备注为空，未保存" : "Reader API 未连接"
+            return
+        }
+        let metadata: [String: Any] = [
+            "source": "ClickPDFKit",
+            "mode": target.mode,
+            "pdf_locator_signature": target.signature,
+            "source_pdf_modified": false,
+        ]
+        statusLabel.stringValue = "正在保存 PDF 备注..."
+        pdfReader.renderPendingAnnotation(target, kind: "note")
+        DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let annotationID = readerAPI.createAnnotation(
+                bookID: bookID,
+                kind: "note",
+                sourceText: target.sourceText,
+                noteText: noteText,
+                color: nil,
+                chapterTitle: target.chapterTitle,
+                chapterLocator: target.chapterLocator,
+                sentenceIndex: target.sentenceIndex,
+                rangeLocator: target.rangeLocator,
+                metadata: metadata
+            )
+            if let annotationID, let audioNoteID {
+                _ = readerAPI.updateAudioNote(
+                    audioNoteID: audioNoteID,
+                    annotationID: annotationID,
+                    provider: nil,
+                    transcript: nil,
+                    status: nil,
+                    errorMessage: nil
+                )
+            }
+            DispatchQueue.main.async {
+                if let annotationID {
+                    self.pdfReader.promotePendingAnnotation(
+                        target,
+                        kind: "note",
+                        annotationID: annotationID,
+                        noteText: noteText,
+                        audioNoteID: audioNoteID
+                    )
+                } else {
+                    self.pdfReader.discardPendingAnnotation(target, kind: "note")
+                }
+                self.statusLabel.stringValue = annotationID == nil ? "PDF 备注保存失败" : "PDF 备注已保存"
+                self.refreshNotes()
+                if annotationID != nil, let audioNoteID {
+                    self.startPDFAudioNotePolling(audioNoteID: audioNoteID)
+                }
+            }
+        }
+    }
+
+    private func speakPDFTextLocally(_ text: String) {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: cleaned)
+        let containsChinese = cleaned.range(of: #"[\p{Han}]"#, options: .regularExpression) != nil
+        utterance.voice = AVSpeechSynthesisVoice(language: containsChinese ? "zh-CN" : "en-US")
+        utterance.rate = containsChinese ? 0.47 : 0.44
+        speechSynthesizer.speak(utterance)
+        statusLabel.stringValue = "正在使用 Mac 本地语音朗读 PDF"
+    }
+
     private func readerAPIScriptCandidates() -> [URL] {
         var candidates: [URL] = []
         if let resourceURL = Bundle.main.resourceURL {
@@ -4083,7 +23576,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         readerAPIScriptCandidates().first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
+    private func runtimeManagerCandidates() -> [URL] {
+        var candidates: [URL] = []
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(resourceURL.appendingPathComponent("ReaderRuntime/scripts/click_runtime_manager.py"))
+        }
+        candidates.append(
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts/click_runtime_manager.py")
+        )
+        return candidates
+    }
+
+    private func runtimeManagerPythonCandidates() -> [URL] {
+        var candidates: [URL] = []
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(
+                resourceURL.appendingPathComponent("ReaderRuntime/Python3.framework/Versions/3.9/bin/python3.9")
+            )
+        }
+        candidates.append(
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(".venv-reader-api/bin/python")
+        )
+        candidates.append(URL(fileURLWithPath: "/usr/bin/python3"))
+        return candidates
+    }
+
+    private func launchReaderAPIWithRuntimeManager(host: String) -> Bool? {
+        guard let managerURL = runtimeManagerCandidates().first(where: {
+            FileManager.default.fileExists(atPath: $0.path)
+        }),
+        let pythonURL = runtimeManagerPythonCandidates().first(where: {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        })
+        else {
+            return nil
+        }
+        let runtimeURL = managerURL.deletingLastPathComponent().deletingLastPathComponent()
+        let appSupport = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Application Support/SentenceReader", isDirectory: true)
+        let process = Process()
+        process.executableURL = pythonURL
+        process.arguments = [
+            managerURL.path,
+            "ensure",
+            "--runtime", runtimeURL.path,
+            "--app-support", appSupport.path,
+            "--host", host,
+            "--port", "18180",
+            "--expected-contract", ReaderAPIClient.runtimeContract,
+            "--minimum-revision", String(ReaderAPIClient.minimumAPIRevision),
+            "--capability", "reader.library.v1",
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            statusLabel.stringValue = "Click Runtime Manager 启动失败：\(error.localizedDescription)"
+            return false
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let detail = String(data: data, encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0,
+              readerAPI.health(requiredCapabilities: ["reader.library.v1"])
+        else {
+            readerAPIAvailable = false
+            statusLabel.stringValue = detail.contains("blocked_incompatible_service")
+                ? "18180 端口上是旧版或不兼容的 Click Runtime"
+                : "共享 Click Runtime 未能启动"
+            return false
+        }
+        readerAPIAvailable = true
+        readerAPILANModeEnabled = host == "0.0.0.0"
+        statusLabel.stringValue = host == "0.0.0.0" ? "共享 Click Runtime 已连接（局域网）" : "共享 Click Runtime 已连接"
+        return true
+    }
+
     private func launchReaderAPI(host: String) -> Bool {
+        if let managedResult = launchReaderAPIWithRuntimeManager(host: host) {
+            return managedResult
+        }
         guard let scriptURL = readerAPIScriptURL() else {
             readerAPIAvailable = false
             statusLabel.stringValue = "Reader API 启动脚本不可用，暂用本机临时状态"
@@ -4126,10 +23702,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if readerAPI.health() {
             readerAPIAvailable = true
             statusLabel.stringValue = "Reader API 已连接"
+            publishReaderLANServiceIfNeeded()
             return
         }
 
-        _ = launchReaderAPI(host: "0.0.0.0")
+        if launchReaderAPI(host: "0.0.0.0") {
+            publishReaderLANServiceIfNeeded()
+        }
+    }
+
+    private func publishReaderLANServiceIfNeeded() {
+        guard readerLANService == nil, readerAPI.health() else {
+            return
+        }
+        let service = NetService(
+            domain: "local.",
+            type: "_click-reader._tcp.",
+            name: "Click Reader",
+            port: 18_180
+        )
+        service.setTXTRecord(
+            NetService.data(
+                fromTXTRecord: [
+                    "contract": Data("click.reader_runtime.v1".utf8),
+                    "api_revision": Data("3".utf8),
+                    "transport": Data("http".utf8),
+                ]
+            )
+        )
+        service.publish()
+        readerLANService = service
     }
 
     private func localLANAddresses() -> [String] {
@@ -4302,7 +23904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
         }
 
-        return []
+        return collectHTMLTOCEntries(in: root, chapters: chapters)
     }
 
     private func allFiles(in root: URL) -> [URL] {
@@ -4321,17 +23923,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let labelText = firstElement(in: navPoint, localName: "text")?.stringValue ?? ""
         let title = cleanChapterTitle(labelText)
         let src = firstElement(in: navPoint, localName: "content")?.attribute(forName: "src")?.stringValue ?? ""
-        let href = src.components(separatedBy: "#").first ?? src
-        let targetURL = baseURL.appendingPathComponent(href.removingPercentEncoding ?? href).standardizedFileURL
 
         if !title.isEmpty,
-           let chapterIndex = nearestChapterIndex(for: targetURL, chapters: chapters) {
+           let chapterIndex = chapterIndexForTOCHref(src, baseURL: baseURL, chapters: chapters) {
             entries.append(TocEntry(title: title, chapterIndex: chapterIndex, level: level))
         }
 
         for child in childElements(of: navPoint, localName: "navPoint") {
             appendTOCEntries(from: child, baseURL: baseURL, chapters: chapters, level: level + 1, into: &entries)
         }
+    }
+
+    private func collectHTMLTOCEntries(in root: URL, chapters: [URL]) -> [TocEntry] {
+        let htmlURLs = allFiles(in: root).filter { url in
+            let ext = url.pathExtension.lowercased()
+            let name = url.lastPathComponent.lowercased()
+            return (ext == "xhtml" || ext == "html") && (name.contains("nav") || name.contains("toc"))
+        }.sorted { lhs, rhs in
+            let lhsName = lhs.lastPathComponent.lowercased()
+            let rhsName = rhs.lastPathComponent.lowercased()
+            if lhsName.contains("nav") != rhsName.contains("nav") {
+                return lhsName.contains("nav")
+            }
+            return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+        }
+
+        for htmlURL in htmlURLs {
+            guard let document = try? XMLDocument(contentsOf: htmlURL, options: []) else {
+                continue
+            }
+
+            let navs = (try? document.nodes(forXPath: "//*[local-name()='nav']"))?.compactMap { $0 as? XMLElement } ?? []
+            let baseURL = htmlURL.deletingLastPathComponent()
+            for nav in navs {
+                let navType = (attributeValue(in: nav, localName: "type") ?? "").lowercased()
+                if !navType.isEmpty && !navType.contains("toc") && !navType.contains("contents") {
+                    continue
+                }
+
+                let directLists = childElements(of: nav, localName: "ol") + childElements(of: nav, localName: "ul")
+                guard let list = directLists.first ?? firstElement(in: nav, localName: "ol") ?? firstElement(in: nav, localName: "ul") else {
+                    continue
+                }
+
+                var entries: [TocEntry] = []
+                appendHTMLTOCEntries(fromList: list, baseURL: baseURL, chapters: chapters, level: 0, into: &entries)
+                if !entries.isEmpty {
+                    return entries
+                }
+            }
+        }
+
+        return []
+    }
+
+    private func appendHTMLTOCEntries(fromList list: XMLElement, baseURL: URL, chapters: [URL], level: Int, into entries: inout [TocEntry]) {
+        for listItem in childElements(of: list, localName: "li") {
+            let link = childElements(of: listItem, localName: "a").first
+            let span = childElements(of: listItem, localName: "span").first
+            let titleSource = link ?? span
+            let title = cleanChapterTitle(titleSource?.stringValue ?? "")
+            let href = link.flatMap { attributeValue(in: $0, localName: "href") } ?? ""
+            let chapterIndex = chapterIndexForTOCHref(href, baseURL: baseURL, chapters: chapters)
+
+            if !title.isEmpty, let chapterIndex {
+                entries.append(TocEntry(title: title, chapterIndex: chapterIndex, level: level))
+            }
+
+            let childLevel = (!title.isEmpty && chapterIndex != nil) ? level + 1 : level
+            let childLists = childElements(of: listItem, localName: "ol") + childElements(of: listItem, localName: "ul")
+            for childList in childLists {
+                appendHTMLTOCEntries(fromList: childList, baseURL: baseURL, chapters: chapters, level: childLevel, into: &entries)
+            }
+        }
+    }
+
+    private func chapterIndexForTOCHref(_ href: String, baseURL: URL, chapters: [URL]) -> Int? {
+        let resource = href.components(separatedBy: "#").first ?? href
+        let trimmed = resource.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        let decoded = trimmed.removingPercentEncoding ?? trimmed
+        let relativePath = decoded.hasPrefix("/") ? String(decoded.dropFirst()) : decoded
+        let targetURL = baseURL.appendingPathComponent(relativePath).standardizedFileURL
+        if let exact = nearestChapterIndex(for: targetURL, chapters: chapters) {
+            return exact
+        }
+
+        let targetName = targetURL.lastPathComponent
+        return chapters.firstIndex { $0.lastPathComponent == targetName }
     }
 
     private func nearestChapterIndex(for targetURL: URL, chapters: [URL]) -> Int? {
@@ -4374,6 +24056,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return false
         }
         return name == localName || name.hasSuffix(":\(localName)")
+    }
+
+    private func attributeValue(in element: XMLElement, localName: String) -> String? {
+        for attribute in element.attributes ?? [] {
+            guard let name = attribute.name else {
+                continue
+            }
+            if name == localName || name.hasSuffix(":\(localName)") {
+                return attribute.stringValue
+            }
+        }
+        return nil
     }
 
     private func collectHTMLChapters(in root: URL) -> [URL] {
@@ -4451,13 +24145,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return baseURL.appendingPathComponent(href).standardizedFileURL
         }
 
-        return spineURLs.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let existingSpineURLs = spineURLs.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let manifestHTMLURLs = manifest.values.compactMap { entry -> URL? in
+            let href = entry.href.removingPercentEncoding ?? entry.href
+            let lowerHref = href.lowercased()
+            guard entry.mediaType == "application/xhtml+xml"
+                    || lowerHref.hasSuffix(".xhtml")
+                    || lowerHref.hasSuffix(".html")
+                    || lowerHref.hasSuffix(".htm")
+            else {
+                return nil
+            }
+            let url = baseURL.appendingPathComponent(href).standardizedFileURL
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+
+        guard let resolution = EPUBLinkedReadingOrderResolver.resolve(
+            spineURLs: existingSpineURLs,
+            manifestHTMLURLs: manifestHTMLURLs
+        ),
+        let hubIndex = existingSpineURLs.firstIndex(where: {
+            $0.standardizedFileURL == resolution.hubURL.standardizedFileURL
+        }) else {
+            return existingSpineURLs
+        }
+
+        var expanded = existingSpineURLs
+        let insertionIndex = expanded.index(after: hubIndex)
+        expanded.insert(contentsOf: resolution.linkedChapters, at: insertionIndex)
+        return expanded
     }
 
-    private func loadChapter(at index: Int, initialPage: InitialPage) {
+    private func loadChapter(
+        at index: Int,
+        initialPage: InitialPage,
+        preservingPendingReadingMove: Bool = false
+    ) {
+        readingJumpCoordinator.cancel()
+        if !preservingPendingReadingMove {
+            pendingReadingMove = nil
+        }
+        lastFocusedReadingLocator = nil
+        installedReadingBridgeChapterIndex = nil
+        readingTTSButton.isHidden = true
         guard let bookRootURL,
               chapters.indices.contains(index)
         else {
+            return
+        }
+
+        if isComicReadingMode {
+            suppressReadingPositionSave = true
+            comicReader.display(chapterIndex: index)
+            currentChapterIndex = comicReader.currentPageIndex
+            pendingInitialPage = .start
+            suppressReadingPositionSave = false
+            saveReadingPosition(pageIndex: 0, totalPages: 1)
             return
         }
 
@@ -4478,7 +24221,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let annotations = readerAPI.listAnnotations(bookID: bookID)
-            let rows = annotations.compactMap { self.noteRow(from: $0) }
+            let audioNotes = readerAPI.listAudioNotes(bookID: bookID)
+            let audioByAnnotation = Dictionary(grouping: audioNotes) { $0["annotation_id"] as? String ?? "" }
+            let rows = annotations.compactMap { annotation -> NoteRow? in
+                let annotationID = annotation["id"] as? String ?? ""
+                return self.noteRow(from: annotation, audioNotes: audioByAnnotation[annotationID] ?? [])
+            }
             DispatchQueue.main.async {
                 self.allNoteRows = rows
                 self.applyNotesFilter()
@@ -4486,7 +24234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    private func noteRow(from annotation: [String: Any]) -> NoteRow? {
+    private func noteRow(from annotation: [String: Any], audioNotes: [[String: Any]] = []) -> NoteRow? {
         guard let id = annotation["id"] as? String,
               let kind = annotation["kind"] as? String,
               let sourceText = annotation["source_text"] as? String,
@@ -4498,6 +24246,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let range = annotation["range_locator"] as? [String: Any] ?? [:]
         let metadata = annotation["metadata"] as? [String: Any] ?? [:]
         let sentenceIndex = sentenceIndexString(from: range["sentenceIndex"] ?? metadata["sentenceIndex"]) ?? ""
+        let storedSentenceLocator = firstStoredSentenceLocator(
+            range: range,
+            metadata: metadata
+        )
+        let rangeFragments = selectionFragments(
+            fromRawFragments: range["fragments"]
+        )
+        let selectionFragments = rangeFragments.isEmpty
+            ? selectionFragments(fromRawFragments: metadata["fragments"])
+            : rangeFragments
+        var sentenceTargets = storedSentenceTargets(
+            range: range,
+            metadata: metadata
+        )
+        if sentenceTargets.isEmpty {
+            sentenceTargets = self.sentenceTargets(
+                fromSelectionFragments: selectionFragments
+            )
+        }
+        let sentenceLocator = storedSentenceLocator.isEmpty
+            ? sentenceTargets.compactMap {
+                ($0["sentenceLocator"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }.first { !$0.isEmpty } ?? ""
+            : storedSentenceLocator
+        let sentenceSourceText = sentenceTargets.compactMap {
+            ($0["sourceText"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }.first { !$0.isEmpty }
+            ?? selectionFragments.compactMap {
+                ($0["sentenceSourceText"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }.first { !$0.isEmpty }
+            ?? sourceText
 
         return NoteRow(
             id: id,
@@ -4506,7 +24288,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             noteText: annotation["note_text"] as? String ?? "",
             chapterTitle: annotation["chapter_title"] as? String ?? chapterLocator,
             chapterLocator: chapterLocator,
-            sentenceIndex: sentenceIndex
+            sentenceIndex: sentenceIndex,
+            sentenceLocator: sentenceLocator,
+            sentenceSourceText: sentenceSourceText,
+            sentenceTargets: sentenceTargets,
+            selectionFragments: selectionFragments,
+            audioNotes: audioNotes
         )
     }
 
@@ -4542,7 +24329,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         notesRailWidthConstraint.constant = visible ? 304 : 0
         notesRail.isHidden = !visible
         notesRailToggleButton?.title = "收起笔记"
-        notesButton.title = visible ? "隐藏笔记" : "笔记"
+        let notesLabel = visible ? "隐藏笔记" : "笔记"
+        notesButton.setAccessibilityLabel(notesLabel)
+        notesButton.toolTip = notesLabel
         window.contentView?.layoutSubtreeIfNeeded()
     }
 
@@ -4694,45 +24483,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func jumpToNote(_ item: NoteRow) {
-        guard !item.sentenceIndex.isEmpty else {
+        if isPDFReadingMode, item.chapterLocator.hasPrefix("pdf:page:") {
+            let pageNumber = Int(item.chapterLocator.split(separator: ":").last ?? "1") ?? 1
+            pdfReader.goTo(pageIndex: max(0, pageNumber - 1))
+            statusLabel.stringValue = "已跳回 PDF 第 \(pageNumber) 页"
+            return
+        }
+        markReadingTTSManualBrowse()
+        guard !item.sentenceLocator.isEmpty || !item.sentenceIndex.isEmpty else {
             statusLabel.stringValue = "这条笔记没有句子定位"
             return
         }
 
         if currentChapterLocator() == item.chapterLocator {
-            jumpToSentence(index: item.sentenceIndex)
+            jumpToAnnotation(item)
             return
         }
         guard let chapterIndex = chapters.firstIndex(where: { relativeChapterPath(for: $0) == item.chapterLocator }) else {
             statusLabel.stringValue = "没有找到笔记所在章节"
             return
         }
-        pendingNoteJumpIndex = item.sentenceIndex
+        pendingNoteJump = item
         loadChapter(at: chapterIndex, initialPage: .start)
     }
 
-    private func jumpToSentence(index: String) {
-        let targetIndex = sentenceIndexList(from: index).first ?? index
-        guard let data = try? JSONSerialization.data(withJSONObject: [targetIndex]),
+    private func jumpToAnnotation(_ item: NoteRow) {
+        let payload: [String: Any] = [
+            "sentenceLocator": item.sentenceLocator,
+            "indexes": sentenceIndexList(from: item.sentenceIndex),
+            "sourceText": item.sentenceSourceText,
+            "sentenceTargets": item.sentenceTargets,
+            "fragments": item.selectionFragments,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8)
         else {
             return
         }
-        webView.evaluateJavaScript("window.__sentenceReaderFocusSentence && window.__sentenceReaderFocusSentence(\(json)[0]);")
-        statusLabel.stringValue = "已跳回笔记原句"
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderFocusAnnotation && window.__sentenceReaderFocusAnnotation(\(json));"
+        ) { [weak self] result, error in
+            guard let self else { return }
+            let focused = (result as? Bool) == true
+                || (result as? NSNumber)?.boolValue == true
+            self.statusLabel.stringValue = error == nil && focused
+                ? "已跳回笔记原句"
+                : "原文已变化或定位有歧义，未跳到其他句子"
+        }
     }
 
     private func turnChapter(direction: Int) {
+        if isPDFReadingMode {
+            pdfReader.turn(direction: direction)
+            return
+        }
+        if isComicReadingMode {
+            comicReader.turn(direction: direction)
+            return
+        }
         let target = currentChapterIndex + direction
         guard chapters.indices.contains(target) else {
             statusLabel.stringValue = direction > 0 ? "已经到最后一章" : "已经到第一章"
             return
         }
 
+        markReadingTTSManualBrowse()
         loadChapter(at: target, initialPage: direction > 0 ? .start : .end)
     }
 
     @objc private func showContents(_ sender: NSButton) {
+        if isPDFReadingMode {
+            pdfReader.showContents(from: sender, target: self, action: #selector(selectPDFPageFromContents(_:)))
+            return
+        }
         let entries = tocEntries.isEmpty ? fallbackTOCEntries() : tocEntries
         guard !entries.isEmpty else {
             statusLabel.stringValue = "这本书没有可用目录"
@@ -4741,25 +24564,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         let menu = NSMenu(title: "目录")
         menu.autoenablesItems = false
-
-        for entry in entries {
-            let visibleLevel = min(max(entry.level, 0), 6)
-            let visibleTitle = String(repeating: "    ", count: visibleLevel) + entry.title
-            let item = NSMenuItem(title: visibleTitle, action: #selector(selectChapterFromContents(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = entry.chapterIndex
-            item.indentationLevel = visibleLevel
-            item.toolTip = entry.title
-            item.state = entry.chapterIndex == currentChapterIndex ? .on : .off
-            item.isEnabled = true
-            menu.addItem(item)
-        }
+        buildContentsMenu(entries, into: menu)
 
         menu.popUp(positioning: menu.items.first, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
     }
 
+    private func buildContentsMenu(_ entries: [TocEntry], into rootMenu: NSMenu) {
+        var menuStack: [(level: Int, menu: NSMenu)] = [(level: -1, menu: rootMenu)]
+
+        for (index, entry) in entries.enumerated() {
+            let visibleLevel = min(max(entry.level, 0), 6)
+            while let last = menuStack.last, last.level >= visibleLevel {
+                menuStack.removeLast()
+            }
+
+            let parentMenu = menuStack.last?.menu ?? rootMenu
+            let hasChildren = entries.indices.contains(index + 1) && entries[index + 1].level > entry.level
+            let item = NSMenuItem(
+                title: entry.title,
+                action: hasChildren ? nil : #selector(selectChapterFromContents(_:)),
+                keyEquivalent: ""
+            )
+            item.target = hasChildren ? nil : self
+            item.tag = entry.chapterIndex
+            item.toolTip = entry.title
+            item.state = entry.chapterIndex == currentChapterIndex ? .on : .off
+            item.isEnabled = true
+
+            if hasChildren {
+                let submenu = NSMenu(title: entry.title)
+                submenu.autoenablesItems = false
+                item.submenu = submenu
+                menuStack.append((level: visibleLevel, menu: submenu))
+            }
+
+            parentMenu.addItem(item)
+        }
+    }
+
     @objc private func selectChapterFromContents(_ sender: NSMenuItem) {
+        markReadingTTSManualBrowse()
         loadChapter(at: sender.tag, initialPage: .start)
+    }
+
+    @objc private func selectPDFPageFromContents(_ sender: NSMenuItem) {
+        pdfReader.goTo(pageIndex: sender.tag)
+    }
+
+    private func showPDFSearchPanel() {
+        guard isPDFReadingMode else { return }
+        let alert = NSAlert()
+        alert.messageText = "搜索 PDF"
+        alert.informativeText = "搜索只在本机 PDFKit 中执行，不发送文档文字。"
+        alert.addButton(withTitle: "搜索")
+        alert.addButton(withTitle: "取消")
+        let field = NSSearchField(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
+        field.placeholderString = "输入关键词"
+        alert.accessoryView = field
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let query = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !query.isEmpty else { return }
+            let count = self.pdfReader.search(query)
+            self.statusLabel.stringValue = count > 0 ? "PDF 搜索到 \(count) 处：\(query)" : "PDF 中没有找到：\(query)"
+        }
     }
 
     private func fallbackTOCEntries() -> [TocEntry] {
@@ -4795,6 +24663,1781 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
+    private func installRenderedReadingChapter(from payload: [String: Any]) {
+        guard let provider = readingTextProvider,
+              provider.document.chapters.indices.contains(
+                currentChapterIndex
+              )
+        else {
+            statusLabel.stringValue = "正文会话内核拒绝了不完整的章节快照"
+            return
+        }
+
+        let records: [RenderedReadingSentence]
+        do {
+            records = try RenderedReadingChapterPayloadParser
+                .parse(payload)
+        } catch {
+            statusLabel.stringValue =
+                "正文会话内核拒绝了无效的章节快照：\(error)"
+            return
+        }
+
+        do {
+            let chapter = try provider.installRenderedChapter(
+                descriptorIndex: currentChapterIndex,
+                records: records
+            )
+            let bridgeSentences: [[String: Any]] = chapter.sentences.map { sentence in
+                [
+                    "sourceKey": "\(sentence.sourcePath)#\(sentence.sourceOrdinal)",
+                    "locator": sentence.locator,
+                    "index": sentence.index,
+                    "rendererIndexes": sentence.rendererIndexes,
+                ]
+            }
+            let bridge: [String: Any] = [
+                "schema": "click.reading.chapter.bridge.v1",
+                "documentRevision": provider.document.revision,
+                "chapterLocator": chapter.descriptor.locator,
+                "sentences": bridgeSentences,
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: bridge),
+                  let json = String(data: data, encoding: .utf8)
+            else {
+                statusLabel.stringValue = "正文会话定位映射生成失败"
+                return
+            }
+            let expectedSentenceCount = chapter.sentences.count
+            let expectedFragmentCount = chapter.sentences.reduce(0) {
+                $0 + $1.rendererIndexes.count
+            }
+            let expectedChapterIndex = currentChapterIndex
+            webView.evaluateJavaScript(
+                "window.__sentenceReaderInstallReadingChapter && window.__sentenceReaderInstallReadingChapter(\(json));"
+            ) { [weak self] result, error in
+                guard let self,
+                      self.currentChapterIndex == expectedChapterIndex
+                else {
+                    return
+                }
+                let installed = result as? [String: Any]
+                let sentenceCount = self.readingInteger(
+                    installed?["sentenceCount"]
+                )
+                let fragmentCount = self.readingInteger(
+                    installed?["fragmentCount"]
+                )
+                let revision = installed?["documentRevision"] as? String
+                guard error == nil,
+                      sentenceCount == expectedSentenceCount,
+                      fragmentCount == expectedFragmentCount,
+                      revision == provider.document.revision
+                else {
+                    self.installedReadingBridgeChapterIndex = nil
+                    self.statusLabel.stringValue = "正文已显示，但稳定句子定位未完成"
+                    if self.isGate1AcceptanceMode {
+                        self.failGate1Acceptance(
+                            "installed reading bridge validation failed"
+                        )
+                    }
+                    if self.isGate2ANAcceptanceMode {
+                        self.failGate2ANAcceptance(
+                            "installed reading bridge validation failed"
+                        )
+                    }
+                    return
+                }
+                self.installedReadingBridgeChapterIndex = expectedChapterIndex
+                self.readingTTSButton.isHidden =
+                    self.isPDFReadingMode
+                    || self.isComicReadingMode
+                self.restoreReadingTTSHighlightIfNeeded()
+                self.statusLabel.stringValue = "第 \(expectedChapterIndex + 1) / \(self.chapters.count) 章 · 规范化句子 \(expectedSentenceCount)"
+                let completedMove = self.completePendingReadingMove(
+                    provider: provider,
+                    chapter: chapter
+                )
+                self.advanceGate1AcceptanceAfterBridge(
+                    provider: provider,
+                    chapter: chapter,
+                    completedMove: completedMove
+                )
+                self.advanceGate2ANAcceptanceAfterBridge(
+                    provider: provider,
+                    chapter: chapter
+                )
+            }
+        } catch {
+            statusLabel.stringValue = "正文会话内核拒绝了章节：\(error)"
+            if isGate1AcceptanceMode {
+                failGate1Acceptance(
+                    "reading chapter rejected: \(error)"
+                )
+            }
+            if isGate2ANAcceptanceMode {
+                failGate2ANAcceptance(
+                    "reading chapter rejected: \(error)"
+                )
+            }
+        }
+    }
+
+    private func scheduleReadingJumpCandidate(from payload: [String: Any]) {
+        guard let provider = readingTextProvider,
+              readingAudioSession.isJumpEligible,
+              let identity = readingAudioSession.jumpIdentity,
+              let locator = (payload["locator"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !locator.isEmpty,
+              payload["documentRevision"] as? String == provider.document.revision,
+              let chapterLocator = (payload["chapterLocator"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              chapterLocator == currentChapterLocator(),
+              let sentence = provider.sentence(at: locator),
+              sentence.chapterLocator == chapterLocator
+        else {
+            readingJumpCoordinator.cancel()
+            return
+        }
+        let decision = ReadingInteractionArbitrator.decision(
+            sessionIsJumpEligible: true,
+            kind: .ordinarySentence,
+            hasStableLocator: true
+        )
+        guard decision == .schedule else {
+            readingJumpCoordinator.cancel()
+            return
+        }
+        readingJumpCoordinator.schedule(
+            ReadingJumpCandidate(
+                sessionID: identity.sessionID,
+                documentRevision: identity.documentRevision,
+                chapterLocator: chapterLocator,
+                sentenceLocator: sentence.locator
+            )
+        )
+    }
+
+    private func commitReadingJumpCandidate(_ candidate: ReadingJumpCandidate) {
+        guard let provider = readingTextProvider,
+              let identity = readingAudioSession.jumpIdentity,
+              identity.sessionID == candidate.sessionID,
+              identity.documentRevision == candidate.documentRevision,
+              provider.document.revision == candidate.documentRevision,
+              currentChapterLocator() == candidate.chapterLocator,
+              let sentence = provider.sentence(
+                at: candidate.sentenceLocator
+              )
+        else {
+            return
+        }
+        if readingTTSIsActive {
+            startReadingTTS(at: sentence)
+        } else {
+            guard readingAudioSession.seek(
+                to: sentence.locator,
+                provider: provider
+            ) else {
+                return
+            }
+        }
+        focusReadingLocator(candidate.sentenceLocator)
+        statusLabel.stringValue = "已从所点句子调整朗读位置"
+    }
+
+    private func focusReadingLocator(_ locator: String) {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: [locator]
+        ),
+        let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        webView.evaluateJavaScript(
+            "window.__sentenceReaderFocusReadingLocator && window.__sentenceReaderFocusReadingLocator(\(json)[0]);"
+        )
+    }
+
+    @discardableResult
+    private func moveReadingSession(
+        direction: Int
+    ) -> ReadingTextNavigation {
+        guard direction == -1 || direction == 1,
+              let provider = readingTextProvider,
+              let identity = readingAudioSession.jumpIdentity
+        else {
+            return .unavailable
+        }
+        let navigation = direction < 0
+            ? readingAudioSession.previous(using: provider)
+            : readingAudioSession.next(using: provider)
+        switch navigation {
+        case let .sentence(sentence):
+            if sentence.chapterIndex == currentChapterIndex {
+                focusReadingLocator(sentence.locator)
+                return navigation
+            }
+            pendingReadingMove = PendingReadingMove(
+                identity: identity,
+                targetChapterIndex: sentence.chapterIndex,
+                targetLocator: sentence.locator,
+                edge: direction < 0 ? .end : .start
+            )
+            loadChapter(
+                at: sentence.chapterIndex,
+                initialPage: direction < 0 ? .end : .start,
+                preservingPendingReadingMove: true
+            )
+        case let .requiresChapter(index, edge):
+            pendingReadingMove = PendingReadingMove(
+                identity: identity,
+                targetChapterIndex: index,
+                targetLocator: nil,
+                edge: edge
+            )
+            loadChapter(
+                at: index,
+                initialPage: edge == .start ? .start : .end,
+                preservingPendingReadingMove: true
+            )
+        case .startOfDocument, .endOfDocument, .unavailable:
+            break
+        }
+        return navigation
+    }
+
+    @discardableResult
+    private func completePendingReadingMove(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter
+    ) -> Bool {
+        guard let pending = pendingReadingMove,
+              pending.targetChapterIndex == currentChapterIndex,
+              chapter.descriptor.index == pending.targetChapterIndex,
+              provider.document.revision == pending.identity.documentRevision,
+              readingAudioSession.matches(pending.identity)
+        else {
+            return false
+        }
+        let target: ReadingSentence?
+        if let exactLocator = pending.targetLocator {
+            target = provider.sentence(at: exactLocator)
+        } else {
+            target = pending.edge == .start
+                ? chapter.sentences.first
+                : chapter.sentences.last
+        }
+        guard let target,
+              target.chapterIndex == pending.targetChapterIndex,
+              readingAudioSession.seek(
+                to: target.locator,
+                provider: provider
+              )
+        else {
+            return false
+        }
+        pendingReadingMove = nil
+        focusReadingLocator(target.locator)
+        statusLabel.stringValue =
+            "朗读会话已跨章定位到第 \(target.chapterIndex + 1) 章"
+        return true
+    }
+
+    private func advanceGate1AcceptanceAfterBridge(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter,
+        completedMove: Bool
+    ) {
+        guard isGate1AcceptanceMode,
+              gate1AcceptanceFixtureURL != nil
+        else {
+            return
+        }
+        switch gate1AcceptancePhase {
+        case .waitingForFirstBridge:
+            let chapterOrder = provider.document.chapters.map(\.locator)
+            guard chapter.descriptor.index == 0,
+                  chapterOrder == [
+                    "EPUB/text/z-first.xhtml",
+                    "EPUB/text/a-second.xhtml",
+                  ],
+                  chapter.sentences.count >= 2,
+                  let first = chapter.sentences.first,
+                  readingAudioSession.activate(
+                    at: first.locator,
+                    provider: provider
+                  )
+            else {
+                failGate1Acceptance(
+                    "first chapter, OPF order, or session activation failed"
+                )
+                return
+            }
+            gate1AcceptanceEvents.append([
+                "event": "session_activated",
+                "state": readingAudioSession.state.rawValue,
+                "chapter_index": chapter.descriptor.index,
+                "sentence_count": chapter.sentences.count,
+                "document_revision": provider.document.revision,
+            ])
+            runGate1AcceptanceCancelledClick(
+                provider: provider,
+                chapter: chapter,
+                originalLocator: first.locator,
+                target: chapter.sentences[1]
+            )
+        case .waitingForNextChapter:
+            guard chapter.descriptor.index == 1,
+                  completedMove,
+                  readingAudioSession.currentLocator
+                    == chapter.sentences.first?.locator
+            else {
+                failGate1Acceptance(
+                    "next chapter bridge did not complete at its first sentence"
+                )
+                return
+            }
+            gate1AcceptanceEvents.append([
+                "event": "cross_chapter_next_completed",
+                "chapter_index": chapter.descriptor.index,
+                "sentence_count": chapter.sentences.count,
+            ])
+            gate1AcceptancePhase = .waitingForPreviousChapter
+            let navigation = moveReadingSession(direction: -1)
+            guard case let .sentence(sentence) = navigation,
+                  sentence.chapterIndex == 0
+            else {
+                failGate1Acceptance(
+                    "cross-chapter previous did not target chapter 1"
+                )
+                return
+            }
+        case .waitingForPreviousChapter:
+            guard chapter.descriptor.index == 0,
+                  completedMove,
+                  readingAudioSession.currentLocator
+                    == chapter.sentences.last?.locator
+            else {
+                failGate1Acceptance(
+                    "previous chapter bridge did not complete at its last sentence"
+                )
+                return
+            }
+            gate1AcceptanceEvents.append([
+                "event": "cross_chapter_previous_completed",
+                "chapter_index": chapter.descriptor.index,
+                "sentence_count": chapter.sentences.count,
+            ])
+            finishGate1Acceptance(ok: true, error: nil)
+        case .waitingForFixture,
+             .checkingCancelledClick,
+             .checkingCommittedClick,
+             .finished:
+            break
+        }
+    }
+
+    private func runGate1AcceptanceCancelledClick(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter,
+        originalLocator: String,
+        target: ReadingSentence
+    ) {
+        gate1AcceptancePhase = .checkingCancelledClick
+        guard let locatorData = try? JSONSerialization.data(
+            withJSONObject: [target.locator]
+        ),
+        let locatorJSON = String(data: locatorData, encoding: .utf8)
+        else {
+            failGate1Acceptance("could not encode click target locator")
+            return
+        }
+        let script = """
+        (function () {
+          const locator = \(locatorJSON)[0];
+          const node = Array.from(
+            document.querySelectorAll('.sr-sentence[data-sr-locator]')
+          ).find(function (candidate) {
+            return String(candidate.dataset.srLocator || '') === locator;
+          });
+          if (!node) { return false; }
+          node.dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true, button: 0, detail: 1
+          }));
+          node.dispatchEvent(new MouseEvent('mousedown', {
+            bubbles: true, cancelable: true, button: 0, buttons: 1
+          }));
+          node.dispatchEvent(new MouseEvent('mouseup', {
+            bubbles: true, cancelable: true, button: 0, buttons: 0
+          }));
+          return true;
+        })()
+        """
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            guard let self else { return }
+            let dispatched = (result as? Bool) == true
+                || (result as? NSNumber)?.boolValue == true
+            guard error == nil, dispatched else {
+                self.failGate1Acceptance(
+                    "cancelled-click DOM dispatch failed"
+                )
+                return
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + NSEvent.doubleClickInterval + 0.2
+            ) { [weak self] in
+                guard let self else { return }
+                guard case .checkingCancelledClick =
+                    self.gate1AcceptancePhase,
+                    self.readingAudioSession.currentLocator
+                        == originalLocator
+                else {
+                    self.failGate1Acceptance(
+                        "selection mousedown did not cancel the pending click"
+                    )
+                    return
+                }
+                self.gate1AcceptanceEvents.append([
+                    "event": "click_cancelled",
+                    "session_locator_unchanged": true,
+                ])
+                self.runGate1AcceptanceCommittedClick(
+                    provider: provider,
+                    chapter: chapter,
+                    target: target,
+                    locatorJSON: locatorJSON
+                )
+            }
+        }
+    }
+
+    private func runGate1AcceptanceCommittedClick(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter,
+        target: ReadingSentence,
+        locatorJSON: String
+    ) {
+        gate1AcceptancePhase = .checkingCommittedClick
+        let script = """
+        (function () {
+          const locator = \(locatorJSON)[0];
+          const node = Array.from(
+            document.querySelectorAll('.sr-sentence[data-sr-locator]')
+          ).find(function (candidate) {
+            return String(candidate.dataset.srLocator || '') === locator;
+          });
+          if (!node) { return false; }
+          node.dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true, button: 0, detail: 1
+          }));
+          return true;
+        })()
+        """
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            guard let self else { return }
+            let dispatched = (result as? Bool) == true
+                || (result as? NSNumber)?.boolValue == true
+            guard error == nil, dispatched else {
+                self.failGate1Acceptance(
+                    "committed-click DOM dispatch failed"
+                )
+                return
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + NSEvent.doubleClickInterval + 0.2
+            ) { [weak self] in
+                guard let self else { return }
+                guard case .checkingCommittedClick =
+                    self.gate1AcceptancePhase,
+                    self.readingAudioSession.currentLocator == target.locator
+                else {
+                    self.failGate1Acceptance(
+                        "clean sentence click did not commit to the session"
+                    )
+                    return
+                }
+                self.verifyGate1AcceptanceDOMFocus(
+                    provider: provider,
+                    chapter: chapter,
+                    target: target,
+                    locatorJSON: locatorJSON
+                )
+            }
+        }
+    }
+
+    private func verifyGate1AcceptanceDOMFocus(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter,
+        target: ReadingSentence,
+        locatorJSON: String
+    ) {
+        let script = """
+        (function () {
+          const locator = \(locatorJSON)[0];
+          const nodes = Array.from(
+            document.querySelectorAll('.sr-sentence.sr-reading-focused')
+          );
+          return {
+            count: nodes.length,
+            allMatch: nodes.length > 0 && nodes.every(function (node) {
+              return String(node.dataset.srLocator || '') === locator;
+            })
+          };
+        })()
+        """
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            guard let self else { return }
+            let payload = result as? [String: Any]
+            let count = self.readingInteger(payload?["count"])
+            let allMatch = (payload?["allMatch"] as? Bool) == true
+                || (payload?["allMatch"] as? NSNumber)?.boolValue == true
+            guard error == nil,
+                  count == target.rendererIndexes.count,
+                  allMatch
+            else {
+                self.failGate1Acceptance(
+                    "committed locator did not focus every rendered fragment"
+                )
+                return
+            }
+            self.gate1AcceptanceEvents.append([
+                "event": "click_committed",
+                "focused_fragment_count": count ?? 0,
+            ])
+            guard let last = chapter.sentences.last,
+                  self.readingAudioSession.seek(
+                    to: last.locator,
+                    provider: provider
+                  )
+            else {
+                self.failGate1Acceptance(
+                    "could not place the session at the chapter boundary"
+                )
+                return
+            }
+            self.gate1AcceptancePhase = .waitingForNextChapter
+            let navigation = self.moveReadingSession(direction: 1)
+            guard navigation == .requiresChapter(index: 1, edge: .start)
+            else {
+                self.failGate1Acceptance(
+                    "next did not request the unloaded second chapter"
+                )
+                return
+            }
+            self.gate1AcceptanceEvents.append([
+                "event": "next_requested_chapter",
+                "chapter_index": 1,
+                "edge": ReadingChapterEdge.start.rawValue,
+            ])
+        }
+    }
+
+    private func makeGate2ANSamples(
+        chapter: ReadingChapter
+    ) -> [Gate2ANSample] {
+        let specifications =
+            (0...13).map { (start: $0, length: 4) }
+            + (0...12).map { (start: $0, length: 5) }
+            + (0...2).map { (start: $0, length: 6) }
+        guard chapter.sentences.count >= 17 else {
+            return []
+        }
+        return specifications.enumerated().compactMap {
+            ordinal, specification in
+            let end = specification.start + specification.length
+            guard end <= chapter.sentences.count else {
+                return nil
+            }
+            let window = Array(
+                chapter.sentences[specification.start..<end]
+            )
+            guard let first = window.first, let last = window.last else {
+                return nil
+            }
+            let text = window.map(\.text).joined(separator: " ")
+            let identifier = String(
+                format: "gate2an-%02d",
+                ordinal + 1
+            )
+            return Gate2ANSample(
+                id: identifier,
+                text: text,
+                textSHA256: ClickTTSGate0Contract.sha256(
+                    Data(text.utf8)
+                ),
+                voice: "zh-CN-YunjianNeural",
+                chapterLocator: chapter.descriptor.locator,
+                startLocator: first.locator,
+                endLocator: last.locator,
+                locatorRange: "\(first.locator)..\(last.locator)"
+            )
+        }
+    }
+
+    private func advanceGate2ANAcceptanceAfterBridge(
+        provider: EPUBReadingTextProvider,
+        chapter: ReadingChapter
+    ) {
+        guard isGate2ANAcceptanceMode,
+              !gate2ANBatchStarted,
+              !gate2ANFinished,
+              gate2ANAcceptanceFixtureURL != nil,
+              chapter.descriptor.index == 0,
+              let phase = gate2ANAcceptancePhase
+        else {
+            return
+        }
+        let allSamples = makeGate2ANSamples(chapter: chapter)
+        let uniqueHashes = Set(allSamples.map(\.textSHA256))
+        let uniqueRanges = Set(allSamples.map(\.locatorRange))
+        guard allSamples.count == 30,
+              uniqueHashes.count == 30,
+              uniqueRanges.count == 30,
+              allSamples.allSatisfy({
+                  provider.sentence(at: $0.startLocator) != nil
+                      && provider.sentence(at: $0.endLocator) != nil
+              })
+        else {
+            failGate2ANAcceptance(
+                "could not derive 30 unique public samples from the verified Gate 1 EPUB"
+            )
+            return
+        }
+        gate2ANRunNamespace = UUID().uuidString.lowercased()
+        gate2ANSamples = phase == .batch
+            ? allSamples
+            : [allSamples[3]]
+        gate2ANCurrentSampleIndex = 0
+        gate2ANBatchStarted = true
+        UserDefaults.standard.set(
+            [
+                "revision": ClickTTSGate0Contract.disclosureRevision,
+                "accepted": true,
+                "accepted_at": ISO8601DateFormatter().string(from: Date()),
+                "scope": "Gate 2A-N verified public fixture only",
+            ],
+            forKey: ClickTTSGate0Contract.disclosureDefaultsKey
+        )
+        gate2ANAcceptanceEvents.append([
+            "event": "sample_plan_ready",
+            "phase": phase.rawValue,
+            "derived_sample_count": allSamples.count,
+            "scheduled_sample_count": gate2ANSamples.count,
+            "unique_text_hash_count": uniqueHashes.count,
+            "unique_locator_range_count": uniqueRanges.count,
+            "chapter_locator": chapter.descriptor.locator,
+        ])
+        guard let resultURL = resolvedGate2ANResultURL() else {
+            failGate2ANAcceptance(
+                "Gate 2A-N result path disappeared before readiness"
+            )
+            return
+        }
+        let controlRoot = resultURL.deletingLastPathComponent()
+        let readyURL = controlRoot.appendingPathComponent(
+            "click-gate2an-ready.json"
+        )
+        let startURL = controlRoot.appendingPathComponent(
+            "click-gate2an-start"
+        )
+        guard !FileManager.default.fileExists(atPath: startURL.path),
+              writeGate2ANPrivateReport(
+                  [
+                      "schema": "click.mac.gate2an.ready.v1",
+                      "phase": phase.rawValue,
+                      "process_id":
+                          ProcessInfo.processInfo.processIdentifier,
+                      "run_namespace_sha256":
+                          ClickTTSGate0Contract.sha256(
+                              Data(gate2ANRunNamespace.utf8)
+                          ),
+                      "scheduled_sample_count": gate2ANSamples.count,
+                  ],
+                  to: readyURL
+              )
+        else {
+            failGate2ANAcceptance(
+                "Gate 2A-N control files were unsafe or could not be written"
+            )
+            return
+        }
+        gate2ANAcceptanceEvents.append([
+            "event": "ready_for_resource_sampler",
+            "process_id": ProcessInfo.processInfo.processIdentifier,
+        ])
+        waitForGate2ANStart(
+            provider: provider,
+            startURL: startURL
+        )
+    }
+
+    private func waitForGate2ANStart(
+        provider: EPUBReadingTextProvider,
+        startURL: URL
+    ) {
+        guard isGate2ANAcceptanceMode, !gate2ANFinished else {
+            return
+        }
+        if FileManager.default.fileExists(atPath: startURL.path) {
+            let values = try? startURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            let data = try? Data(contentsOf: startURL)
+            guard values?.isRegularFile == true,
+                  values?.isSymbolicLink != true,
+                  data == Data("start\n".utf8)
+            else {
+                failGate2ANAcceptance(
+                    "Gate 2A-N start signal is invalid"
+                )
+                return
+            }
+            gate2ANAcceptanceEvents.append([
+                "event": "resource_sampler_ready_start_received",
+            ])
+            runNextGate2ANSample(provider: provider)
+            return
+        }
+        let item = DispatchWorkItem { [weak self, weak provider] in
+            guard let self, let provider else {
+                return
+            }
+            self.waitForGate2ANStart(
+                provider: provider,
+                startURL: startURL
+            )
+        }
+        gate2ANStartWaitWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.05,
+            execute: item
+        )
+    }
+
+    private func runNextGate2ANSample(
+        provider: EPUBReadingTextProvider
+    ) {
+        guard isGate2ANAcceptanceMode,
+              !gate2ANFinished
+        else {
+            return
+        }
+        guard gate2ANCurrentSampleIndex < gate2ANSamples.count else {
+            if gate2ANAcceptancePhase == .batch,
+               !gate2ANTimeoutExerciseStarted {
+                runGate2ANTimeoutExercise(provider: provider)
+                return
+            }
+            finishGate2ANAcceptance(ok: true, error: nil)
+            return
+        }
+        let sample = gate2ANSamples[gate2ANCurrentSampleIndex]
+        guard provider.sentence(at: sample.startLocator) != nil else {
+            failGate2ANAcceptance(
+                "stable sample locator disappeared before synthesis"
+            )
+            return
+        }
+        readingAudioSession.stop()
+        let intentStartedUptime = ProcessInfo.processInfo.systemUptime
+        guard readingAudioSession.activate(
+            at: sample.startLocator,
+            provider: provider
+        ),
+        readingAudioSession.state == .preparing
+        else {
+            failGate2ANAcceptance(
+                "ReadingAudioSession did not enter preparing"
+            )
+            return
+        }
+        let fixtureID = [
+            "click-gate2an",
+            gate2ANRunNamespace,
+            sample.id,
+        ].joined(separator: "-")
+        clickTTSGate0ProbeController.runGate2ANAcceptance(
+            text: sample.text,
+            voice: sample.voice,
+            parentWindow: window,
+            fixtureID: fixtureID,
+            chapterLocator: sample.chapterLocator,
+            locatorRange: sample.locatorRange,
+            intentStartedUptime: intentStartedUptime,
+            mutePlayback: gate2ANAcceptancePhase == .batch,
+            stopAfterFirstSound: gate2ANAcceptancePhase == .batch,
+            expectedSource: "online",
+            evictAfterFirstSound:
+                gate2ANAcceptancePhase != .batch,
+            event: { [weak self] rawEvent in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var event = rawEvent
+                event["sample_id"] = sample.id
+                event["measurement_kind"] = "online"
+                event["text_sha256"] = sample.textSHA256
+                self.gate2ANAcceptanceEvents.append(event)
+                if event["event"] as? String == "preparing_published",
+                   let elapsed = (
+                       event["elapsed_ms"] as? NSNumber
+                   )?.doubleValue {
+                    self.gate2ANPreparingMSBySample[sample.id] = elapsed
+                }
+                if event["event"] as? String == "first_sound",
+                   let elapsed = (
+                       event["elapsed_ms"] as? NSNumber
+                   )?.doubleValue {
+                    self.gate2ANFirstSoundMSBySample[sample.id] = elapsed
+                    self.readingAudioSession.markPlaying()
+                }
+            },
+            completion: { [weak self] rawResult in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var result = rawResult
+                result["sample_id"] = sample.id
+                result["measurement_kind"] = "online"
+                result["text_sha256"] = sample.textSHA256
+                result["character_count"] = sample.text.count
+                result["voice"] = sample.voice
+                result["chapter_locator"] = sample.chapterLocator
+                result["start_locator"] = sample.startLocator
+                result["end_locator"] = sample.endLocator
+                result["locator_range"] = sample.locatorRange
+                result["reading_audio_session_state"] =
+                    self.readingAudioSession.state.rawValue
+                if let preparingMS =
+                    self.gate2ANPreparingMSBySample[sample.id] {
+                    result["preparing_ms"] = preparingMS
+                }
+                if let firstSoundMS =
+                    self.gate2ANFirstSoundMSBySample[sample.id] {
+                    result["first_sound_ms"] = firstSoundMS
+                }
+                self.gate2ANAcceptanceResults.append(result)
+                self.readingAudioSession.stop()
+                let status = result["status"] as? String ?? ""
+                if !["first_sound", "timed_out"].contains(status) {
+                    self.failGate2ANAcceptance(
+                        result["error"] as? String
+                            ?? "Gate 2A-N sample failed"
+                    )
+                    return
+                }
+                if self.gate2ANAcceptancePhase == .batch,
+                   status == "first_sound" {
+                    self.runGate2ANCachedReplay(
+                        sample: sample,
+                        provider: provider,
+                        onlineResult: result
+                    )
+                    return
+                }
+                self.gate2ANCurrentSampleIndex += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                    self.runNextGate2ANSample(provider: provider)
+                }
+            }
+        )
+    }
+
+    private func runGate2ANCachedReplay(
+        sample: Gate2ANSample,
+        provider: EPUBReadingTextProvider,
+        onlineResult: [String: Any]
+    ) {
+        guard isGate2ANAcceptanceMode,
+              !gate2ANFinished,
+              gate2ANAcceptancePhase == .batch,
+              onlineResult["status"] as? String == "first_sound",
+              onlineResult["source"] as? String == "online",
+              onlineResult["cache_miss_verified"] as? Bool == true,
+              onlineResult["cache_evicted"] as? Bool == false,
+              let onlineCacheKey = onlineResult["cache_key"] as? String,
+              !onlineCacheKey.isEmpty,
+              provider.sentence(at: sample.startLocator) != nil
+        else {
+            failGate2ANAcceptance(
+                "online sample could not be bound to its immediate cached replay"
+            )
+            return
+        }
+        readingAudioSession.stop()
+        let intentStartedUptime = ProcessInfo.processInfo.systemUptime
+        guard readingAudioSession.activate(
+            at: sample.startLocator,
+            provider: provider
+        ),
+        readingAudioSession.state == .preparing
+        else {
+            failGate2ANAcceptance(
+                "cached replay did not enter preparing"
+            )
+            return
+        }
+        let eventSampleID = "\(sample.id)-cache"
+        let fixtureID = [
+            "click-gate2an",
+            gate2ANRunNamespace,
+            sample.id,
+        ].joined(separator: "-")
+        clickTTSGate0ProbeController.runGate2ANAcceptance(
+            text: sample.text,
+            voice: sample.voice,
+            parentWindow: window,
+            fixtureID: fixtureID,
+            chapterLocator: sample.chapterLocator,
+            locatorRange: sample.locatorRange,
+            intentStartedUptime: intentStartedUptime,
+            mutePlayback: true,
+            stopAfterFirstSound: true,
+            expectedSource: "cache",
+            evictAfterFirstSound: true,
+            event: { [weak self] rawEvent in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var event = rawEvent
+                event["sample_id"] = eventSampleID
+                event["online_sample_id"] = sample.id
+                event["measurement_kind"] = "cached"
+                event["text_sha256"] = sample.textSHA256
+                self.gate2ANAcceptanceEvents.append(event)
+                if event["event"] as? String == "preparing_published",
+                   let elapsed = (
+                       event["elapsed_ms"] as? NSNumber
+                   )?.doubleValue {
+                    self.gate2ANCachedPreparingMSBySample[sample.id] =
+                        elapsed
+                }
+                if event["event"] as? String == "first_sound",
+                   let elapsed = (
+                       event["elapsed_ms"] as? NSNumber
+                   )?.doubleValue {
+                    self.gate2ANCachedFirstSoundMSBySample[sample.id] =
+                        elapsed
+                    self.readingAudioSession.markPlaying()
+                }
+            },
+            completion: { [weak self] rawResult in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var result = rawResult
+                result["sample_id"] = sample.id
+                result["event_sample_id"] = eventSampleID
+                result["online_sample_id"] = sample.id
+                result["measurement_kind"] = "cached"
+                result["text_sha256"] = sample.textSHA256
+                result["character_count"] = sample.text.count
+                result["voice"] = sample.voice
+                result["chapter_locator"] = sample.chapterLocator
+                result["start_locator"] = sample.startLocator
+                result["end_locator"] = sample.endLocator
+                result["locator_range"] = sample.locatorRange
+                result["online_cache_key"] = onlineCacheKey
+                result["reading_audio_session_state"] =
+                    self.readingAudioSession.state.rawValue
+                if let preparingMS =
+                    self.gate2ANCachedPreparingMSBySample[sample.id] {
+                    result["preparing_ms"] = preparingMS
+                }
+                if let firstSoundMS =
+                    self.gate2ANCachedFirstSoundMSBySample[sample.id] {
+                    result["first_sound_ms"] = firstSoundMS
+                }
+                self.gate2ANCachedResults.append(result)
+                self.readingAudioSession.stop()
+                let passed =
+                    result["ok"] as? Bool == true
+                    && result["status"] as? String == "first_sound"
+                    && result["expected_source"] as? String == "cache"
+                    && result["source"] as? String == "cache"
+                    && result["cache_hit_verified"] as? Bool == true
+                    && result["cache_miss_verified"] as? Bool == false
+                    && result["cache_evicted"] as? Bool == true
+                    && result["first_sound_observed"] as? Bool == true
+                    && result["cache_key"] as? String == onlineCacheKey
+                guard passed else {
+                    self.failGate2ANAcceptance(
+                        result["error"] as? String
+                            ?? "Gate 2A-N cached replay failed"
+                    )
+                    return
+                }
+                self.gate2ANCurrentSampleIndex += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+                    self.runNextGate2ANSample(provider: provider)
+                }
+            }
+        )
+    }
+
+    private func runGate2ANTimeoutExercise(
+        provider: EPUBReadingTextProvider
+    ) {
+        guard isGate2ANAcceptanceMode,
+              !gate2ANFinished,
+              gate2ANAcceptancePhase == .batch,
+              !gate2ANTimeoutExerciseStarted,
+              let sample = gate2ANSamples.first
+        else {
+            failGate2ANAcceptance(
+                "Gate 2A-N timeout exercise could not start"
+            )
+            return
+        }
+        gate2ANTimeoutExerciseStarted = true
+        readingAudioSession.stop()
+        let intentStartedUptime = ProcessInfo.processInfo.systemUptime
+        guard readingAudioSession.activate(
+            at: sample.startLocator,
+            provider: provider
+        ),
+        readingAudioSession.state == .preparing
+        else {
+            failGate2ANAcceptance(
+                "timeout exercise did not enter preparing"
+            )
+            return
+        }
+        let exerciseID = "gate2an-timeout-exercise"
+        clickTTSGate0ProbeController.runGate2ANAcceptance(
+            text: sample.text,
+            voice: sample.voice,
+            parentWindow: window,
+            fixtureID: [
+                "click-gate2an",
+                gate2ANRunNamespace,
+                "timeout-exercise",
+            ].joined(separator: "-"),
+            chapterLocator: sample.chapterLocator,
+            locatorRange: sample.locatorRange,
+            intentStartedUptime: intentStartedUptime,
+            mutePlayback: true,
+            stopAfterFirstSound: true,
+            expectedSource: "online",
+            evictAfterFirstSound: true,
+            holdHelperAfterReadyForTimeoutExercise: true,
+            event: { [weak self] rawEvent in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var event = rawEvent
+                event["sample_id"] = exerciseID
+                event["measurement_kind"] = "controlled_timeout"
+                event["text_sha256"] = sample.textSHA256
+                event["timeout_exercise"] = true
+                self.gate2ANAcceptanceEvents.append(event)
+            },
+            completion: { [weak self] rawResult in
+                guard let self, !self.gate2ANFinished else {
+                    return
+                }
+                var result = rawResult
+                result["sample_id"] = exerciseID
+                result["measurement_kind"] = "controlled_timeout"
+                result["text_sha256"] = sample.textSHA256
+                result["character_count"] = sample.text.count
+                result["voice"] = sample.voice
+                result["chapter_locator"] = sample.chapterLocator
+                result["start_locator"] = sample.startLocator
+                result["end_locator"] = sample.endLocator
+                result["locator_range"] = sample.locatorRange
+                self.readingAudioSession.stop()
+
+                let events = self.gate2ANAcceptanceEvents.filter {
+                    $0["sample_id"] as? String == exerciseID
+                }
+                let names = events.compactMap {
+                    $0["event"] as? String
+                }
+                let ready = events.first {
+                    $0["event"] as? String == "helper_ready"
+                }
+                let terminated = events.first {
+                    $0["event"] as? String == "helper_terminated"
+                }
+                let helperPID = ready?["helper_pid"] as? Int
+                let helperPGID = ready?["helper_pgid"] as? Int
+                let terminatedPID = terminated?["helper_pid"] as? Int
+                let passed =
+                    result["status"] as? String == "timed_out"
+                    && result["timed_out"] as? Bool == true
+                    && result["timeout_exercise"] as? Bool == true
+                    && result["error"] as? String
+                        == "在线语音响应较慢，请重试"
+                    && result["cache_miss_verified"] as? Bool == true
+                    && result["first_sound_observed"] as? Bool == false
+                    && result["cache_key"] as? String == ""
+                    && names.contains("timeout_exercise_helper_held")
+                    && names.contains("timed_out")
+                    && !names.contains("first_sound")
+                    && helperPID != nil
+                    && helperPID == helperPGID
+                    && helperPID == terminatedPID
+                result["passed"] = passed
+                result["helper_pid"] = helperPID ?? 0
+                result["helper_pgid"] = helperPGID ?? 0
+                result["helper_terminated"] =
+                    helperPID != nil && helperPID == terminatedPID
+                result["submitted_text_to_helper"] = false
+                self.gate2ANTimeoutExerciseResult = result
+                if passed {
+                    self.finishGate2ANAcceptance(ok: true, error: nil)
+                } else {
+                    self.failGate2ANAcceptance(
+                        "Gate 2A-N controlled timeout exercise failed"
+                    )
+                }
+            }
+        )
+    }
+
+    private func gate2ANNNearestRank(
+        _ values: [Double],
+        percentile: Double
+    ) -> Double? {
+        guard !values.isEmpty else {
+            return nil
+        }
+        let ordered = values.sorted()
+        let rank = max(
+            1,
+            Int(ceil(percentile * Double(ordered.count)))
+        )
+        return ordered[min(ordered.count - 1, rank - 1)]
+    }
+
+    private func writeGate2ANPrivateReport(
+        _ report: [String: Any],
+        to resultURL: URL
+    ) -> Bool {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: report,
+            options: [.prettyPrinted, .sortedKeys]
+        ) else {
+            return false
+        }
+        let parent = resultURL.deletingLastPathComponent()
+        let partial = parent.appendingPathComponent(
+            ".\(resultURL.lastPathComponent).partial."
+                + UUID().uuidString.lowercased()
+        )
+        defer {
+            try? FileManager.default.removeItem(at: partial)
+        }
+        guard FileManager.default.createFile(
+            atPath: partial.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ),
+        let handle = try? FileHandle(forWritingTo: partial)
+        else {
+            return false
+        }
+        do {
+            try handle.write(contentsOf: data)
+            try handle.write(contentsOf: Data([0x0A]))
+            try handle.synchronize()
+            try handle.close()
+            if FileManager.default.fileExists(atPath: resultURL.path) {
+                try FileManager.default.removeItem(at: resultURL)
+            }
+            try FileManager.default.moveItem(
+                at: partial,
+                to: resultURL
+            )
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: resultURL.path
+            )
+            let values = try? resultURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            let attributes = try? FileManager.default.attributesOfItem(
+                atPath: resultURL.path
+            )
+            let permissions = (
+                attributes?[.posixPermissions] as? NSNumber
+            )?.intValue
+            var expectedData = data
+            expectedData.append(0x0A)
+            let writtenData = try? Data(contentsOf: resultURL)
+            return values?.isRegularFile == true
+                && values?.isSymbolicLink != true
+                && permissions == 0o600
+                && writtenData == expectedData
+        } catch {
+            try? handle.close()
+            return false
+        }
+    }
+
+    private func failGate2ANAcceptance(_ message: String) {
+        guard isGate2ANAcceptanceMode else {
+            return
+        }
+        finishGate2ANAcceptance(ok: false, error: message)
+    }
+
+    private func armGate2ANAcceptanceWatchdog() {
+        guard isGate2ANAcceptanceMode else {
+            return
+        }
+        gate2ANAcceptanceWatchdog?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.failGate2ANAcceptance(
+                "Gate 2A-N acceptance watchdog timed out"
+            )
+        }
+        gate2ANAcceptanceWatchdog = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.gate2ANAcceptanceWatchdogSeconds,
+            execute: workItem
+        )
+    }
+
+    private func finishGate2ANAcceptance(
+        ok: Bool,
+        error: String?
+    ) {
+        guard isGate2ANAcceptanceMode, !gate2ANFinished else {
+            return
+        }
+        gate2ANFinished = true
+        gate2ANAcceptanceWatchdog?.cancel()
+        gate2ANAcceptanceWatchdog = nil
+        gate2ANStartWaitWorkItem?.cancel()
+        gate2ANStartWaitWorkItem = nil
+        clickTTSGate0ProbeController.cancelAndWait(timeout: 2)
+        readingAudioSession.stop()
+        UserDefaults.standard.removeObject(
+            forKey: ClickTTSGate0Contract.disclosureDefaultsKey
+        )
+
+        let phase = gate2ANAcceptancePhase
+        let expectedCount = phase == .batch ? 30 : 1
+        let preparingValues = gate2ANAcceptanceResults.compactMap {
+            ($0["preparing_ms"] as? NSNumber)?.doubleValue
+        }
+        let firstSoundValues = gate2ANAcceptanceResults.compactMap {
+            ($0["first_sound_ms"] as? NSNumber)?.doubleValue
+        }
+        let cappedValues = gate2ANAcceptanceResults.map {
+            (($0["first_sound_ms"] as? NSNumber)?.doubleValue)
+                ?? 12_000
+        }
+        let cachedPreparingValues = gate2ANCachedResults.compactMap {
+            ($0["preparing_ms"] as? NSNumber)?.doubleValue
+        }
+        let cachedFirstSoundValues = gate2ANCachedResults.compactMap {
+            ($0["first_sound_ms"] as? NSNumber)?.doubleValue
+        }
+        let performanceSampleIDs = Set(
+            gate2ANAcceptanceResults.compactMap {
+                $0["sample_id"] as? String
+            }
+        )
+        let helperReadySampleIDs = Set(
+            gate2ANAcceptanceEvents.compactMap { event -> String? in
+                guard event["event"] as? String == "helper_ready" else {
+                    return nil
+                }
+                guard let sampleID = event["sample_id"] as? String,
+                      performanceSampleIDs.contains(sampleID)
+                else {
+                    return nil
+                }
+                return sampleID
+            }
+        )
+        let uniqueTextHashes = Set(
+            gate2ANAcceptanceResults.compactMap {
+                $0["text_sha256"] as? String
+            }
+        )
+        let cacheMissCount = gate2ANAcceptanceResults.filter {
+            $0["cache_miss_verified"] as? Bool == true
+        }.count
+        let onlineSourceCount = gate2ANAcceptanceResults.filter {
+            $0["first_sound_observed"] as? Bool == true
+                && $0["source"] as? String == "online"
+                && $0["expected_source"] as? String == "online"
+        }.count
+        let onlineCacheEvictedSuccessCount =
+            gate2ANAcceptanceResults.filter {
+            $0["first_sound_observed"] as? Bool == true
+                && $0["cache_evicted"] as? Bool == true
+        }.count
+        let cachedHitCount = gate2ANCachedResults.filter {
+            $0["cache_hit_verified"] as? Bool == true
+        }.count
+        let cachedSourceCount = gate2ANCachedResults.filter {
+            $0["first_sound_observed"] as? Bool == true
+                && $0["source"] as? String == "cache"
+                && $0["expected_source"] as? String == "cache"
+        }.count
+        let cachedEvictedCount = gate2ANCachedResults.filter {
+            $0["cache_evicted"] as? Bool == true
+        }.count
+        let cachedSuccessSampleIDs = Set(
+            gate2ANCachedResults.compactMap { result -> String? in
+                guard result["ok"] as? Bool == true,
+                      result["status"] as? String == "first_sound",
+                      result["cache_key"] as? String
+                          == result["online_cache_key"] as? String
+                else {
+                    return nil
+                }
+                return result["sample_id"] as? String
+            }
+        )
+        let onlineSuccessSampleIDs = Set(
+            gate2ANAcceptanceResults.compactMap { result -> String? in
+                guard result["status"] as? String == "first_sound" else {
+                    return nil
+                }
+                return result["sample_id"] as? String
+            }
+        )
+        let nonTimeoutFailures = gate2ANAcceptanceResults.filter {
+            $0["ok"] as? Bool != true
+                && $0["status"] as? String != "timed_out"
+        }
+        let within12Count = firstSoundValues.filter { $0 <= 12_000 }.count
+        let p50MS = gate2ANNNearestRank(
+            cappedValues,
+            percentile: 0.50
+        )
+        let p95MS = gate2ANNNearestRank(
+            cappedValues,
+            percentile: 0.95
+        )
+        let maxMS = cappedValues.max()
+        let cachedP95MS = gate2ANNNearestRank(
+            cachedFirstSoundValues,
+            percentile: 0.95
+        )
+        let cachedMaxMS = cachedFirstSoundValues.max()
+        var failureReasons = error.map { [$0] } ?? []
+        if gate2ANAcceptanceResults.count != expectedCount {
+            failureReasons.append(
+                "sample count \(gate2ANAcceptanceResults.count) != \(expectedCount)"
+            )
+        }
+        if preparingValues.count != expectedCount
+            || (preparingValues.max() ?? .infinity) > 100 {
+            failureReasons.append(
+                "preparing state was not published within 100 ms for every sample"
+            )
+        }
+        if cacheMissCount != expectedCount
+            || helperReadySampleIDs.count != expectedCount {
+            failureReasons.append(
+                "not every sample was a verified online cache miss with an owned helper"
+            )
+        }
+        if !nonTimeoutFailures.isEmpty {
+            failureReasons.append(
+                "one or more samples failed outside the bounded timeout contract"
+            )
+        }
+        if phase == .batch {
+            if uniqueTextHashes.count != 30 {
+                failureReasons.append(
+                    "batch did not contain 30 unique public text hashes"
+                )
+            }
+            if (p50MS ?? .infinity) > 4_000 {
+                failureReasons.append("first-sound P50 exceeded 4 seconds")
+            }
+            if within12Count < 29 {
+                failureReasons.append(
+                    "fewer than 29 of 30 samples started within 12 seconds"
+                )
+            }
+            if gate2ANCachedResults.count != firstSoundValues.count
+                || gate2ANCachedResults.count < 29
+                || cachedSuccessSampleIDs != onlineSuccessSampleIDs {
+                failureReasons.append(
+                    "every successful online sample was not replayed once from the same cache key"
+                )
+            }
+            if cachedPreparingValues.count
+                != gate2ANCachedResults.count
+                || (cachedPreparingValues.max() ?? .infinity) > 100 {
+                failureReasons.append(
+                    "cached replay did not publish preparing within 100 ms"
+                )
+            }
+            if cachedFirstSoundValues.count
+                != gate2ANCachedResults.count
+                || (cachedP95MS ?? .infinity) > 1_000 {
+                failureReasons.append(
+                    "cached first-sound P95 exceeded 1 second"
+                )
+            }
+            if cachedHitCount != gate2ANCachedResults.count
+                || cachedSourceCount != gate2ANCachedResults.count
+                || cachedEvictedCount != gate2ANCachedResults.count {
+                failureReasons.append(
+                    "cached replay source, hit, or precise cleanup evidence was incomplete"
+                )
+            }
+            if onlineCacheEvictedSuccessCount != 0 {
+                failureReasons.append(
+                    "online cache was removed before its immediate cached replay"
+                )
+            }
+            if gate2ANTimeoutExerciseResult?["passed"] as? Bool != true {
+                failureReasons.append(
+                    "controlled 12-second helper cancellation was not exercised"
+                )
+            }
+        } else {
+            if within12Count != 1 {
+                failureReasons.append(
+                    "audible confirmation sample did not start within 12 seconds"
+                )
+            }
+            if !gate2ANCachedResults.isEmpty
+                || onlineCacheEvictedSuccessCount != firstSoundValues.count {
+                failureReasons.append(
+                    "audible sample cleanup or phase isolation was incomplete"
+                )
+            }
+        }
+        if onlineSourceCount != firstSoundValues.count {
+            failureReasons.append(
+                "successful online first-sound samples had an invalid source"
+            )
+        }
+
+        let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? ""
+        let teamIdentifier = signingTeamIdentifier() ?? ""
+        let executableSHA256 = Bundle.main.executableURL.flatMap {
+            try? ClickTTSGate0Contract.sha256File($0)
+        } ?? ""
+        if teamIdentifier.isEmpty || executableSHA256.isEmpty {
+            failureReasons.append(
+                "running installed app identity is incomplete"
+            )
+        }
+        let machineOK = ok && failureReasons.isEmpty
+        var metrics: [String: Any] = [
+            "sample_count": gate2ANAcceptanceResults.count,
+            "unique_text_hash_count": uniqueTextHashes.count,
+            "cache_miss_count": cacheMissCount,
+            "owned_helper_ready_count": helperReadySampleIDs.count,
+            "online_source_count": onlineSourceCount,
+            "first_sound_count": firstSoundValues.count,
+            "within_12_seconds_count": within12Count,
+            "within_12_seconds_rate": expectedCount > 0
+                ? Double(within12Count) / Double(expectedCount)
+                : 0,
+            "online_cache_evicted_success_count":
+                onlineCacheEvictedSuccessCount,
+            "cached_sample_count": gate2ANCachedResults.count,
+            "cached_hit_count": cachedHitCount,
+            "cached_source_count": cachedSourceCount,
+            "cached_cache_evicted_count": cachedEvictedCount,
+            "cached_preparing_max_ms":
+                cachedPreparingValues.max() ?? NSNull(),
+            "cached_p95_ms": cachedP95MS ?? NSNull(),
+            "cached_max_ms": cachedMaxMS ?? NSNull(),
+            "performance_timeout_count":
+                expectedCount - firstSoundValues.count,
+            "controlled_timeout_exercise_passed":
+                gate2ANTimeoutExerciseResult?["passed"] as? Bool == true,
+            "preparing_max_ms": preparingValues.max() ?? NSNull(),
+            "p50_ms": p50MS ?? NSNull(),
+            "p95_ms": p95MS ?? NSNull(),
+            "max_ms": maxMS ?? NSNull(),
+        ]
+        if phase == .audible {
+            metrics["user_heard_audio"] = NSNull()
+        }
+        var report: [String: Any] = [
+            "schema": "click.mac.gate2an.installed-acceptance.v1",
+            "ok": machineOK,
+            "mode": Self.gate2ANAcceptanceModeValue,
+            "phase": phase?.rawValue ?? "",
+            "fixture_sha256": Self.gate1AcceptanceFixtureSHA256,
+            "sample_derivation":
+                "verified Gate 1 EPUB chapter 1 contiguous windows",
+            "submitted_text_in_output": false,
+            "hard_deadline_seconds": 12,
+            "first_sound_clock":
+                "same AVAudioPlayer isPlaying && currentTime > 0.01",
+            "metrics": metrics,
+            "results": gate2ANAcceptanceResults,
+            "cached_results": gate2ANCachedResults,
+            "events": gate2ANAcceptanceEvents,
+            "timeout_exercise":
+                gate2ANTimeoutExerciseResult ?? NSNull(),
+            "reader_api_available": readerAPIAvailable,
+            "process_id": ProcessInfo.processInfo.processIdentifier,
+            "bundle_path": bundlePath,
+            "bundle_identifier": bundleIdentifier,
+            "team_identifier": teamIdentifier,
+            "executable_sha256": executableSHA256,
+            "ns_home_directory": NSHomeDirectory(),
+            "acceptance_watchdog_seconds":
+                Self.gate2ANAcceptanceWatchdogSeconds,
+            "network_contract": [
+                "provider": "Microsoft Edge online",
+                "hostname": "speech.platform.bing.com",
+                "protocol": "wss",
+                "port": 443,
+                "proxy_mode": "direct-no-proxy",
+                "tls_verification": true,
+                "internal_acceptance_not_microsoft_sla": true,
+            ],
+            "generated_at": ISO8601DateFormatter().string(from: Date()),
+        ]
+        if !failureReasons.isEmpty {
+            report["error"] = failureReasons.joined(separator: "; ")
+        }
+        let resultURL = resolvedGate2ANResultURL()
+        let wroteResult: Bool
+        if let resultURL {
+            wroteResult = writeGate2ANPrivateReport(
+                report,
+                to: resultURL
+            )
+        } else {
+            wroteResult = false
+        }
+        statusLabel.stringValue = machineOK && wroteResult
+            ? "Gate 2A-N 安装版原生首声机器验收完成"
+            : "Gate 2A-N 安装版验收失败"
+        if phase == .batch,
+           wroteResult,
+           let resultURL {
+            let ackURL = resultURL
+                .deletingLastPathComponent()
+                .appendingPathComponent(
+                    "click-gate2an-resource-finished"
+                )
+            gate2ANResourceAckDeadlineUptime =
+                ProcessInfo.processInfo.systemUptime
+                    + Self.gate2ANResourceAckSeconds
+            waitForGate2ANResourceAck(ackURL)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func waitForGate2ANResourceAck(_ ackURL: URL) {
+        if let deadline = gate2ANResourceAckDeadlineUptime,
+           ProcessInfo.processInfo.systemUptime > deadline {
+            statusLabel.stringValue =
+                "Gate 2A-N 资源采样结束确认超时"
+            NSApp.terminate(nil)
+            return
+        }
+        if FileManager.default.fileExists(atPath: ackURL.path) {
+            let values = try? ackURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            let data = try? Data(contentsOf: ackURL)
+            guard values?.isRegularFile == true,
+                  values?.isSymbolicLink != true,
+                  data == Data("resource-finished\n".utf8)
+            else {
+                statusLabel.stringValue =
+                    "Gate 2A-N 资源采样结束信号无效"
+                NSApp.terminate(nil)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                NSApp.terminate(nil)
+            }
+            return
+        }
+        let item = DispatchWorkItem { [weak self] in
+            self?.waitForGate2ANResourceAck(ackURL)
+        }
+        gate2ANResourceAckWaitWorkItem = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.05,
+            execute: item
+        )
+    }
+
+    private func failGate1Acceptance(_ message: String) {
+        guard isGate1AcceptanceMode else {
+            return
+        }
+        finishGate1Acceptance(ok: false, error: message)
+    }
+
+    private func armGate1AcceptanceWatchdog() {
+        guard isGate1AcceptanceMode else {
+            return
+        }
+        gate1AcceptanceWatchdog?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.failGate1Acceptance(
+                "acceptance watchdog timed out before completion"
+            )
+        }
+        gate1AcceptanceWatchdog = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.gate1AcceptanceWatchdogSeconds,
+            execute: workItem
+        )
+    }
+
+    private func signingTeamIdentifier() -> String? {
+        var dynamicCode: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &dynamicCode) == errSecSuccess,
+              let dynamicCode
+        else {
+            return nil
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(
+            dynamicCode,
+            SecCSFlags(),
+            &staticCode
+        ) == errSecSuccess,
+        let staticCode
+        else {
+            return nil
+        }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode,
+            SecCSFlags(rawValue: kSecCSSigningInformation),
+            &information
+        ) == errSecSuccess,
+        let dictionary = information as? [String: Any]
+        else {
+            return nil
+        }
+        return dictionary[kSecCodeInfoTeamIdentifier as String] as? String
+    }
+
+    private func finishGate1Acceptance(
+        ok: Bool,
+        error: String?
+    ) {
+        guard isGate1AcceptanceMode else {
+            return
+        }
+        if case .finished = gate1AcceptancePhase {
+            return
+        }
+        gate1AcceptanceWatchdog?.cancel()
+        gate1AcceptanceWatchdog = nil
+        let activeState = readingAudioSession.state.rawValue
+        gate1AcceptancePhase = .finished
+        readingJumpCoordinator.cancel()
+        pendingReadingMove = nil
+        let bundlePath = Bundle.main.bundleURL.standardizedFileURL.path
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? ""
+        let teamIdentifier = signingTeamIdentifier() ?? ""
+        let executableURL = Bundle.main.executableURL
+        let executableSHA256 = executableURL.flatMap {
+            try? ClickTTSGate0Contract.sha256File($0)
+        } ?? ""
+        let bookHash = currentBookEntry?.bookHash ?? ""
+        let importRoot = currentBookEntry.map {
+            URL(
+                fileURLWithPath: $0.bookRootPath,
+                isDirectory: true
+            ).standardizedFileURL.path
+        } ?? ""
+        let ownedEPUBPath = currentBookEntry.map {
+            URL(fileURLWithPath: $0.epubPath).standardizedFileURL.path
+        } ?? ""
+        var failureReasons = error.map { [$0] } ?? []
+        if teamIdentifier.isEmpty {
+            failureReasons.append("could not read the running code signature team")
+        }
+        if executableSHA256.isEmpty {
+            failureReasons.append("could not hash the running executable")
+        }
+        if ok && (bookHash.isEmpty || importRoot.isEmpty || ownedEPUBPath.isEmpty) {
+            failureReasons.append("accepted EPUB import identity is incomplete")
+        }
+        let reportedOK = ok && failureReasons.isEmpty
+        var report: [String: Any] = [
+            "schema": "click.mac.gate1.installed-acceptance.v1",
+            "ok": reportedOK,
+            "mode": Self.gate1AcceptanceModeValue,
+            "fixture_sha256": Self.gate1AcceptanceFixtureSHA256,
+            "normalizer_revision": ReadingDocument.normalizerRevision,
+            "active_state_before_stop": activeState,
+            "events": gate1AcceptanceEvents,
+            "reader_api_available": readerAPIAvailable,
+            "audio_requested": false,
+            "tts_helper_requested": false,
+            "process_id": ProcessInfo.processInfo.processIdentifier,
+            "bundle_path": bundlePath,
+            "bundle_identifier": bundleIdentifier,
+            "team_identifier": teamIdentifier,
+            "executable_sha256": executableSHA256,
+            "ns_home_directory": NSHomeDirectory(),
+            "book_hash": bookHash,
+            "import_root": importRoot,
+            "owned_epub_path": ownedEPUBPath,
+            "acceptance_watchdog_seconds":
+                Self.gate1AcceptanceWatchdogSeconds,
+            "generated_at": ISO8601DateFormatter().string(from: Date()),
+        ]
+        if let document = readingTextProvider?.document {
+            report["document_revision"] = document.revision
+            report["chapter_order"] = document.chapters.map(\.locator)
+            report["chapter_counts"] = document.chapters.map { descriptor in
+                readingTextProvider?.chapter(at: descriptor.index)?
+                    .sentences.count ?? 0
+            }
+        }
+        if !failureReasons.isEmpty {
+            report["error"] = failureReasons.joined(separator: "; ")
+        }
+        if let resultURL = gate1AcceptanceResultURL,
+           let data = try? JSONSerialization.data(
+                withJSONObject: report,
+                options: [.prettyPrinted, .sortedKeys]
+           ) {
+            try? FileManager.default.createDirectory(
+                at: resultURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? data.write(to: resultURL, options: .atomic)
+        }
+        readingAudioSession.stop()
+        statusLabel.stringValue = reportedOK
+            ? "Gate 1 安装版文本与会话验收通过（无音频）"
+            : "Gate 1 安装版验收失败：\(failureReasons.joined(separator: "; "))"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func readingInteger(_ value: Any?) -> Int? {
+        if let int = value as? Int {
+            return int
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String {
+            return Int(string)
+        }
+        return nil
+    }
+
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard let payload = message.body as? [String: Any],
               let type = payload["type"] as? String
@@ -4803,11 +26446,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
 
         let text = (payload["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sourceWebView = message.webView
+        let sourceIsMainFrame = message.frameInfo.isMainFrame
+        if type == "readingChapter"
+            || type == "readingJumpCandidate"
+            || type == "readingJumpCancel"
+            || type == "readingBrowse" {
+            guard message.frameInfo.isMainFrame,
+                  sourceWebView === webView,
+                  !isPDFReadingMode,
+                  !isComicReadingMode
+            else {
+                return
+            }
+            switch type {
+            case "readingChapter":
+                installRenderedReadingChapter(from: payload)
+            case "readingJumpCandidate":
+                scheduleReadingJumpCandidate(from: payload)
+            case "readingJumpCancel":
+                readingJumpCoordinator.cancel()
+            case "readingBrowse":
+                markReadingTTSManualBrowse()
+            default:
+                break
+            }
+            return
+        }
         DispatchQueue.main.async {
             switch type {
+            case "libraryOpenBook":
+                guard self.isLibraryWebView(sourceWebView),
+                      let bookID = payload["book_id"] as? String,
+                      !bookID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    return
+                }
+                self.openNativeReaderFromLibraryBookID(
+                    bookID,
+                    sourceWebView: sourceWebView,
+                    requestID: payload["request_id"] as? String
+                )
             case "ready":
-                let count = payload["sentenceCount"] as? Int ?? 0
-                self.statusLabel.stringValue = "第 \(self.currentChapterIndex + 1) / \(self.chapters.count) 章 · 句子 \(count)"
+                let count = self.readingTextProvider?
+                    .chapter(at: self.currentChapterIndex)?
+                    .sentences.count
+                if let count {
+                    self.statusLabel.stringValue = self.installedReadingBridgeChapterIndex == self.currentChapterIndex
+                        ? "第 \(self.currentChapterIndex + 1) / \(self.chapters.count) 章 · 规范化句子 \(count)"
+                        : "第 \(self.currentChapterIndex + 1) / \(self.chapters.count) 章 · 正在建立稳定句子定位"
+                } else {
+                    self.statusLabel.stringValue = "第 \(self.currentChapterIndex + 1) / \(self.chapters.count) 章 · 朗读文本内核未就绪"
+                }
                 let initialPage = self.pendingInitialPage
                 self.pendingInitialPage = .start
                 self.applyReaderSettingsToWebView()
@@ -4821,29 +26511,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     self.webView.evaluateJavaScript("window.__sentenceReaderRestorePage && window.__sentenceReaderRestorePage(\(pageIndex), \(pageRatio), \(totalPages));")
                 }
                 self.restoreAnnotationsForCurrentChapter()
-                if let pendingIndex = self.pendingNoteJumpIndex {
-                    self.pendingNoteJumpIndex = nil
+                if let pendingNote = self.pendingNoteJump {
+                    self.pendingNoteJump = nil
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        self.jumpToSentence(index: pendingIndex)
+                        self.jumpToAnnotation(pendingNote)
                     }
                 }
+                self.completePendingLibraryBookOpenIfReady()
             case "focus":
+                self.lastFocusedReadingLocator = (
+                    payload["locator"] as? String
+                )?.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.statusLabel.stringValue = text.isEmpty ? "已聚焦当前句" : "已聚焦：\(text)"
             case "note":
                 self.statusLabel.stringValue = "正在为当前句添加备注"
-                self.showNotePanel(sentence: text, sentenceIndex: self.sentenceIndexPayload(from: payload))
+                self.showNotePanel(
+                    sentence: text,
+                    sentenceIndex: self.sentenceIndexPayload(from: payload),
+                    sentenceTargets: self.sentenceTargets(from: payload)
+                )
             case "selectionCopy":
                 let rawText = payload["text"] as? String ?? text
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(rawText, forType: .string)
                 self.statusLabel.stringValue = rawText.isEmpty ? "没有可复制的选中文字" : "已复制选中文字"
+            case "selectionReadSentence":
+                guard sourceIsMainFrame,
+                      sourceWebView === self.webView,
+                      !self.isPDFReadingMode,
+                      !self.isComicReadingMode
+                else {
+                    return
+                }
+                self.readSelectionSentence(from: payload)
             case "selectionNote":
                 self.statusLabel.stringValue = "正在为选中文字添加备注"
                 self.showNotePanel(
                     sentence: text,
                     sentenceIndex: self.sentenceIndexPayload(from: payload),
                     selectionFragments: self.selectionFragments(from: payload),
-                    selectionMode: "text_selection_note"
+                    selectionMode: "text_selection_note",
+                    sentenceTargets: self.sentenceTargets(from: payload)
                 )
             case "selectionRed":
                 let count = payload["redCount"] as? Int ?? 0
@@ -4852,7 +26560,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 self.persistSelectionRed(
                     sentence: text,
                     sentenceIndex: self.sentenceIndexPayload(from: payload),
-                    fragments: self.selectionFragments(from: payload)
+                    fragments: self.selectionFragments(from: payload),
+                    sentenceTargets: self.sentenceTargets(from: payload)
                 )
             case "selectionRedUndo":
                 let count = payload["redCount"] as? Int ?? 0
@@ -4860,13 +26569,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 self.statusLabel.stringValue = "正在撤回选中文字红标..."
                 self.deleteSelectionRed(
                     sentenceIndex: self.sentenceIndexPayload(from: payload),
-                    fragments: self.selectionFragments(from: payload)
+                    fragments: self.selectionFragments(from: payload),
+                    requestedAnnotationIDs: self.annotationIDsPayload(from: payload)
                 )
             case "lookup":
                 self.showLookupPanel(
                     word: payload["word"] as? String ?? "",
                     sentence: text,
-                    sentenceIndex: self.sentenceIndexPayload(from: payload)
+                    sentenceIndex: self.sentenceIndexPayload(from: payload),
+                    sentenceTargets: self.sentenceTargets(from: payload)
                 )
             case "notePreview":
                 self.showNotePreview(
@@ -4881,7 +26592,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 self.persistRed(
                     sentence: text,
                     sentenceIndex: self.sentenceIndexPayload(from: payload),
-                    isRed: payload["isRed"] as? Bool ?? true
+                    isRed: payload["isRed"] as? Bool ?? true,
+                    sentenceTargets: self.sentenceTargets(from: payload),
+                    requestedAnnotationIDs: self.annotationIDsPayload(from: payload)
                 )
             case "undo":
                 let count = payload["redCount"] as? Int ?? 0
@@ -4892,12 +26605,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     self.persistRed(
                         sentence: text,
                         sentenceIndex: self.sentenceIndexPayload(from: payload),
-                        isRed: payload["isRed"] as? Bool ?? false
+                        isRed: payload["isRed"] as? Bool ?? false,
+                        sentenceTargets: self.sentenceTargets(from: payload),
+                        requestedAnnotationIDs: self.annotationIDsPayload(from: payload)
                     )
                 }
             case "annotationsRestored":
                 let count = payload["redCount"] as? Int ?? 0
                 self.redLabel.stringValue = "红标 \(count)"
+                if let chapterLocator = self.currentChapterLocator() {
+                    let prefix = "\(chapterLocator)#"
+                    self.redAnnotationIDs = self.redAnnotationIDs.filter {
+                        !$0.key.hasPrefix(prefix)
+                    }
+                    let bindings = payload["redBindings"]
+                        as? [[String: Any]] ?? []
+                    for binding in bindings {
+                        guard let annotationID = binding["id"] as? String,
+                              !annotationID.isEmpty,
+                              let sentenceIndex = self.sentenceIndexString(
+                                from: binding["index"]
+                              )
+                        else {
+                            continue
+                        }
+                        self.redAnnotationIDs[
+                            self.annotationKey(
+                                chapterLocator: chapterLocator,
+                                sentenceIndex: sentenceIndex
+                            )
+                        ] = annotationID
+                    }
+                }
             case "page":
                 let page = payload["page"] as? Int ?? 1
                 let total = payload["total"] as? Int ?? 1
@@ -4921,7 +26660,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         sentence: String,
         sentenceIndex: String,
         selectionFragments: [[String: Any]] = [],
-        selectionMode: String? = nil
+        selectionMode: String? = nil,
+        sentenceTargets: [[String: Any]] = []
     ) {
         let alert = NSAlert()
         alert.messageText = "添加备注"
@@ -4962,6 +26702,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         recordButton.action = #selector(NoteSpeechController.toggleRecording(_:))
         providerPopup.target = speechController
         providerPopup.action = #selector(NoteSpeechController.providerChanged(_:))
+        speechController.onTranscriptionFinished = { [weak alert, weak textView] _ in
+            guard let alert,
+                  let textView,
+                  !NoteTextNormalizer.normalized(textView.string).isEmpty
+            else {
+                return
+            }
+            alert.buttons.first?.performClick(nil)
+        }
         noteSpeechController = speechController
 
         accessory.addSubview(scroll)
@@ -4970,28 +26719,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         accessory.addSubview(speechStatus)
         alert.accessoryView = accessory
         alert.beginSheetModal(for: window) { response in
-            let audioNoteID = self.noteSpeechController?.latestAudioNoteID
-            self.noteSpeechController?.cancel()
+            let controller = self.noteSpeechController
+            let audioNoteID = response == .alertFirstButtonReturn ? controller?.prepareForSave() : nil
+            if response == .alertFirstButtonReturn, let controller, let audioNoteID {
+                self.retainSpeechControllerForBackground(controller, audioNoteID: audioNoteID)
+            } else if response != .alertFirstButtonReturn {
+                controller?.cancel()
+            }
             self.noteSpeechController = nil
             if response == .alertFirstButtonReturn {
-                let noteText = NoteTextNormalizer.normalized(textView.string)
+                let normalized = NoteTextNormalizer.normalized(textView.string)
+                let noteText = normalized.isEmpty && audioNoteID != nil ? "语音转写中..." : normalized
                 self.persistNote(
                     sentence: sentence,
                     sentenceIndex: sentenceIndex,
                     noteText: noteText,
                     audioNoteID: audioNoteID,
                     selectionFragments: selectionFragments,
-                    selectionMode: selectionMode
+                    selectionMode: selectionMode,
+                    sentenceTargets: sentenceTargets
                 )
             }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            guard self.noteSpeechController === speechController,
+                  self.window.attachedSheet === alert.window
+            else {
+                return
+            }
+            speechController.beginVoiceFirstRecording()
+        }
     }
 
-    private func showLookupPanel(word: String, sentence: String, sentenceIndex: String) {
+    private func showLookupPanel(
+        word: String,
+        sentence: String,
+        sentenceIndex: String,
+        sentenceTargets: [[String: Any]] = []
+    ) {
         let trimSet = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'.,;:!?()[]{}<>“”‘’"))
         let cleanedWord = word.trimmingCharacters(in: trimSet)
         guard !cleanedWord.isEmpty else {
-            showNotePanel(sentence: sentence, sentenceIndex: sentenceIndex)
+            showNotePanel(
+                sentence: sentence,
+                sentenceIndex: sentenceIndex,
+                sentenceTargets: sentenceTargets
+            )
             return
         }
         guard let bookID = readerBookID, !bookID.isEmpty else {
@@ -5001,7 +26774,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         statusLabel.stringValue = "正在查词：\(cleanedWord)"
         DispatchQueue.global(qos: .userInitiated).async { [readerAPI] in
-            let payload = readerAPI.lookupWord(bookID: bookID, word: cleanedWord, sentenceIndex: sentenceIndex)
+            let payload = readerAPI.lookupWord(
+                bookID: bookID,
+                word: cleanedWord,
+                sentenceIndex: sentenceIndex,
+                sentence: sentence
+            )
             let lemma = Self.lookupLemma(from: payload) ?? cleanedWord.lowercased()
             readerAPI.createLookupEvent(
                 bookID: bookID,
@@ -5016,13 +26794,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     word: cleanedWord,
                     sentence: sentence,
                     sentenceIndex: sentenceIndex,
+                    sentenceTargets: sentenceTargets,
                     payload: payload
                 )
             }
         }
     }
 
-    private func showLookupAlert(bookID: String, word: String, sentence: String, sentenceIndex: String, payload: [String: Any]?) {
+    private func showLookupAlert(
+        bookID: String,
+        word: String,
+        sentence: String,
+        sentenceIndex: String,
+        sentenceTargets: [[String: Any]] = [],
+        payload: [String: Any]?
+    ) {
         guard window.attachedSheet == nil else {
             statusLabel.stringValue = "已有弹窗打开，查词结果未显示"
             return
@@ -5214,7 +27000,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     self.window.endSheet(sheet)
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    self.showNotePanel(sentence: sentence, sentenceIndex: sentenceIndex)
+                    self.showNotePanel(
+                        sentence: sentence,
+                        sentenceIndex: sentenceIndex,
+                        sentenceTargets: sentenceTargets
+                    )
                 }
             }
             accessory.addSubview(noteButton)
@@ -5503,6 +27293,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             statusLabel.stringValue = "没有可朗读的英文"
             return
         }
+        if isPDFReadingMode {
+            speakEnglishFallback(trimmed)
+            return
+        }
         statusLabel.stringValue = "正在准备英文朗读"
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let audioData = readerAPI.lookupCachedTTSData(text: trimmed, voice: "en-US-BrianNeural")
@@ -5547,6 +27341,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             statusLabel.stringValue = "没有可朗读的释义"
+            return
+        }
+        if isPDFReadingMode {
+            speakChineseFallback(trimmed)
             return
         }
         statusLabel.stringValue = "正在准备释义朗读"
@@ -5857,6 +27655,191 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return sentenceIndexString(from: payload["index"]) ?? ""
     }
 
+    private func sentenceTargets(from payload: [String: Any]) -> [[String: Any]] {
+        let rawTargets = payload["sentenceTargets"] as? [[String: Any]] ?? []
+        let candidates: [[String: Any]]
+        if rawTargets.isEmpty {
+            let fallbackIndex = sentenceIndexPayload(from: payload)
+            let fallbackLocator = (payload["locator"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let fallbackText = payload["text"] as? String ?? ""
+            candidates = fallbackIndex.isEmpty ? [] : [[
+                "sentenceIndex": fallbackIndex,
+                "sentenceLocator": fallbackLocator,
+                "sourceText": fallbackText,
+            ]]
+        } else {
+            candidates = rawTargets
+        }
+
+        var seen = Set<String>()
+        return candidates.compactMap { target in
+            guard let sentenceIndex = sentenceIndexString(
+                from: target["sentenceIndex"] ?? target["index"]
+            ) else {
+                return nil
+            }
+            let locator = (
+                target["sentenceLocator"] as? String
+                    ?? target["locator"] as? String
+                    ?? ""
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let sourceText = target["sourceText"] as? String
+                ?? target["text"] as? String
+                ?? ""
+            let key = "\(sentenceIndex)\u{1f}\(locator)\u{1f}\(sourceText)"
+            guard seen.insert(key).inserted else {
+                return nil
+            }
+            return [
+                "sentenceIndex": sentenceIndex,
+                "sentenceLocator": locator,
+                "sourceText": sourceText,
+            ]
+        }
+    }
+
+    private func sentenceLocatorFields(
+        targets: [[String: Any]]
+    ) -> [String: Any] {
+        var seen = Set<String>()
+        let locators = targets.compactMap { target -> String? in
+            let locator = (target["sentenceLocator"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !locator.isEmpty, seen.insert(locator).inserted else {
+                return nil
+            }
+            return locator
+        }
+        var fields: [String: Any] = [
+            "sentenceTargets": targets,
+            "sentenceLocators": locators,
+        ]
+        if locators.count == 1 {
+            fields["sentenceLocator"] = locators[0]
+        }
+        return fields
+    }
+
+    private func storedSentenceLocatorFields(
+        range: [String: Any],
+        metadata: [String: Any]
+    ) -> [String: Any] {
+        var fields: [String: Any] = [:]
+        for key in [
+            "sentenceLocator",
+            "sentenceLocators",
+            "sentenceTargets",
+        ] {
+            if let value = range[key] ?? metadata[key] {
+                fields[key] = value
+            }
+        }
+        return fields
+    }
+
+    private func storedSentenceTargets(
+        range: [String: Any],
+        metadata: [String: Any]
+    ) -> [[String: Any]] {
+        for rawValue in [
+            range["sentenceTargets"],
+            metadata["sentenceTargets"],
+        ] {
+            guard let targets = rawValue as? [[String: Any]] else {
+                continue
+            }
+            let normalized = sentenceTargets(from: [
+                "sentenceTargets": targets,
+            ])
+            if !normalized.isEmpty {
+                return normalized
+            }
+        }
+        return []
+    }
+
+    private func sentenceTargets(
+        fromSelectionFragments fragments: [[String: Any]]
+    ) -> [[String: Any]] {
+        let rawTargets = fragments.compactMap { fragment -> [String: Any]? in
+            guard let sentenceIndex = sentenceIndexString(
+                from: fragment["sentenceIndex"]
+            ) else {
+                return nil
+            }
+            return [
+                "sentenceIndex": sentenceIndex,
+                "sentenceLocator": fragment["sentenceLocator"] as? String ?? "",
+                "sourceText": fragment["sentenceSourceText"] as? String ?? "",
+            ]
+        }
+        return sentenceTargets(from: [
+            "sentenceTargets": rawTargets,
+        ])
+    }
+
+    private func firstStoredSentenceLocator(
+        range: [String: Any],
+        metadata: [String: Any]
+    ) -> String {
+        for rawValue in [
+            range["sentenceLocator"],
+            metadata["sentenceLocator"],
+        ] {
+            let locator = (rawValue as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !locator.isEmpty {
+                return locator
+            }
+        }
+        for rawValue in [
+            range["sentenceLocators"],
+            metadata["sentenceLocators"],
+        ] {
+            let locator = (rawValue as? [Any])?
+                .compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty } ?? ""
+            if !locator.isEmpty {
+                return locator
+            }
+        }
+        for rawValue in [
+            range["sentenceTargets"],
+            metadata["sentenceTargets"],
+        ] {
+            let locator = (rawValue as? [[String: Any]])?
+                .compactMap {
+                    ($0["sentenceLocator"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                .first { !$0.isEmpty } ?? ""
+            if !locator.isEmpty {
+                return locator
+            }
+        }
+        return ""
+    }
+
+    private func annotationIDsPayload(from payload: [String: Any]) -> [String] {
+        let rawIDs = payload["annotationIDs"] as? [Any] ?? []
+        var seen = Set<String>()
+        return rawIDs.compactMap { rawID in
+            guard let rawID = rawID as? String else {
+                return nil
+            }
+            let annotationID = rawID.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !annotationID.isEmpty,
+                  seen.insert(annotationID).inserted
+            else {
+                return nil
+            }
+            return annotationID
+        }
+    }
+
     private func integerValue(from rawValue: Any?) -> Int? {
         if let intValue = rawValue as? Int {
             return intValue
@@ -5885,12 +27868,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             else {
                 return nil
             }
-            return [
+            var normalized: [String: Any] = [
                 "sentenceIndex": sentenceIndex,
                 "startOffset": startOffset,
                 "endOffset": endOffset,
                 "text": fragment["text"] as? String ?? "",
             ]
+            let locator = (fragment["sentenceLocator"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !locator.isEmpty {
+                normalized["sentenceLocator"] = locator
+            }
+            if let sourceText = fragment["sentenceSourceText"] as? String,
+               !sourceText.isEmpty {
+                normalized["sentenceSourceText"] = sourceText
+            }
+            return normalized
         }
     }
 
@@ -5902,7 +27895,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         else {
             return nil
         }
-        return "\(sentenceIndex):\(startOffset):\(endOffset)"
+        let locator = (fragment["sentenceLocator"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sourceText = (fragment["sentenceSourceText"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let identity = locator.isEmpty || sourceText.isEmpty
+            ? "index:\(sentenceIndex)"
+            : "locator:\(locator):\(sourceText)"
+        return "\(identity):\(startOffset):\(endOffset)"
     }
 
     private func selectionFragmentKeys(from fragments: [[String: Any]]) -> Set<String> {
@@ -5922,7 +27922,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         noteText: String,
         audioNoteID: String? = nil,
         selectionFragments: [[String: Any]] = [],
-        selectionMode: String? = nil
+        selectionMode: String? = nil,
+        sentenceTargets: [[String: Any]] = []
     ) {
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator(),
@@ -5932,21 +27933,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         let chapterTitle = chapterTitles.indices.contains(currentChapterIndex) ? chapterTitles[currentChapterIndex] : nil
-        var rangeLocator: [String: Any]? = nil
-        var metadata: [String: Any]? = nil
+        var rangeLocator: [String: Any] = [
+            "chapterLocator": chapterLocator,
+            "sentenceIndex": sentenceIndex,
+        ]
+        var metadata: [String: Any] = [
+            "source": "SentenceReaderNative",
+            "sentenceIndex": sentenceIndex,
+        ]
+        for (key, value) in sentenceLocatorFields(targets: sentenceTargets) {
+            rangeLocator[key] = value
+            metadata[key] = value
+        }
         if let selectionMode, !selectionFragments.isEmpty {
-            rangeLocator = [
-                "chapterLocator": chapterLocator,
-                "sentenceIndex": sentenceIndex,
-                "mode": selectionMode,
-                "fragments": selectionFragments,
-            ]
-            metadata = [
-                "source": "SentenceReaderNative",
-                "sentenceIndex": sentenceIndex,
-                "mode": selectionMode,
-                "fragments": selectionFragments,
-            ]
+            rangeLocator["mode"] = selectionMode
+            rangeLocator["fragments"] = selectionFragments
+            metadata["mode"] = selectionMode
+            metadata["fragments"] = selectionFragments
         }
         statusLabel.stringValue = "正在保存备注到 Reader API..."
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
@@ -5983,7 +27986,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    private func persistSelectionRed(sentence: String, sentenceIndex: String, fragments: [[String: Any]]) {
+    private func persistSelectionRed(
+        sentence: String,
+        sentenceIndex: String,
+        fragments: [[String: Any]],
+        sentenceTargets: [[String: Any]]
+    ) {
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator(),
               !sentenceIndex.isEmpty,
@@ -5993,18 +28001,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         let chapterTitle = chapterTitles.indices.contains(currentChapterIndex) ? chapterTitles[currentChapterIndex] : nil
-        let rangeLocator: [String: Any] = [
+        var rangeLocator: [String: Any] = [
             "chapterLocator": chapterLocator,
             "sentenceIndex": sentenceIndex,
             "mode": "text_selection",
             "fragments": fragments,
         ]
-        let metadata: [String: Any] = [
+        var metadata: [String: Any] = [
             "source": "SentenceReaderNative",
             "sentenceIndex": sentenceIndex,
             "mode": "text_selection",
             "fragments": fragments,
         ]
+        for (key, value) in sentenceLocatorFields(targets: sentenceTargets) {
+            rangeLocator[key] = value
+            metadata[key] = value
+        }
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let annotationID = readerAPI.createAnnotation(
                 bookID: bookID,
@@ -6026,7 +28038,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    private func deleteSelectionRed(sentenceIndex: String, fragments: [[String: Any]]) {
+    private func deleteSelectionRed(
+        sentenceIndex: String,
+        fragments: [[String: Any]],
+        requestedAnnotationIDs: [String]
+    ) {
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator(),
               !sentenceIndex.isEmpty,
@@ -6046,6 +28062,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             let annotations = readerAPI.listAnnotations(bookID: bookID)
             var exactIDs: [String] = []
             var overlappingIDs: [String] = []
+            var validatedRequestedIDs: [String] = []
+            let requestedIDSet = Set(requestedAnnotationIDs)
 
             for annotation in annotations {
                 guard let annotationID = annotation["id"] as? String,
@@ -6059,6 +28077,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 let mode = range["mode"] as? String ?? metadata["mode"] as? String ?? ""
                 guard mode == "text_selection" else {
                     continue
+                }
+                if requestedIDSet.contains(annotationID) {
+                    validatedRequestedIDs.append(annotationID)
                 }
 
                 let rangeFragments = self.selectionFragments(fromRawFragments: range["fragments"])
@@ -6076,7 +28097,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 }
             }
 
-            let idsToDelete = Set(exactIDs.isEmpty ? overlappingIDs : exactIDs)
+            let matchedIDs = Set(exactIDs.isEmpty ? overlappingIDs : exactIDs)
+            let idsToDelete = requestedIDSet.isEmpty
+                ? matchedIDs
+                : Set(validatedRequestedIDs)
             var allDeleted = true
             for annotationID in idsToDelete {
                 allDeleted = readerAPI.deleteAnnotation(annotationID: annotationID) && allDeleted
@@ -6094,7 +28118,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    private func persistRed(sentence: String, sentenceIndex: String, isRed: Bool) {
+    private func persistRed(
+        sentence: String,
+        sentenceIndex: String,
+        isRed: Bool,
+        sentenceTargets: [[String: Any]],
+        requestedAnnotationIDs: [String]
+    ) {
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator(),
               !sentenceIndex.isEmpty
@@ -6115,6 +28145,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             let missingIndexes = missingPairs.map { index, _ in index }
             let missingKeys = missingPairs.map { _, key in key }
             let missingSentenceIndex = missingIndexes.joined(separator: ",")
+            let missingIndexSet = Set(missingIndexes)
+            let missingTargets = sentenceTargets.filter { target in
+                guard let index = self.sentenceIndexString(
+                    from: target["sentenceIndex"]
+                ) else {
+                    return false
+                }
+                return missingIndexSet.contains(index)
+            }
+            var rangeLocator: [String: Any] = [
+                "chapterLocator": chapterLocator,
+                "sentenceIndex": missingSentenceIndex,
+            ]
+            var metadata: [String: Any] = [
+                "source": "SentenceReaderNative",
+                "sentenceIndex": missingSentenceIndex,
+            ]
+            for (key, value) in sentenceLocatorFields(
+                targets: missingTargets
+            ) {
+                rangeLocator[key] = value
+                metadata[key] = value
+            }
             DispatchQueue.global(qos: .utility).async { [readerAPI] in
                 let annotationID = readerAPI.createAnnotation(
                     bookID: bookID,
@@ -6124,7 +28177,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                     color: "red",
                     chapterTitle: chapterTitle,
                     chapterLocator: chapterLocator,
-                    sentenceIndex: missingSentenceIndex
+                    sentenceIndex: missingSentenceIndex,
+                    rangeLocator: rangeLocator,
+                    metadata: metadata
                 )
                 DispatchQueue.main.async {
                     if let annotationID {
@@ -6143,6 +28198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
 
         let annotationIDs = Set(keys.compactMap { redAnnotationIDs[$0] })
+            .union(requestedAnnotationIDs)
         for key in keys {
             redAnnotationIDs[key] = nil
         }
@@ -6151,12 +28207,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             return
         }
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
+            let allowedIDs = Set(
+                readerAPI.listAnnotations(bookID: bookID).compactMap {
+                    annotation -> String? in
+                    guard annotation["kind"] as? String == "red_highlight",
+                          annotation["chapter_locator"] as? String
+                            == chapterLocator,
+                          let annotationID = annotation["id"] as? String,
+                          annotationIDs.contains(annotationID)
+                    else {
+                        return nil
+                    }
+                    return annotationID
+                }
+            )
             var allDeleted = true
-            for annotationID in annotationIDs {
+            for annotationID in allowedIDs {
                 allDeleted = readerAPI.deleteAnnotation(annotationID: annotationID) && allDeleted
             }
             DispatchQueue.main.async {
-                self.statusLabel.stringValue = allDeleted ? "红标取消已保存到 Reader API" : "红标取消保存失败，已恢复数据库状态"
+                if allowedIDs.isEmpty {
+                    self.statusLabel.stringValue = "没有找到可取消的红标"
+                } else {
+                    self.statusLabel.stringValue = allDeleted ? "红标取消已保存到 Reader API" : "红标取消保存失败，已恢复数据库状态"
+                }
                 self.refreshNotes()
                 self.restoreAnnotationsForCurrentChapter()
             }
@@ -6164,6 +28238,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func restoreAnnotationsForCurrentChapter() {
+        if isPDFReadingMode {
+            restorePDFAnnotations()
+            return
+        }
         guard let bookID = readerBookID,
               let chapterLocator = currentChapterLocator()
         else {
@@ -6172,8 +28250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         DispatchQueue.global(qos: .utility).async { [readerAPI] in
             let annotations = readerAPI.listAnnotations(bookID: bookID)
-            var redIndexes: [String] = []
-            var redIDs: [String: String] = [:]
+            var redItems: [[String: Any]] = []
             var selectionRedFragments: [[String: Any]] = []
             var noteItems: [[String: Any]] = []
             for annotation in annotations {
@@ -6196,52 +28273,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
                 if kind == "red_highlight" {
                     let mode = range["mode"] as? String ?? metadata["mode"] as? String ?? ""
                     if mode == "text_selection" {
-                        if let fragments = range["fragments"] as? [[String: Any]] {
-                            selectionRedFragments.append(contentsOf: fragments)
-                        } else if let fragments = metadata["fragments"] as? [[String: Any]] {
-                            selectionRedFragments.append(contentsOf: fragments)
+                        let fragments = range["fragments"] as? [[String: Any]]
+                            ?? metadata["fragments"] as? [[String: Any]]
+                            ?? []
+                        for var fragment in fragments {
+                            fragment["annotationID"] = id
+                            fragment["annotationSourceText"] =
+                                annotation["source_text"] as? String ?? ""
+                            selectionRedFragments.append(fragment)
                         }
                         continue
                     }
-                    redIndexes.append(contentsOf: indexes)
-                    for index in indexes {
-                        redIDs[self.annotationKey(chapterLocator: chapterLocator, sentenceIndex: index)] = id
+                    var item: [String: Any] = [
+                        "id": id,
+                        "index": indexes.joined(separator: ","),
+                        "indexes": indexes,
+                        "sourceText": annotation["source_text"] as? String ?? "",
+                    ]
+                    for (key, value) in self.storedSentenceLocatorFields(
+                        range: range,
+                        metadata: metadata
+                    ) {
+                        item[key] = value
                     }
+                    redItems.append(item)
                     continue
                 }
 
                 if kind == "note" {
-                    noteItems.append([
+                    var item: [String: Any] = [
                         "id": id,
                         "index": indexes.joined(separator: ","),
                         "indexes": indexes,
                         "sourceText": annotation["source_text"] as? String ?? "",
                         "noteText": annotation["note_text"] as? String ?? "",
-                    ])
+                    ]
+                    for (key, value) in self.storedSentenceLocatorFields(
+                        range: range,
+                        metadata: metadata
+                    ) {
+                        item[key] = value
+                    }
+                    noteItems.append(item)
                 }
             }
 
             DispatchQueue.main.async {
                 let prefix = "\(chapterLocator)#"
                 self.redAnnotationIDs = self.redAnnotationIDs.filter { !$0.key.hasPrefix(prefix) }
-                for (key, value) in redIDs {
-                    self.redAnnotationIDs[key] = value
-                }
                 let payload: [String: Any] = [
-                    "redIndexes": Array(Set(redIndexes)).sorted { lhs, rhs in
-                        let leftNumber = Int(lhs)
-                        let rightNumber = Int(rhs)
-                        if let leftNumber, let rightNumber {
-                            return leftNumber < rightNumber
-                        }
-                        if leftNumber != nil {
-                            return true
-                        }
-                        if rightNumber != nil {
-                            return false
-                        }
-                        return lhs < rhs
-                    },
+                    "redItems": redItems,
                     "selectionRedFragments": selectionRedFragments,
                     "notes": noteItems,
                 ]
@@ -6253,7 +28334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
     }
 
-    private static let readerScript = """
+    static let readerScript = """
     (function () {
       if (window.__sentenceReaderNativeReady) { return; }
       window.__sentenceReaderNativeReady = true;
@@ -6508,7 +28589,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
         p, li, blockquote, div { line-height: var(--sr-line-height) !important; }
         .sr-sentence { border-radius: 3px !important; cursor: text !important; -webkit-user-select: text !important; user-select: text !important; }
-        .sr-sentence.sr-focused { background: var(--sr-focus-bg) !important; box-shadow: 0 0 0 1px var(--sr-focus-ring) inset !important; }
+        .sr-sentence.sr-focused, .sr-sentence.sr-reading-focused { background: var(--sr-focus-bg) !important; box-shadow: 0 0 0 1px var(--sr-focus-ring) inset !important; }
+        .sr-sentence.sr-reading-playing {
+          background: rgba(255, 196, 64, .25) !important;
+          box-shadow: 0 0 0 1px rgba(255, 214, 112, .52) inset !important;
+        }
         .sr-word-focused {
           border-radius: .24em !important;
           background: rgba(0, 122, 255, .34) !important;
@@ -6546,6 +28631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           display: flex !important;
         }
         #sr-selection-action-bar button {
+          box-sizing: border-box !important;
           appearance: none !important;
           -webkit-appearance: none !important;
           min-width: 58px !important;
@@ -6709,44 +28795,370 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         convertScriptureFootnotes(surface);
         installScriptureFootnoteToggles(surface);
       }
-      function parts(text) {
-        const out = [];
-        const nonSentenceBoundaryCharacters = '：:；;';
-        const sentenceBoundaryRegex = /([^。！？!?\\n]+[。！？!?]+[”’」』）】》〕〉]*|[^。！？!?\\n]+$|\\n+)/g;
-        let match;
-        while ((match = sentenceBoundaryRegex.exec(text)) !== null) { out.push(match[0]); }
-        return out.length ? out : [text];
+      const readingBlockSelector = 'h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption';
+      const nonSentenceBoundaryCharacters = '：:；;';
+      function normalizeReadingText(value) {
+        return String(value || '')
+          .replace(/\\u00a0/g, ' ')
+          .replace(/[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u200b\\u200e\\u200f\\u202a-\\u202e\\u2060-\\u206f\\ufeff]/g, '')
+          .replace(/\\s+/g, ' ')
+          .trim();
       }
-      function skip(node) {
-        const parent = node.parentElement;
-        return !parent || parent.closest('script,style,noscript,code,pre,textarea,input,.sr-sentence') || !node.nodeValue.trim();
+      function readingSemanticValue(element) {
+        if (!element || !element.getAttribute) { return ''; }
+        return [
+          element.getAttribute('epub:type') || '',
+          element.getAttribute('type') || '',
+          element.getAttribute('role') || ''
+        ].join(' ').toLowerCase();
       }
-      function wrapNode(node, state) {
-        if (skip(node)) { return; }
-        const split = parts(node.nodeValue);
-        if (split.length <= 1 && split[0].trim().length < 8) { return; }
-        const fragment = document.createDocumentFragment();
-        for (const item of split) {
-          if (!item.trim()) { fragment.appendChild(document.createTextNode(item)); continue; }
-          const span = document.createElement('span');
-          span.className = 'sr-sentence';
-          span.dataset.srIndex = String(state.nextIndex++);
-          span.textContent = item;
-          fragment.appendChild(span);
+      function readingElementIsExcluded(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) { return false; }
+        const tag = String(element.localName || element.tagName || '').toLowerCase();
+        if (['script', 'style', 'noscript', 'template', 'nav', 'aside', 'rt', 'rp', 'summary', 'button', 'input', 'textarea', 'select', 'option', 'code', 'pre'].indexOf(tag) >= 0) {
+          return true;
         }
-        node.parentNode.replaceChild(fragment, node);
+        if (element.hasAttribute('hidden') || element.hasAttribute('inert')) { return true; }
+        if (String(element.getAttribute('aria-hidden') || '').toLowerCase() === 'true') { return true; }
+        const semantics = readingSemanticValue(element);
+        if (/footnote|endnote|noteref|pagebreak|doc-footnote|doc-endnote|doc-noteref|doc-pagebreak/.test(semantics)) {
+          return true;
+        }
+        const idClass = [
+          element.id || '',
+          typeof element.className === 'string' ? element.className : ''
+        ].join(' ').toLowerCase();
+        if (/(^|[\\s_-])(footnote|endnote|noteref|pagebreak|page[-_]?number|pagenum)(?=$|[\\s_-])/.test(idClass)) {
+          return true;
+        }
+        if (tag === 'details' && !element.hasAttribute('open')) {
+          return true;
+        }
+        if (element.matches && element.matches('details.sr-scripture-footnote, .sr-scripture-footnote-content')) {
+          return true;
+        }
+        let style = null;
+        try { style = window.getComputedStyle ? window.getComputedStyle(element) : null; } catch (error) {}
+        if (style && (
+          style.display === 'none'
+          || style.visibility === 'hidden'
+          || style.visibility === 'collapse'
+          || Number(style.opacity) <= 0
+        )) {
+          return true;
+        }
+        return false;
       }
-      function wrap() {
-        ensureSurface();
-        normalizeCollapsibleScriptureBlocks();
-        const state = { nextIndex: document.querySelectorAll('.sr-sentence').length };
-        document.querySelectorAll('#sr-page-surface p, #sr-page-surface li, #sr-page-surface blockquote, #sr-page-surface h1, #sr-page-surface h2, #sr-page-surface h3, #sr-page-surface h4, #sr-page-surface h5, #sr-page-surface h6').forEach(function (root) {
-          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-          const nodes = [];
-          while (walker.nextNode()) { nodes.push(walker.currentNode); }
-          nodes.forEach(function (node) { wrapNode(node, state); });
+      function readingTextNodeIsVisible(node, surface) {
+        if (!node || node.nodeType !== Node.TEXT_NODE || !String(node.nodeValue || '').trim()) { return false; }
+        let element = node.parentElement;
+        while (element && element !== surface) {
+          if (readingElementIsExcluded(element)) { return false; }
+          element = element.parentElement;
+        }
+        return element === surface;
+      }
+      function readingElementPath(element, surface) {
+        const parts = [];
+        let current = element;
+        while (current && current !== surface) {
+          const parent = current.parentElement;
+          if (!parent) { return ''; }
+          const tag = String(current.localName || current.tagName || 'node').toLowerCase();
+          const siblings = Array.from(parent.children).filter(function (sibling) {
+            return String(sibling.localName || sibling.tagName || '').toLowerCase() === tag;
+          });
+          parts.unshift(tag + '[' + String(Math.max(0, siblings.indexOf(current)) + 1) + ']');
+          current = parent;
+        }
+        return current === surface ? parts.join('/') : '';
+      }
+      function readingNodePath(node, root) {
+        const path = [];
+        let current = node;
+        while (current && current !== root) {
+          const parent = current.parentNode;
+          if (!parent) { return []; }
+          path.unshift(Array.prototype.indexOf.call(parent.childNodes, current));
+          current = parent;
+        }
+        return current === root ? path : [];
+      }
+      function readingSeparatorBetween(previousNode, nextNode) {
+        if (!previousNode || !nextNode) { return ''; }
+        const range = document.createRange();
+        try {
+          range.setStartAfter(previousNode);
+          range.setEndBefore(nextNode);
+          const fragment = range.cloneContents();
+          return fragment.querySelector && fragment.querySelector('br') ? '\\n' : '';
+        } catch (error) {
+          return '';
+        } finally {
+          range.detach && range.detach();
+        }
+      }
+      function isReadingPeriodBoundary(text, index) {
+        const previous = text.charAt(index - 1);
+        const next = text.charAt(index + 1);
+        if (/\\d/.test(previous) && /\\d/.test(next)) { return false; }
+        if (/[A-Za-z]/.test(previous) && /[A-Za-z]/.test(next) && text.charAt(index + 2) === '.') {
+          return false;
+        }
+        const prefix = text.slice(Math.max(0, index - 12), index + 1);
+        if (/\\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc)\\.$/i.test(prefix)) { return false; }
+        if (/(?:\\b[A-Za-z]\\.){2,}$/.test(prefix)) { return false; }
+        return !next || /\\s|[”’」』）】》〕〉"']/.test(next);
+      }
+      function readingSentenceRanges(text) {
+        const ranges = [];
+        let start = 0;
+        function append(end) {
+          let trimmedStart = start;
+          let trimmedEnd = end;
+          while (trimmedStart < trimmedEnd && /\\s/.test(text.charAt(trimmedStart))) { trimmedStart += 1; }
+          while (trimmedEnd > trimmedStart && /\\s/.test(text.charAt(trimmedEnd - 1))) { trimmedEnd -= 1; }
+          if (trimmedEnd > trimmedStart && normalizeReadingText(text.slice(trimmedStart, trimmedEnd))) {
+            ranges.push({ start: trimmedStart, end: trimmedEnd });
+          }
+          start = end;
+        }
+        let index = 0;
+        while (index < text.length) {
+          const character = text.charAt(index);
+          const boundary = /[。！？!?\\n]/.test(character)
+            || (character === '.' && isReadingPeriodBoundary(text, index));
+          if (!boundary) {
+            index += 1;
+            continue;
+          }
+          let end = index + 1;
+          while (end < text.length && /[”’」』）】》〕〉"']/.test(text.charAt(end))) { end += 1; }
+          append(end);
+          index = end;
+        }
+        if (start < text.length) { append(text.length); }
+        return ranges;
+      }
+      function wrapReadingAssignments(assignments) {
+        const byNode = new Map();
+        assignments.forEach(function (assignment) {
+          if (!byNode.has(assignment.node)) { byNode.set(assignment.node, []); }
+          byNode.get(assignment.node).push(assignment);
+        });
+        byNode.forEach(function (items, originalNode) {
+          items.sort(function (left, right) { return right.start - left.start; });
+          items.forEach(function (item) {
+            if (!originalNode.parentNode || item.end <= item.start) { return; }
+            const suffix = originalNode.splitText(item.end);
+            const selected = originalNode.splitText(item.start);
+            const span = document.createElement('span');
+            span.className = 'sr-sentence';
+            span.dataset.srIndex = item.rendererIndex;
+            span.dataset.srReadingKey = item.sourceKey;
+            selected.parentNode.replaceChild(span, selected);
+            span.appendChild(selected);
+            void suffix;
+          });
         });
       }
+      function wrap() {
+        const surface = ensureSurface();
+        normalizeCollapsibleScriptureBlocks();
+        const grouped = new Map();
+        const walker = document.createTreeWalker(surface, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+          const node = walker.currentNode;
+          if (!readingTextNodeIsVisible(node, surface)) { continue; }
+          const block = node.parentElement && node.parentElement.closest
+            ? node.parentElement.closest(readingBlockSelector)
+            : null;
+          if (!block || !surface.contains(block)) { continue; }
+          if (!grouped.has(block)) { grouped.set(block, []); }
+          grouped.get(block).push(node);
+        }
+
+        const state = { nextIndex: document.querySelectorAll('.sr-sentence').length };
+        const readingRecords = [];
+        const assignments = [];
+        grouped.forEach(function (nodes, block) {
+          const sourcePath = readingElementPath(block, surface);
+          if (!sourcePath) { return; }
+          let raw = '';
+          const nodeRecords = [];
+          nodes.forEach(function (node, nodeIndex) {
+            const value = String(node.nodeValue || '');
+            if (nodeIndex > 0) {
+              raw += readingSeparatorBetween(nodes[nodeIndex - 1], node);
+            }
+            const start = raw.length;
+            raw += value;
+            nodeRecords.push({
+              node: node,
+              start: start,
+              end: raw.length,
+              nodePath: readingNodePath(node, block)
+            });
+          });
+          readingSentenceRanges(raw).forEach(function (sentenceRange, sourceOrdinal) {
+            const text = normalizeReadingText(raw.slice(sentenceRange.start, sentenceRange.end));
+            if (!text) { return; }
+            const sourceKey = sourcePath + '#' + String(sourceOrdinal);
+            const sourceRanges = [];
+            const rendererIndexes = [];
+            nodeRecords.forEach(function (record) {
+              const overlapStart = Math.max(sentenceRange.start, record.start);
+              const overlapEnd = Math.min(sentenceRange.end, record.end);
+              if (overlapEnd <= overlapStart) { return; }
+              const localStart = overlapStart - record.start;
+              const localEnd = overlapEnd - record.start;
+              const selectedText = String(record.node.nodeValue || '').slice(localStart, localEnd);
+              if (!selectedText || !normalizeReadingText(selectedText)) { return; }
+              const rendererIndex = String(state.nextIndex++);
+              rendererIndexes.push(rendererIndex);
+              sourceRanges.push({
+                nodePath: record.nodePath,
+                startUTF16: localStart,
+                endUTF16: localEnd
+              });
+              assignments.push({
+                node: record.node,
+                start: localStart,
+                end: localEnd,
+                rendererIndex: rendererIndex,
+                sourceKey: sourceKey
+              });
+            });
+            if (!rendererIndexes.length || !sourceRanges.length) { return; }
+            readingRecords.push({
+              sourceKey: sourceKey,
+              sourcePath: sourcePath,
+              sourceOrdinal: sourceOrdinal,
+              text: text,
+              sourceRanges: sourceRanges,
+              rendererIndexes: rendererIndexes
+            });
+          });
+        });
+        wrapReadingAssignments(assignments);
+        return readingRecords;
+      }
+      window.__sentenceReaderInstallReadingChapter = function (payload) {
+        payload = payload || {};
+        const assignments = Array.isArray(payload.sentences) ? payload.sentences : [];
+        const bySourceKey = new Map();
+        assignments.forEach(function (item) {
+          if (item && item.sourceKey && item.locator) {
+            bySourceKey.set(String(item.sourceKey), item);
+          }
+        });
+        let installedFragments = 0;
+        document.querySelectorAll('.sr-sentence[data-sr-reading-key]').forEach(function (node) {
+          const item = bySourceKey.get(String(node.dataset.srReadingKey || ''));
+          if (!item) {
+            delete node.dataset.srLocator;
+            delete node.dataset.srReadingIndex;
+            return;
+          }
+          node.dataset.srLocator = String(item.locator);
+          node.dataset.srReadingIndex = String(item.index);
+          installedFragments += 1;
+        });
+        window.__clickReadingDocumentRevision = String(payload.documentRevision || '');
+        window.__clickReadingChapterLocator = String(payload.chapterLocator || '');
+        return {
+          sentenceCount: assignments.length,
+          fragmentCount: installedFragments,
+          documentRevision: window.__clickReadingDocumentRevision
+        };
+      };
+      window.__sentenceReaderFocusReadingLocator = function (locator) {
+        const target = String(locator || '');
+        const fragments = Array.from(document.querySelectorAll('.sr-sentence[data-sr-locator]')).filter(function (node) {
+          return String(node.dataset.srLocator || '') === target;
+        });
+        if (!fragments.length) { return false; }
+        document.querySelectorAll('.sr-sentence.sr-reading-focused').forEach(function (node) {
+          node.classList.remove('sr-reading-focused');
+        });
+        fragments.forEach(function (node) { node.classList.add('sr-reading-focused'); });
+        const first = fragments[0];
+        pageIndex = Math.max(0, Math.min(Math.round(first.offsetLeft / pageStep()), maxPageIndex()));
+        applyPage(false, 0);
+        return true;
+      };
+      window.__sentenceReaderReadingStartLocator = function () {
+        const focused = document.querySelector('.sr-sentence.sr-focused[data-sr-locator], .sr-sentence.sr-reading-focused[data-sr-locator]');
+        if (focused && focused.dataset.srLocator) {
+          return String(focused.dataset.srLocator);
+        }
+        const left = pageOffsetForIndex(pageIndex);
+        const right = left + pageStep();
+        const candidates = Array.from(
+          document.querySelectorAll(
+            '.sr-sentence[data-sr-locator]'
+          )
+        ).filter(function (node) {
+          const nodeLeft = Number(node.offsetLeft || 0);
+          const width = Math.max(
+            1,
+            Number(node.offsetWidth || 0)
+          );
+          return nodeLeft >= left - 1
+            && nodeLeft + width <= right + 1;
+        }).sort(function (first, second) {
+          const horizontal = Number(first.offsetLeft || 0)
+            - Number(second.offsetLeft || 0);
+          if (horizontal !== 0) { return horizontal; }
+          return Number(first.offsetTop || 0)
+            - Number(second.offsetTop || 0);
+        });
+        const first = candidates[0];
+        return first && first.dataset.srLocator
+          ? String(first.dataset.srLocator)
+          : '';
+      };
+      window.__sentenceReaderSetPlayingLocator = function (
+        locator,
+        follow
+      ) {
+        const target = String(locator || '');
+        document.querySelectorAll(
+          '.sr-sentence.sr-reading-playing'
+        ).forEach(function (node) {
+          node.classList.remove('sr-reading-playing');
+        });
+        const fragments = Array.from(
+          document.querySelectorAll(
+            '.sr-sentence[data-sr-locator]'
+          )
+        ).filter(function (node) {
+          return String(node.dataset.srLocator || '') === target;
+        });
+        fragments.forEach(function (node) {
+          node.classList.add('sr-reading-playing');
+        });
+        if (follow && fragments.length) {
+          const first = fragments[0];
+          pageIndex = Math.max(
+            0,
+            Math.min(
+              Math.round(first.offsetLeft / pageStep()),
+              maxPageIndex()
+            )
+          );
+          applyPage(false, 0);
+        }
+        return fragments.length > 0;
+      };
+      window.__sentenceReaderClearPlayingLocator = function () {
+        document.querySelectorAll(
+          '.sr-sentence.sr-reading-playing'
+        ).forEach(function (node) {
+          node.classList.remove('sr-reading-playing');
+        });
+        return true;
+      };
       function sentenceFromTarget(target) {
         if (!target) { return null; }
         target = target.nodeType === Node.TEXT_NODE ? target.parentElement : target;
@@ -6804,6 +29216,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       }
       function indexesFrom(value) {
         return String(value || '').split(',').map(function (item) { return item.trim(); }).filter(Boolean);
+      }
+      function sentenceTargetPayload(sentence) {
+        if (!sentence) { return null; }
+        return {
+          sentenceIndex: String(sentence.dataset.srIndex || ''),
+          sentenceLocator: String(sentence.dataset.srLocator || ''),
+          sourceText: String(sentence.textContent || '')
+        };
+      }
+      function sentenceTargetsPayload(sentences) {
+        return uniqueSentences(sentences || []).map(sentenceTargetPayload).filter(function (target) {
+          return !!(target && target.sentenceIndex);
+        });
+      }
+      function annotationIDsForSentence(sentence) {
+        if (!sentence) { return []; }
+        try {
+          const values = JSON.parse(String(sentence.dataset.srRedAnnotationIds || '[]'));
+          return Array.isArray(values) ? values.map(String).filter(Boolean) : [];
+        } catch (error) {
+          return [];
+        }
       }
       function compareSentenceIndex(left, right) {
         const leftNumber = Number(left.dataset.srIndex || 0);
@@ -6866,6 +29300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       let selectionDragStart = null;
       let selectionDragMoved = false;
       let selectionDragAllowedUntil = 0;
+      let selectionGestureActive = false;
+      let lastSelectionPointerActivityAt = 0;
       let selectionRedFragments = [];
       function selectionTextOffset(sentence, node, offset) {
         if (!sentence || !node) { return -1; }
@@ -6937,6 +29373,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             }
             fragments.push({
               sentenceIndex: sentenceIndex,
+              sentenceLocator: String(sentence.dataset.srLocator || ''),
+              sentenceSourceText: String(sentence.textContent || ''),
               startOffset: startOffset,
               endOffset: endOffset,
               text: text
@@ -6961,6 +29399,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           normalizedText: normalizedText,
           index: indexes.join(','),
           indexes: indexes,
+          sentenceTargets: sentenceTargetsPayload(sentences.filter(function (sentence) {
+            return indexes.indexOf(String(sentence.dataset.srIndex || '')) >= 0;
+          })),
           fragments: fragments,
           rect: anchorRect ? {
             left: anchorRect.left,
@@ -6980,7 +29421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         selectionActionBar = document.createElement('div');
         selectionActionBar.id = 'sr-selection-action-bar';
         selectionActionBar.className = 'sr-selection-action-bar';
-        selectionActionBar.innerHTML = '<button type="button" data-sr-selection-action="copy">复制</button><button type="button" data-sr-selection-action="red">标红</button><button type="button" data-sr-selection-action="note">备注</button>';
+        selectionActionBar.innerHTML = '<button type="button" data-sr-selection-action="copy">复制</button><button type="button" data-sr-selection-action="red">标红</button><button type="button" data-sr-selection-action="note">备注</button><button type="button" data-sr-selection-action="read">朗读本句</button>';
         selectionActionBar.addEventListener('mousedown', function (event) {
           event.preventDefault();
           event.stopPropagation();
@@ -7032,7 +29473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         activeSelectionPayload = payload;
         updateSelectionActionBarState(payload);
         const rect = payload && payload.rect;
-        const width = 186;
+        const width = 262;
         const viewportWidthValue = Math.max(320, window.innerWidth || document.documentElement.clientWidth || 0);
         const viewportHeightValue = Math.max(240, window.innerHeight || document.documentElement.clientHeight || 0);
         const centerX = rect ? (rect.left + rect.right) / 2 : viewportWidthValue / 2;
@@ -7082,16 +29523,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (!event || event.button !== 0 || !targetAllowsSelectionActionDrag(event.target)) {
           selectionDragStart = null;
           selectionDragMoved = false;
+          selectionGestureActive = false;
           return;
         }
+        cancelReadingJumpCandidate('selection-mousedown');
         hideSelectionActionBar();
         selectionDragAllowedUntil = 0;
+        selectionGestureActive = true;
+        lastSelectionPointerActivityAt = Date.now();
         selectionDragStart = pointFromEvent(event);
         selectionDragMoved = false;
       }
       function updateSelectionActionDrag(event) {
         if (!selectionDragStart || !event) { return; }
         if (typeof event.buttons === 'number' && event.buttons !== 0 && (event.buttons & 1) !== 1) { return; }
+        lastSelectionPointerActivityAt = Date.now();
         const point = pointFromEvent(event);
         const dx = point.x - selectionDragStart.x;
         const dy = point.y - selectionDragStart.y;
@@ -7100,24 +29546,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
       }
       function finishSelectionActionDrag(event) {
-        if (!selectionDragStart) { return; }
+        if (!selectionDragStart) {
+          selectionGestureActive = false;
+          return;
+        }
         updateSelectionActionDrag(event);
         const wasRealDrag = selectionDragMoved;
         selectionDragStart = null;
         selectionDragMoved = false;
+        selectionGestureActive = false;
+        lastSelectionPointerActivityAt = Date.now();
         if (!wasRealDrag) {
           if (!selectionActionBarVisible()) { hideSelectionActionBar(); }
           return;
         }
-        selectionDragAllowedUntil = Date.now() + 900;
-        window.setTimeout(scheduleSelectionActionBarUpdate, 40);
+        selectionDragAllowedUntil = Date.now() + 1400;
+        window.setTimeout(scheduleSelectionActionBarUpdate, 150);
       }
-      function hideSelectionActionBarWhenSelectionGone() {
-        if (!selectionActionBarVisible()) { return; }
-        if (!readerSelectionPayload()) { hideSelectionActionBar(); }
+      function handleReaderSelectionChange() {
+        const payload = readerSelectionPayload();
+        if (!payload) {
+          hideSelectionActionBar();
+          return;
+        }
+        if (selectionGestureActive) {
+          hideSelectionActionBar();
+          return;
+        }
+        if (selectionActionBarSuppressed()) {
+          hideSelectionActionBar();
+          return;
+        }
+        if (selectionActionBarVisible()
+            || Date.now() - lastSelectionPointerActivityAt < 1400) {
+          selectionDragAllowedUntil = Date.now() + 1400;
+          scheduleSelectionActionBarUpdate();
+        }
       }
       function fragmentKey(fragment) {
-        return String(fragment.sentenceIndex || '') + ':' + String(fragment.startOffset || 0) + ':' + String(fragment.endOffset || 0);
+        const locator = String(fragment.sentenceLocator || '');
+        const sourceText = normalizeReadingText(fragment.sentenceSourceText || '');
+        const identity = locator && sourceText
+          ? 'locator:' + locator + ':' + sourceText
+          : 'index:' + String(fragment.sentenceIndex || '');
+        return identity + ':' + String(fragment.startOffset || 0) + ':' + String(fragment.endOffset || 0);
       }
       function selectionFragmentKeySet(fragments) {
         const keys = {};
@@ -7130,27 +29602,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const bySentence = {};
         (fragments || []).forEach(function (fragment) {
           const sentenceIndex = String(fragment.sentenceIndex || '');
+          const sentenceLocator = String(fragment.sentenceLocator || '');
+          const sentenceSourceText = String(fragment.sentenceSourceText || '');
           const startOffset = Number(fragment.startOffset);
           const endOffset = Number(fragment.endOffset);
           if (!sentenceIndex || !Number.isFinite(startOffset) || !Number.isFinite(endOffset) || endOffset <= startOffset) { return; }
-          if (!bySentence[sentenceIndex]) { bySentence[sentenceIndex] = []; }
-          bySentence[sentenceIndex].push({
+          const sentenceKey = sentenceLocator && sentenceSourceText
+            ? 'locator:' + sentenceLocator + ':' + normalizeReadingText(sentenceSourceText)
+            : 'index:' + sentenceIndex;
+          if (!bySentence[sentenceKey]) { bySentence[sentenceKey] = []; }
+          const annotationIDs = [];
+          const rawAnnotationIDs = Array.isArray(fragment.annotationIDs)
+            ? fragment.annotationIDs
+            : [fragment.annotationID];
+          rawAnnotationIDs.filter(function (value) {
+            return typeof value === 'string' && value.trim();
+          }).map(String).forEach(function (annotationID) {
+            if (annotationIDs.indexOf(annotationID) < 0) { annotationIDs.push(annotationID); }
+          });
+          bySentence[sentenceKey].push({
             sentenceIndex: sentenceIndex,
+            sentenceLocator: sentenceLocator,
+            sentenceSourceText: sentenceSourceText,
             startOffset: Math.max(0, Math.floor(startOffset)),
             endOffset: Math.max(0, Math.floor(endOffset)),
-            text: String(fragment.text || '')
+            text: String(fragment.text || ''),
+            annotationIDs: annotationIDs
           });
         });
         const merged = [];
-        Object.keys(bySentence).forEach(function (sentenceIndex) {
-          const items = bySentence[sentenceIndex].sort(function (left, right) {
+        Object.keys(bySentence).forEach(function (sentenceKey) {
+          const items = bySentence[sentenceKey].sort(function (left, right) {
             if (left.startOffset !== right.startOffset) { return left.startOffset - right.startOffset; }
             return left.endOffset - right.endOffset;
           });
           items.forEach(function (item) {
             const previous = merged.length ? merged[merged.length - 1] : null;
-            if (previous && previous.sentenceIndex === item.sentenceIndex && item.startOffset <= previous.endOffset) {
+            if (previous
+                && fragmentKey({
+                  sentenceIndex: previous.sentenceIndex,
+                  sentenceLocator: previous.sentenceLocator,
+                  sentenceSourceText: previous.sentenceSourceText,
+                  startOffset: 0,
+                  endOffset: 0
+                }) === fragmentKey({
+                  sentenceIndex: item.sentenceIndex,
+                  sentenceLocator: item.sentenceLocator,
+                  sentenceSourceText: item.sentenceSourceText,
+                  startOffset: 0,
+                  endOffset: 0
+                })
+                && item.startOffset <= previous.endOffset) {
               previous.endOffset = Math.max(previous.endOffset, item.endOffset);
+              (item.annotationIDs || []).forEach(function (annotationID) {
+                if (previous.annotationIDs.indexOf(annotationID) < 0) {
+                  previous.annotationIDs.push(annotationID);
+                }
+              });
               return;
             }
             merged.push(item);
@@ -7217,8 +29725,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         fragments.forEach(function (fragment) {
           const sentence = document.querySelector('.sr-sentence[data-sr-index="' + String(fragment.sentenceIndex) + '"]');
           if (!sentence) { return; }
+          if (fragment.sentenceLocator
+              && String(sentence.dataset.srLocator || '') !== String(fragment.sentenceLocator)) {
+            return;
+          }
+          if (fragment.sentenceSourceText
+              && normalizeReadingText(sentence.textContent || '') !== normalizeReadingText(fragment.sentenceSourceText)) {
+            return;
+          }
           const range = rangeForPlainTextOffsets(sentence, fragment.startOffset, fragment.endOffset);
           if (!range || String(range.toString() || '').length === 0) { return; }
+          if (fragment.text && String(range.toString() || '') !== String(fragment.text)) {
+            range.detach && range.detach();
+            return;
+          }
           try {
             const span = document.createElement('span');
             span.className = 'sr-selection-red';
@@ -7258,6 +29778,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           return !!redKeys[fragmentKey(fragment)];
         });
       }
+      function selectionAnnotationIDsForPayload(payload) {
+        const payloadKeys = selectionFragmentKeySet(payload && payload.fragments);
+        const annotationIDs = [];
+        normalizeSelectionFragments(selectionRedFragments).forEach(function (fragment) {
+          if (!payloadKeys[fragmentKey(fragment)]) { return; }
+          (fragment.annotationIDs || []).forEach(function (annotationID) {
+            if (annotationIDs.indexOf(annotationID) < 0) {
+              annotationIDs.push(annotationID);
+            }
+          });
+        });
+        return annotationIDs;
+      }
       function updateSelectionActionBarState(payload) {
         const bar = selectionActionBarNode();
         const redButton = bar.querySelector('button[data-sr-selection-action="red"]');
@@ -7267,6 +29800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         redButton.dataset.srSelectionRedMode = isExactRed ? 'remove' : 'add';
       }
       function handleSelectionAction(action) {
+        cancelReadingJumpCandidate('selection-action');
         const payload = activeSelectionPayload || readerSelectionPayload();
         if (!payload) {
           hideSelectionActionBar();
@@ -7276,6 +29810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           text: payload.text,
           index: payload.index,
           indexes: payload.indexes,
+          sentenceTargets: payload.sentenceTargets || [],
           fragments: payload.fragments
         };
         if (action === 'copy') {
@@ -7284,9 +29819,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           clearTextSelection();
           return;
         }
+        if (action === 'read') {
+          post(Object.assign({ type: 'selectionReadSentence' }, message));
+          hideSelectionActionBar();
+          clearTextSelection();
+          return;
+        }
         if (action === 'red') {
           const previousFragments = selectionRedFragments.slice();
           if (selectionPayloadHasExactRed(payload)) {
+            const annotationIDs = selectionAnnotationIDsForPayload(payload);
             removeSelectionRedFragments(payload.fragments);
             undoStack.push({
               type: 'selectionRedRemove',
@@ -7294,9 +29836,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
               fragments: payload.fragments,
               text: payload.text,
               index: payload.index,
-              indexes: payload.indexes
+              indexes: payload.indexes,
+              sentenceTargets: payload.sentenceTargets || [],
+              annotationIDs: annotationIDs
             });
-            post(Object.assign({ type: 'selectionRedUndo', actionType: 'selectionRedRemove', redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length }, message));
+            post(Object.assign({
+              type: 'selectionRedUndo',
+              actionType: 'selectionRedRemove',
+              annotationIDs: annotationIDs,
+              redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length
+            }, message));
             hideSelectionActionBar();
             clearTextSelection();
             return;
@@ -7308,7 +29857,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             fragments: payload.fragments,
             text: payload.text,
             index: payload.index,
-            indexes: payload.indexes
+            indexes: payload.indexes,
+            sentenceTargets: payload.sentenceTargets || []
           });
           post(Object.assign({ type: 'selectionRed', redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length }, message));
           hideSelectionActionBar();
@@ -7332,7 +29882,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         sentenceWhen: ['plain-click', 'english-click-lookup', 'double-click-note', 'context-click-red'],
         sentenceContextWinsOnlyWithoutSelection: true,
         selectedTextActionBar: 'sr-selection-action-bar',
-        copyPath: 'selection-action-bar-copy-button-not-command-c'
+        copyPath: 'selection-action-bar-copy-button-not-command-c',
+        audioSessionCandidate: 'active-reading-audio-session-single-click-v1'
       };
       function isEditableTarget(target) {
         const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
@@ -7350,6 +29901,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         event.preventDefault();
         event.stopPropagation();
         if (event.stopImmediatePropagation) { event.stopImmediatePropagation(); }
+      }
+      function readingJumpTargetIsExcluded(target) {
+        const node = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement;
+        if (!node || !node.closest) { return true; }
+        return !!node.closest('a[href], summary, input, textarea, select, button, [contenteditable="true"], [contenteditable=""], #sr-selection-action-bar');
+      }
+      function cancelReadingJumpCandidate(reason) {
+        post({ type: 'readingJumpCancel', reason: String(reason || 'protected-interaction') });
+      }
+      function postReadingJumpCandidate(sentence, event) {
+        if (!sentence || readingJumpTargetIsExcluded(event && event.target)) {
+          cancelReadingJumpCandidate('link-or-control');
+          return false;
+        }
+        if (sentence.classList.contains('sr-note')) {
+          cancelReadingJumpCandidate('note-preview');
+          return false;
+        }
+        const locator = String(sentence.dataset.srLocator || '');
+        if (!locator) {
+          cancelReadingJumpCandidate('missing-stable-locator');
+          return false;
+        }
+        post({
+          type: 'readingJumpCandidate',
+          locator: locator,
+          documentRevision: String(window.__clickReadingDocumentRevision || ''),
+          chapterLocator: String(window.__clickReadingChapterLocator || '')
+        });
+        return true;
       }
       function shouldLetSystemHandleContext(event) {
         if (isEditableTarget(event && event.target)) { return true; }
@@ -7446,6 +30027,206 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         post({ type: 'page', page: pageIndex + 1, pageIndex: pageIndex, total: maxPageIndex() + 1 });
       }
       window.__sentenceReaderAnnotationCoreV2 = true;
+      function annotationSentenceNodes() {
+        return Array.from(document.querySelectorAll('.sr-sentence'));
+      }
+      function annotationIndexes(item) {
+        return Array.isArray(item && item.indexes)
+          ? item.indexes.map(String).filter(Boolean)
+          : indexesFrom(item && (item.index || item.sentenceIndex));
+      }
+      function annotationLocators(item) {
+        if (Array.isArray(item && item.sentenceLocators)) {
+          return item.sentenceLocators.map(String).filter(Boolean);
+        }
+        const locator = String(item && item.sentenceLocator || '');
+        return locator ? [locator] : [];
+      }
+      function annotationNodeAtIndex(index) {
+        return document.querySelector('.sr-sentence[data-sr-index="' + String(index) + '"]');
+      }
+      function annotationNodeTextMatches(node, sourceText) {
+        const expected = normalizeReadingText(sourceText || '');
+        return !!(node && expected
+          && normalizeReadingText(node.textContent || '') === expected);
+      }
+      function uniqueAnnotationNode(nodes) {
+        const unique = Array.from(new Set((nodes || []).filter(Boolean)));
+        return unique.length === 1 ? unique[0] : null;
+      }
+      function resolveAnnotationTarget(target) {
+        target = target || {};
+        const locator = String(target.sentenceLocator || target.locator || '');
+        const index = String(target.sentenceIndex || target.index || '');
+        const sourceText = String(target.sourceText || target.text || '');
+        const allNodes = annotationSentenceNodes();
+        if (locator) {
+          const locatorNodes = allNodes.filter(function (node) {
+            return String(node.dataset.srLocator || '') === locator;
+          });
+          if (!sourceText) {
+            return uniqueAnnotationNode(locatorNodes);
+          }
+          const exactLocatorNodes = locatorNodes.filter(function (node) {
+            return annotationNodeTextMatches(node, sourceText);
+          });
+          const indexed = index ? annotationNodeAtIndex(index) : null;
+          if (indexed && exactLocatorNodes.indexOf(indexed) >= 0) {
+            return indexed;
+          }
+          return uniqueAnnotationNode(exactLocatorNodes);
+        }
+        if (!sourceText) { return null; }
+        const exactNodes = allNodes.filter(function (node) {
+          return annotationNodeTextMatches(node, sourceText);
+        });
+        return uniqueAnnotationNode(exactNodes);
+      }
+      function uniqueContiguousAnnotationGroup(sourceText, requiredCount) {
+        const expected = normalizeReadingText(sourceText || '');
+        if (!expected) { return []; }
+        const allNodes = annotationSentenceNodes();
+        const matches = [];
+        for (let start = 0; start < allNodes.length; start += 1) {
+          const maximumEnd = requiredCount
+            ? Math.min(allNodes.length, start + requiredCount)
+            : allNodes.length;
+          let combined = '';
+          for (let end = start; end < maximumEnd; end += 1) {
+            combined += String(allNodes[end].textContent || '');
+            const normalized = normalizeReadingText(combined);
+            if ((!requiredCount || end - start + 1 === requiredCount)
+                && normalized === expected) {
+              matches.push(allNodes.slice(start, end + 1));
+            }
+            if (normalized.length >= expected.length) { break; }
+          }
+        }
+        return matches.length === 1 ? matches[0] : [];
+      }
+      function resolveLegacyAnnotationGroup(item) {
+        const indexes = annotationIndexes(item);
+        const sourceText = String(item && item.sourceText || '');
+        const locators = annotationLocators(item);
+        if (indexes.length === 1) {
+          if (locators.length === 1) {
+            const stableNode = resolveAnnotationTarget({
+              sentenceIndex: indexes[0],
+              sentenceLocator: locators[0],
+              sourceText: sourceText
+            });
+            if (stableNode) { return [stableNode]; }
+          }
+          return uniqueContiguousAnnotationGroup(sourceText, 0);
+        }
+        if (!indexes.length || !sourceText) { return []; }
+        return uniqueContiguousAnnotationGroup(sourceText, indexes.length);
+      }
+      function annotationTargets(item) {
+        const storedTargets = Array.isArray(item && item.sentenceTargets)
+          ? item.sentenceTargets
+          : [];
+        if (storedTargets.length) { return storedTargets; }
+        const fragments = Array.isArray(item && item.fragments)
+          ? item.fragments
+          : [];
+        const seen = new Set();
+        return fragments.map(function (fragment) {
+          return {
+            sentenceIndex: String(fragment.sentenceIndex || ''),
+            sentenceLocator: String(fragment.sentenceLocator || ''),
+            sourceText: String(fragment.sentenceSourceText || '')
+          };
+        }).filter(function (target) {
+          const key = [
+            target.sentenceIndex,
+            target.sentenceLocator,
+            normalizeReadingText(target.sourceText)
+          ].join('\\u001f');
+          if (!target.sourceText || seen.has(key)) { return false; }
+          seen.add(key);
+          return true;
+        });
+      }
+      function resolveAnnotationNodes(item) {
+        const targets = annotationTargets(item);
+        if (!targets.length) {
+          return resolveLegacyAnnotationGroup(item);
+        }
+        const resolved = targets.map(resolveAnnotationTarget);
+        if (resolved.some(function (node) { return !node; })) { return []; }
+        return Array.from(new Set(resolved));
+      }
+      window.__sentenceReaderFocusAnnotation = function (item) {
+        const nodes = resolveAnnotationNodes(item || {});
+        if (!nodes.length) { return false; }
+        const sentence = nodes[0];
+        pageIndex = Math.max(0, Math.min(Math.round(sentence.offsetLeft / pageStep()), maxPageIndex()));
+        applyPage(false, 0);
+        window.setTimeout(function () { focus(sentence); }, 30);
+        return true;
+      };
+      function resolveSelectionRedFragments(fragments) {
+        const allNodes = annotationSentenceNodes();
+        const resolved = [];
+        (fragments || []).forEach(function (fragment) {
+          const sentenceIndex = String(fragment.sentenceIndex || '');
+          const locator = String(fragment.sentenceLocator || '');
+          const sentenceSourceText = String(fragment.sentenceSourceText || '');
+          const selectedText = String(fragment.text || '');
+          const startOffset = Number(fragment.startOffset);
+          const endOffset = Number(fragment.endOffset);
+          if (!selectedText
+              || !Number.isFinite(startOffset)
+              || !Number.isFinite(endOffset)
+              || endOffset <= startOffset) {
+            return;
+          }
+          const candidates = locator
+            ? allNodes.filter(function (node) {
+                return String(node.dataset.srLocator || '') === locator;
+              })
+            : allNodes;
+          const exact = candidates.filter(function (node) {
+            const nodeText = String(node.textContent || '');
+            if (sentenceSourceText
+                && normalizeReadingText(nodeText)
+                  !== normalizeReadingText(sentenceSourceText)) {
+              return false;
+            }
+            return nodeText.slice(startOffset, endOffset) === selectedText;
+          });
+          let node = null;
+          const indexed = sentenceIndex ? annotationNodeAtIndex(sentenceIndex) : null;
+          if (sentenceSourceText && indexed && exact.indexOf(indexed) >= 0) {
+            node = indexed;
+          } else {
+            node = uniqueAnnotationNode(exact);
+          }
+          if (!node) { return; }
+          const annotationIDs = [];
+          const rawIDs = Array.isArray(fragment.annotationIDs)
+            ? fragment.annotationIDs
+            : [fragment.annotationID];
+          rawIDs.filter(function (value) {
+            return typeof value === 'string' && value.trim();
+          }).forEach(function (annotationID) {
+            if (annotationIDs.indexOf(annotationID) < 0) {
+              annotationIDs.push(annotationID);
+            }
+          });
+          resolved.push({
+            sentenceIndex: String(node.dataset.srIndex || ''),
+            sentenceLocator: String(node.dataset.srLocator || ''),
+            sentenceSourceText: String(node.textContent || ''),
+            startOffset: Math.max(0, Math.floor(startOffset)),
+            endOffset: Math.max(0, Math.floor(endOffset)),
+            text: selectedText,
+            annotationIDs: annotationIDs
+          });
+        });
+        return normalizeSelectionFragments(resolved);
+      }
       function applyNoteMarkers(notes) {
         document.querySelectorAll('.sr-sentence.sr-note').forEach(function (node) {
           node.classList.remove('sr-note');
@@ -7454,10 +30235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           delete node.dataset.srNoteSource;
         });
         (notes || []).forEach(function (note) {
-          const indexes = Array.isArray(note.indexes) ? note.indexes.map(String) : indexesFrom(note.index || note.sentenceIndex);
-          indexes.forEach(function (index) {
-            const node = document.querySelector('.sr-sentence[data-sr-index="' + String(index) + '"]');
-            if (!node) { return; }
+          resolveAnnotationNodes(note).forEach(function (node) {
             node.classList.add('sr-note');
             node.dataset.srNoteId = String(note.id || '');
             node.dataset.srNoteText = String(note.noteText || '');
@@ -7465,17 +30243,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           });
         });
       }
+      function applyRedMarkers(redItems) {
+        document.querySelectorAll('.sr-sentence.sr-red').forEach(function (node) {
+          node.classList.remove('sr-red');
+          delete node.dataset.srRedAnnotationIds;
+        });
+        const bindings = [];
+        (redItems || []).forEach(function (item) {
+          resolveAnnotationNodes(item).forEach(function (node) {
+            const annotationID = String(item.id || '');
+            const annotationIDs = annotationIDsForSentence(node);
+            if (annotationID && annotationIDs.indexOf(annotationID) < 0) {
+              annotationIDs.push(annotationID);
+            }
+            node.classList.add('sr-red');
+            node.dataset.srRedAnnotationIds = JSON.stringify(annotationIDs);
+            bindings.push({
+              id: annotationID,
+              index: String(node.dataset.srIndex || ''),
+              locator: String(node.dataset.srLocator || ''),
+              sourceText: String(node.textContent || '')
+            });
+          });
+        });
+        return bindings;
+      }
       window.__sentenceReaderApplyAnnotations = function (payload) {
         payload = payload || {};
-        const redIndexes = payload.redIndexes || payload.red || [];
-        const wanted = new Set((redIndexes || []).map(function (item) { return String(item); }));
-        document.querySelectorAll('.sr-sentence.sr-red').forEach(function (node) { node.classList.remove('sr-red'); });
-        document.querySelectorAll('.sr-sentence').forEach(function (node) {
-          if (wanted.has(String(node.dataset.srIndex || ''))) {
-            node.classList.add('sr-red');
-          }
-        });
-        selectionRedFragments = normalizeSelectionFragments(payload.selectionRedFragments || []);
+        const redItems = Array.isArray(payload.redItems)
+          ? payload.redItems
+          : (payload.redIndexes || payload.red || []).map(function (index) {
+              return { indexes: [String(index)], sourceText: '' };
+            });
+        const redBindings = applyRedMarkers(redItems);
+        selectionRedFragments = resolveSelectionRedFragments(payload.selectionRedFragments || []);
         renderSelectionRedFragments();
         if (Array.isArray(payload.notes)) {
           applyNoteMarkers(payload.notes);
@@ -7483,7 +30284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         post({
           type: 'annotationsRestored',
           redCount: document.querySelectorAll('.sr-sentence.sr-red').length,
-          noteCount: document.querySelectorAll('.sr-sentence.sr-note').length
+          noteCount: document.querySelectorAll('.sr-sentence.sr-note').length,
+          redBindings: redBindings
         });
         return true;
       };
@@ -7550,6 +30352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }, delay);
       }
       function turnPage(direction, options) {
+        cancelReadingJumpCandidate('page-navigation');
         options = options || {};
         const now = Date.now();
         if (now < pageTurnLockUntil) {
@@ -7567,6 +30370,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         } else {
           post({ type: 'edge', direction: direction < 0 ? 'previous' : 'next' });
           publishPage();
+        }
+        if (!options.silent) {
+          post({
+            type: 'readingBrowse',
+            pageIndex: pageIndex
+          });
         }
         return true;
       }
@@ -7620,7 +30429,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         if (!sentence) { return; }
         document.querySelectorAll('.sr-sentence.sr-focused').forEach(function (node) { node.classList.remove('sr-focused'); });
         sentence.classList.add('sr-focused');
-        post({ type: 'focus', text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+        post({
+          type: 'focus',
+          text: sentence.textContent || '',
+          index: sentence.dataset.srIndex || '',
+          locator: sentence.dataset.srLocator || ''
+        });
       }
       function postNotePreview(sentence) {
         if (!sentence || !sentence.classList.contains('sr-note')) { return; }
@@ -7737,8 +30551,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const states = targets.map(function (sentence) {
           return {
             index: sentence.dataset.srIndex || '',
+            locator: sentence.dataset.srLocator || '',
             wasRed: sentence.classList.contains('sr-red'),
-            text: sentence.textContent || ''
+            text: sentence.textContent || '',
+            annotationIDs: annotationIDsForSentence(sentence)
           };
         });
         const shouldRed = states.some(function (state) { return !state.wasRed; });
@@ -7749,12 +30565,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         clearTextSelectionAfterSecondaryRed();
         const indexes = states.map(function (state) { return state.index; }).filter(Boolean);
         const text = states.map(function (state) { return state.text; }).join('');
+        const annotationIDs = states.reduce(function (values, state) {
+          (state.annotationIDs || []).forEach(function (annotationID) {
+            if (values.indexOf(annotationID) < 0) { values.push(annotationID); }
+          });
+          return values;
+        }, []);
         undoStack.push({ type: 'redBatch', states: states });
         post({
           type: 'red',
           text: text,
           index: indexes.join(','),
           indexes: indexes,
+          sentenceTargets: states.map(function (state) {
+            return {
+              sentenceIndex: String(state.index || ''),
+              sentenceLocator: String(state.locator || ''),
+              sourceText: String(state.text || '')
+            };
+          }),
+          annotationIDs: annotationIDs,
           isRed: shouldRed,
           redCount: document.querySelectorAll('.sr-sentence.sr-red').length
         });
@@ -7774,6 +30604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         return toggleRedSentences([sentence], event);
       }
       function toggleRedFromSecondaryEvent(event) {
+        cancelReadingJumpCandidate('secondary-click');
         if (isEditableTarget(event && event.target)) { return true; }
         const sentence = sentenceFromEvent(event);
         if (hasReaderTextSelection() && selectionActionBarVisible()) {
@@ -7826,6 +30657,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
               text: state.text || '',
               index: state.index || '',
               indexes: state.index ? [state.index] : [],
+              sentenceTargets: [{
+                sentenceIndex: String(state.index || ''),
+                sentenceLocator: String(state.locator || ''),
+                sourceText: String(state.text || '')
+              }],
+              annotationIDs: state.annotationIDs || [],
               isRed: state.wasRed,
               redCount: document.querySelectorAll('.sr-sentence.sr-red').length
             });
@@ -7840,6 +30677,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             text: action.text || '',
             index: action.index || '',
             indexes: action.indexes || [],
+            sentenceTargets: action.sentenceTargets || [],
             fragments: action.fragments || [],
             redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length
           });
@@ -7853,6 +30691,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
             text: action.text || '',
             index: action.index || '',
             indexes: action.indexes || [],
+            sentenceTargets: action.sentenceTargets || [],
+            annotationIDs: action.annotationIDs || [],
             fragments: action.fragments || [],
             redCount: document.querySelectorAll('.sr-sentence.sr-red').length + selectionRedFragments.length
           });
@@ -7926,14 +30766,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
           const hit = lookupWordHitFromEvent(event);
           if (notePreviewTimer) { window.clearTimeout(notePreviewTimer); }
           if (hit && hit.word) {
+            cancelReadingJumpCandidate('english-lookup');
             claimSentenceEvent(event);
             focusWordHit(hit);
             notePreviewTimer = 0;
-            post({ type: 'lookup', word: hit.word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+            post({
+              type: 'lookup',
+              word: hit.word,
+              text: sentence.textContent || '',
+              index: sentence.dataset.srIndex || '',
+              indexes: sentence.dataset.srIndex ? [sentence.dataset.srIndex] : [],
+              sentenceTargets: sentenceTargetsPayload([sentence])
+            });
             return;
           }
           clearWordFocus();
           focus(sentence);
+          postReadingJumpCandidate(sentence, event);
           notePreviewTimer = window.setTimeout(function () {
             notePreviewTimer = 0;
             if (sentence.classList.contains('sr-note')) {
@@ -7943,6 +30792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         }
       }, true);
       document.addEventListener('dblclick', function (event) {
+        cancelReadingJumpCandidate('double-click');
         if (shouldLetSystemHandle(event, { respectSelection: false })) { return; }
         suppressSelectionActionBar(520);
         if (notePreviewTimer) {
@@ -7959,10 +30809,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         const hit = event.altKey ? lookupWordHitFromEvent(event) : null;
         if (hit && hit.word) {
           focusWordHit(hit);
-          post({ type: 'lookup', word: hit.word, text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+          post({
+            type: 'lookup',
+            word: hit.word,
+            text: sentence.textContent || '',
+            index: sentence.dataset.srIndex || '',
+            indexes: sentence.dataset.srIndex ? [sentence.dataset.srIndex] : [],
+            sentenceTargets: sentenceTargetsPayload([sentence])
+          });
           return;
         }
-        post({ type: 'note', text: sentence.textContent || '', index: sentence.dataset.srIndex || '' });
+        post({
+          type: 'note',
+          text: sentence.textContent || '',
+          index: sentence.dataset.srIndex || '',
+          indexes: sentence.dataset.srIndex ? [sentence.dataset.srIndex] : [],
+          sentenceTargets: sentenceTargetsPayload([sentence])
+        });
       }, true);
       document.addEventListener('mousedown', function (event) {
         if (!event || event.button !== 2) { return; }
@@ -7982,18 +30845,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
       document.addEventListener('mousemove', updateSelectionActionDrag, true);
       document.addEventListener('mouseup', finishSelectionActionDrag, true);
       document.addEventListener('dragend', finishSelectionActionDrag, true);
-      document.addEventListener('selectionchange', hideSelectionActionBarWhenSelectionGone, true);
+      document.addEventListener('selectionchange', handleReaderSelectionChange, true);
 
-      wrap();
-      invalidatePagination();
-      applyPage(false, 0);
-      post({ type: 'ready', sentenceCount: document.querySelectorAll('.sr-sentence').length });
+      function initializeReadingDocument() {
+        if (window.__clickReadingDocumentInitialized) { return; }
+        window.__clickReadingDocumentInitialized = true;
+        const readingRecords = wrap();
+        post({
+          type: 'readingChapter',
+          normalizerRevision: 'click-reading-document-v2',
+          sentences: readingRecords
+        });
+        invalidatePagination();
+        applyPage(false, 0);
+        post({
+          type: 'ready',
+          sentenceCount: readingRecords.length,
+          rendererSentenceCount: document.querySelectorAll('.sr-sentence').length
+        });
+      }
+      if (document.readyState === 'complete') {
+        window.setTimeout(initializeReadingDocument, 0);
+      } else {
+        window.addEventListener('load', initializeReadingDocument, { once: true });
+      }
     })();
     """
 }
 
+#if !CLICK_EPUB_READING_ORDER_PROBE
 let app = NSApplication.shared
+if let gate2CAcceptanceExitCode =
+    Gate2CAcceptanceHarness.runIfRequested() {
+    exit(gate2CAcceptanceExitCode)
+}
+if let gate2BAcceptanceExitCode =
+    Gate2BAcceptanceHarness.runIfRequested() {
+    exit(gate2BAcceptanceExitCode)
+}
 let delegate = AppDelegate()
 app.setActivationPolicy(.regular)
 app.delegate = delegate
 app.run()
+#endif

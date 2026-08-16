@@ -33,13 +33,13 @@ def health(port: int) -> dict:
         return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
 
 
-def assert_runtime_ready(runtime: Path) -> None:
-    python = runtime / ".venv-reader-api" / "bin" / "python"
+def assert_runtime_ready(runtime: Path) -> Path:
+    python = runtime / "Python3.framework" / "Versions" / "3.9" / "bin" / "python3.9"
     script = runtime / "scripts" / "run_reader_api.sh"
     migration = runtime / "migrations" / "reader" / "001_reader_schema.sql"
     missing = [str(path) for path in (python, script, migration) if not path.exists()]
     if missing:
-        raise RuntimeError(f"bundled runtime missing required files: {missing}")
+        raise RuntimeError(f"packaged runtime missing required files: {missing}")
     result = subprocess.run(
         [str(python), "-c", "import fastapi, uvicorn, psycopg, httpx; print('deps ok')"],
         text=True,
@@ -48,7 +48,8 @@ def assert_runtime_ready(runtime: Path) -> None:
         timeout=10,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"bundled runtime python deps failed: {result.stdout}")
+        raise RuntimeError(f"bundled signed runtime python deps failed: {result.stdout}")
+    return python
 
 
 def main() -> int:
@@ -63,7 +64,7 @@ def main() -> int:
     process: subprocess.Popen | None = None
     log_path = Path(tempfile.gettempdir()) / f"sentence-reader-runtime-launch-{port}.log"
     try:
-        assert_runtime_ready(runtime)
+        python = assert_runtime_ready(runtime)
         env = os.environ.copy()
         env.pop("READER_API_PYTHON", None)
         env["READER_API_HOST"] = "127.0.0.1"

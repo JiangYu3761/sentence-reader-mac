@@ -40,15 +40,31 @@ def dock_entry_is_target(entry: dict, app_path: Path) -> bool:
     )
 
 
-def dock_entry_is_legacy(entry: dict) -> bool:
+def dock_entry_is_legacy_reader(entry: dict) -> bool:
     raw_url = dock_entry_url(entry)
     label = dock_entry_label(entry)
     parsed_path = unquote(urlparse(raw_url).path).rstrip("/")
-    return (
-        label in {"Sentence Reader", "Click"}
-        and (parsed_path.endswith("Sentence Reader.app") or parsed_path.endswith("Click.app"))
-        or parsed_path.endswith("Sentence Reader.app")
-    )
+    return label == "Sentence Reader" or parsed_path.endswith("Sentence Reader.app")
+
+
+def dock_entry_is_legacy_voice(entry: dict) -> bool:
+    raw_url = dock_entry_url(entry)
+    label = dock_entry_label(entry)
+    parsed_path = unquote(urlparse(raw_url).path).rstrip("/")
+    return label == "Click Voice" or parsed_path.endswith("Click Voice.app")
+
+
+def app_label(app_path: Path) -> str:
+    plist_path = app_path / "Contents" / "Info.plist"
+    try:
+        with plist_path.open("rb") as handle:
+            payload = plistlib.load(handle)
+        label = payload.get("CFBundleDisplayName") or payload.get("CFBundleName")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    except Exception:
+        pass
+    return app_path.stem
 
 
 def dedupe_dock_entries(app_path: Path) -> int:
@@ -65,13 +81,18 @@ def dedupe_dock_entries(app_path: Path) -> int:
     kept: list[dict] = []
     removed = 0
     seen_click = False
+    remove_legacy_reader = app_path.name == "Click.app"
+    remove_legacy_voice = app_path.name == "Tingle.app"
     for entry in apps:
         if isinstance(entry, dict) and dock_entry_is_target(entry, app_path):
             if seen_click:
                 removed += 1
                 continue
             seen_click = True
-        elif isinstance(entry, dict) and dock_entry_is_legacy(entry):
+        elif remove_legacy_reader and isinstance(entry, dict) and dock_entry_is_legacy_reader(entry):
+            removed += 1
+            continue
+        elif remove_legacy_voice and isinstance(entry, dict) and dock_entry_is_legacy_voice(entry):
             removed += 1
             continue
         kept.append(entry)
@@ -100,7 +121,8 @@ def dock_contains(app_path: Path) -> bool:
 
 
 def dock_item_xml(app_path: Path) -> str:
-    escaped = str(app_path).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    escaped = app_uri(app_path).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    escaped_label = app_label(app_path).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return (
         "<dict>"
         "<key>tile-data</key>"
@@ -113,7 +135,7 @@ def dock_item_xml(app_path: Path) -> str:
         "<integer>0</integer>"
         "</dict>"
         "<key>file-label</key>"
-        "<string>Click</string>"
+        f"<string>{escaped_label}</string>"
         "</dict>"
         "<key>tile-type</key>"
         "<string>file-tile</string>"

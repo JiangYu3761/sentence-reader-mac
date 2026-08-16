@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import reader_api.app as app_module
+import reader_api.db as db_module
 
 
 class FakeCursor:
@@ -170,7 +171,16 @@ class FakeConn:
         if "delete from reader.annotations" in sql:
             annotation_id = params[0]
             row = self.state.annotations.pop(annotation_id, None)
-            return FakeCursor({"id": annotation_id} if row else None)
+            return FakeCursor(
+                {
+                    "id": annotation_id,
+                    "book_id": row["book_id"],
+                    "kind": row["kind"],
+                    "chapter_locator": row["chapter_locator"],
+                }
+                if row
+                else None
+            )
 
         if "insert into reader.exports" in sql:
             export_id, book_id, export_kind, output_path, annotation_count = params
@@ -342,7 +352,7 @@ class FakeReaderDb:
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     fake = FakeReaderDb()
     monkeypatch.setattr(app_module.db, "connect", fake.connect)
-    monkeypatch.setattr(app_module.db, "jsonb", lambda value: value or {})
+    monkeypatch.setattr(app_module.db, "jsonb", lambda value: {} if value is None else value)
     monkeypatch.setattr(
         app_module.db,
         "health",
@@ -355,10 +365,54 @@ def test_health_uses_reader_database_contract(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "ok": True,
-        "database": {"ok": True, "database": "sentence_reader", "schema": "reader"},
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["schema"] == "click.reader_api.health.v2"
+    assert payload["database"] == {"ok": True, "database": "sentence_reader", "schema": "reader"}
+    assert payload["runtime"]["contract"] == "click.reader_runtime.v1"
+    assert payload["runtime"]["api_revision"] >= 2
+    assert "voice.inbox.v2" in payload["runtime"]["capabilities"]
+
+
+def test_database_health_binds_instance_without_exposing_raw_server_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "database": "sentence_reader",
+        "schema": "reader",
+        "server_addr": "::1/128",
+        "server_port": 5432,
+        "system_identifier": "7654321098765432109",
     }
+
+    class HealthConn:
+        def execute(self, query: str) -> FakeCursor:
+            assert "pg_control_system()" in query
+            return FakeCursor(row)
+
+    @contextmanager
+    def fake_connect() -> Iterator[HealthConn]:
+        yield HealthConn()
+
+    monkeypatch.setattr(db_module, "connect", fake_connect)
+    result = db_module.health()
+    expected = db_module.postgresql_instance_fingerprint(
+        row["database"],
+        row["system_identifier"],
+    )
+
+    assert result == {
+        "ok": True,
+        "database": "sentence_reader",
+        "schema": "reader",
+        "instance_fingerprint": expected,
+    }
+    assert len(expected) == 64
+    assert expected != db_module.postgresql_instance_fingerprint(
+        "other_reader_database",
+        row["system_identifier"],
+    )
+    assert not {"server_addr", "server_port", "system_identifier"} & result.keys()
 
 
 def test_book_sentence_note_position_crud_flow(client: TestClient) -> None:
@@ -577,7 +631,6 @@ def test_multi_book_list_and_independent_state(client: TestClient) -> None:
             "title": "First EPUB",
             "source_kind": "epub",
             "book_hash": "first-book-hash",
-            "file_path": "/tmp/first.epub",
         },
     ).json()
     second = client.post(
@@ -586,14 +639,13 @@ def test_multi_book_list_and_independent_state(client: TestClient) -> None:
             "title": "Second EPUB",
             "source_kind": "epub",
             "book_hash": "second-book-hash",
-            "file_path": "/tmp/second.epub",
         },
     ).json()
 
     books = client.get("/books")
     assert books.status_code == 200
     assert {item["book_hash"] for item in books.json()} == {"first-book-hash", "second-book-hash"}
-    assert {item["file_path"] for item in books.json()} == {"/tmp/first.epub", "/tmp/second.epub"}
+    assert {item["file_path"] for item in books.json()} == {None}
 
     client.put(
         f"/books/{first['id']}/position",

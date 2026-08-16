@@ -1,0 +1,51 @@
+{
+  "chapter_order": [
+    "EPUB/text/chapter-01.xhtml",
+    "EPUB/text/chapter-02.xhtml",
+    "EPUB/text/chapter-03.xhtml"
+  ],
+  "chapters": [
+    {
+      "chapter_index": 0,
+      "estimated_duration_minutes": 34.048,
+      "estimated_duration_ms": 2042860,
+      "locator": "EPUB/text/chapter-01.xhtml",
+      "non_whitespace_unicode_scalar_count": 8882,
+      "sentence_count": 104,
+      "title": "第一章：清晨的顺序"
+    },
+    {
+      "chapter_index": 1,
+      "estimated_duration_minutes": 34.078,
+      "estimated_duration_ms": 2044700,
+      "locator": "EPUB/text/chapter-02.xhtml",
+      "non_whitespace_unicode_scalar_count": 8890,
+      "sentence_count": 104,
+      "title": "第二章：午后的校验"
+    },
+    {
+      "chapter_index": 2,
+      "estimated_duration_minutes": 34.075,
+      "estimated_duration_ms": 2044470,
+      "locator": "EPUB/text/chapter-03.xhtml",
+      "non_whitespace_unicode_scalar_count": 8889,
+      "sentence_count": 104,
+      "title": "第三章：夜晚的收束"
+    }
+  ],
+  "content_classification": "public_synthetic_chinese",
+  "epub_sha256": "e03e6866f513597f37d6d64a4ac0d13577954d72550608cbff21fa43cac3ab3c",
+  "estimation_contract": {
+    "milliseconds_per_non_whitespace_unicode_scalar": 230,
+    "whitespace_excluded": true
+  },
+  "fixture_id": "click-stageb-public-listening-v1",
+  "schema": "click.mac.stageb.listening-fixture.expected.v1",
+  "totals": {
+    "chapter_count": 3,
+    "estimated_duration_minutes": 102.201,
+    "estimated_duration_ms": 6132030,
+    "non_whitespace_unicode_scalar_count": 26661,
+    "sentence_count": 312
+  }
+}

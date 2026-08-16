@@ -14,6 +14,20 @@
 		A00000000000000000000105 /* ReaderWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000015 /* ReaderWebView.swift */; };
 		A00000000000000000000106 /* ShellToolbar.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* ShellToolbar.swift */; };
 		A00000000000000000000107 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000018 /* Assets.xcassets */; };
+		A00000000000000000000108 /* WorkspaceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000019 /* WorkspaceModels.swift */; };
+		A00000000000000000000109 /* WorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001A /* WorkspaceStore.swift */; };
+		A0000000000000000000010A /* ListeningController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001B /* ListeningController.swift */; };
+		A0000000000000000000010B /* RecordingController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001C /* RecordingController.swift */; };
+		A0000000000000000000010C /* WorkspaceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001D /* WorkspaceViews.swift */; };
+		A0000000000000000000010D /* NativeReaderViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001E /* NativeReaderViews.swift */; };
+		A0000000000000000000010E /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001F /* KeychainStore.swift */; };
+		A0000000000000000000010F /* ReadiumReaderBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000001 /* ReadiumReaderBridge.swift */; };
+		A00000000000000000000110 /* ClickLANDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000010 /* ClickLANDiscovery.swift */; };
+		A00000000000000000000111 /* ClickSyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000011 /* ClickSyncCoordinator.swift */; };
+		A00000000000000000000113 /* SourceHanSans-LICENSE.txt in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000002 /* SourceHanSans-LICENSE.txt */; };
+		B00000000000000000000101 /* ReadiumShared in Frameworks */ = {isa = PBXBuildFile; productRef = B00000000000000000000201 /* ReadiumShared */; };
+		B00000000000000000000102 /* ReadiumStreamer in Frameworks */ = {isa = PBXBuildFile; productRef = B00000000000000000000202 /* ReadiumStreamer */; };
+		B00000000000000000000103 /* ReadiumNavigator in Frameworks */ = {isa = PBXBuildFile; productRef = B00000000000000000000203 /* ReadiumNavigator */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +40,17 @@
 		A00000000000000000000016 /* ShellToolbar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellToolbar.swift; sourceTree = "<group>"; };
 		A00000000000000000000017 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A00000000000000000000018 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A00000000000000000000019 /* WorkspaceModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModels.swift; sourceTree = "<group>"; };
+		A0000000000000000000001A /* WorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
+		A0000000000000000000001B /* ListeningController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListeningController.swift; sourceTree = "<group>"; };
+		A0000000000000000000001C /* RecordingController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingController.swift; sourceTree = "<group>"; };
+		A0000000000000000000001D /* WorkspaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceViews.swift; sourceTree = "<group>"; };
+		A0000000000000000000001E /* NativeReaderViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeReaderViews.swift; sourceTree = "<group>"; };
+		A0000000000000000000001F /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		D00000000000000000000010 /* ClickLANDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickLANDiscovery.swift; sourceTree = "<group>"; };
+		D00000000000000000000011 /* ClickSyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickSyncCoordinator.swift; sourceTree = "<group>"; };
+		C00000000000000000000001 /* ReadiumReaderBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReadiumReaderBridge.swift; sourceTree = "<group>"; };
+		E10000000000000000000002 /* SourceHanSans-LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Fonts/SourceHanSans-LICENSE.txt"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -33,6 +58,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B00000000000000000000101 /* ReadiumShared in Frameworks */,
+				B00000000000000000000102 /* ReadiumStreamer in Frameworks */,
+				B00000000000000000000103 /* ReadiumNavigator in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -64,8 +92,19 @@
 				A00000000000000000000014 /* ConnectionView.swift */,
 				A00000000000000000000015 /* ReaderWebView.swift */,
 				A00000000000000000000016 /* ShellToolbar.swift */,
+				A00000000000000000000019 /* WorkspaceModels.swift */,
+				A0000000000000000000001A /* WorkspaceStore.swift */,
+				A0000000000000000000001B /* ListeningController.swift */,
+				A0000000000000000000001C /* RecordingController.swift */,
+				A0000000000000000000001D /* WorkspaceViews.swift */,
+				A0000000000000000000001E /* NativeReaderViews.swift */,
+				A0000000000000000000001F /* KeychainStore.swift */,
+				D00000000000000000000010 /* ClickLANDiscovery.swift */,
+				D00000000000000000000011 /* ClickSyncCoordinator.swift */,
+				C00000000000000000000001 /* ReadiumReaderBridge.swift */,
 				A00000000000000000000017 /* Info.plist */,
 				A00000000000000000000018 /* Assets.xcassets */,
+				E10000000000000000000002 /* SourceHanSans-LICENSE.txt */,
 			);
 			path = ClickShell;
 			sourceTree = "<group>";
@@ -86,6 +125,11 @@
 			dependencies = (
 			);
 			name = ClickShell;
+			packageProductDependencies = (
+				B00000000000000000000201 /* ReadiumShared */,
+				B00000000000000000000202 /* ReadiumStreamer */,
+				B00000000000000000000203 /* ReadiumNavigator */,
+			);
 			productName = ClickShell;
 			productReference = A00000000000000000000007 /* ClickShell.app */;
 			productType = "com.apple.product-type.application";
@@ -114,6 +158,9 @@
 				Base,
 			);
 			mainGroup = A00000000000000000000001;
+			packageReferences = (
+				B00000000000000000000301 /* XCRemoteSwiftPackageReference "swift-toolkit" */,
+			);
 			productRefGroup = A00000000000000000000008 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -129,6 +176,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000107 /* Assets.xcassets in Resources */,
+				A00000000000000000000113 /* SourceHanSans-LICENSE.txt in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -145,10 +193,49 @@
 				A00000000000000000000104 /* ConnectionView.swift in Sources */,
 				A00000000000000000000105 /* ReaderWebView.swift in Sources */,
 				A00000000000000000000106 /* ShellToolbar.swift in Sources */,
+				A00000000000000000000108 /* WorkspaceModels.swift in Sources */,
+				A00000000000000000000109 /* WorkspaceStore.swift in Sources */,
+				A0000000000000000000010A /* ListeningController.swift in Sources */,
+				A0000000000000000000010B /* RecordingController.swift in Sources */,
+				A0000000000000000000010C /* WorkspaceViews.swift in Sources */,
+				A0000000000000000000010D /* NativeReaderViews.swift in Sources */,
+				A0000000000000000000010E /* KeychainStore.swift in Sources */,
+				A0000000000000000000010F /* ReadiumReaderBridge.swift in Sources */,
+				A00000000000000000000110 /* ClickLANDiscovery.swift in Sources */,
+				A00000000000000000000111 /* ClickSyncCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B00000000000000000000301 /* XCRemoteSwiftPackageReference "swift-toolkit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/readium/swift-toolkit.git";
+			requirement = {
+				kind = exactVersion;
+				version = 3.11.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B00000000000000000000201 /* ReadiumShared */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B00000000000000000000301 /* XCRemoteSwiftPackageReference "swift-toolkit" */;
+			productName = ReadiumShared;
+		};
+		B00000000000000000000202 /* ReadiumStreamer */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B00000000000000000000301 /* XCRemoteSwiftPackageReference "swift-toolkit" */;
+			productName = ReadiumStreamer;
+		};
+		B00000000000000000000203 /* ReadiumNavigator */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B00000000000000000000301 /* XCRemoteSwiftPackageReference "swift-toolkit" */;
+			productName = ReadiumNavigator;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin XCBuildConfiguration section */
 		A00000000000000000000021 /* Debug */ = {
@@ -271,12 +358,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				CURRENT_PROJECT_VERSION = 23;
+				CLICK_REMOTE_TTS_ORIGIN = "";
+				CLICK_UPDATE_MANIFEST_URL = "";
+				DEVELOPMENT_TEAM = 5A9T9KMVUA;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ClickShell/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = local.click.shell;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jiangyu.click.workspace;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
@@ -292,12 +381,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = "";
+				CURRENT_PROJECT_VERSION = 23;
+				CLICK_REMOTE_TTS_ORIGIN = "";
+				CLICK_UPDATE_MANIFEST_URL = "";
+				DEVELOPMENT_TEAM = 5A9T9KMVUA;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = ClickShell/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				PRODUCT_BUNDLE_IDENTIFIER = local.click.shell;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jiangyu.click.workspace;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";

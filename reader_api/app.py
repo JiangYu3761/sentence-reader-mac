@@ -9,8 +9,10 @@ import mimetypes
 import os
 import posixpath
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -18,32 +20,127 @@ from html import escape as html_escape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import parse_qs, quote
+from urllib.error import URLError
+from urllib.parse import parse_qs, quote, unquote
 from urllib.request import Request as URLRequest, urlopen
 from uuid import uuid4
 from xml.etree import ElementTree as ET
 
 from fastapi import Body, FastAPI, HTTPException, Request as FastAPIRequest
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 from reader_api import db
+from reader_api.android_sync_protocol import (
+    ANDROID_SYNC_SCHEMA,
+    current_sequence as android_current_sequence,
+    event_page as android_event_page,
+    operation_receipt as android_operation_receipt,
+    operation_request_hash as android_operation_request_hash,
+    resource_version as android_resource_version,
+    store_operation_receipt as store_android_operation_receipt,
+)
+from reader_api.epub_compatibility import (
+    DISPLAY_VARIANT_SCHEMA,
+    REPORT_SCHEMA as EPUB_COMPATIBILITY_REPORT_SCHEMA,
+    decode_epub_bytes,
+    ensure_epub_assets,
+)
 from reader_api.mobile_workspace import (
     EDGE_TTS_VOICE,
     MAC_VOICE_PIPELINE_ID,
     MAC_VOICE_PIPELINE_SCHEMA,
     call_hermes_runtime,
     edge_tts_path,
+    edge_tts_subprocess_environment,
     extract_json_object,
     mac_voice_pipeline_transcribe,
+    reconcile_recordings_to_voice_inbox,
+    require_android_access,
+    require_mobile_admin_access,
     router as mobile_workspace_router,
     should_use_lite_ui,
     apply_lite_ui_cookie,
+)
+from reader_api.pdf_support import PDF_PREFLIGHT_SCHEMA, inspect_pdf
+from reader_api.runtime_contract import RUNTIME_HEALTH_SCHEMA, runtime_payload
+from reader_api.tingle import purge_due_inspirations, reconcile_tingle_inspirations
+from reader_api.tingle_api import router as tingle_router
+from reader_api.voice_inbox import router as voice_inbox_router
+from reader_api.voice_processing import (
+    start_voice_processing_worker,
+    stop_voice_processing_worker,
+    voice_processing_worker_metrics,
+)
+from reader_api.voice_reader_notes import (
+    project_reader_audio_note_to_voice_inbox,
+    reconcile_reader_audio_notes_to_voice_inbox,
 )
 
 
 app = FastAPI(title="Sentence Reader API", version="2.0.0")
 app.include_router(mobile_workspace_router)
+app.include_router(voice_inbox_router)
+app.include_router(tingle_router)
+
+_tingle_maintenance_stop = threading.Event()
+
+
+@app.on_event("startup")
+def start_click_voice_processing() -> None:
+    start_voice_processing_worker()
+    _tingle_maintenance_stop.clear()
+
+    def reconcile_mobile_recordings() -> None:
+        try:
+            reconcile_recordings_to_voice_inbox()
+        except Exception:
+            # Each recording keeps its local pending-sync state for a later retry.
+            pass
+
+    # Opening ~/Documents can wait on a first-launch macOS privacy decision.
+    # That must never hold the shared Runtime in FastAPI's startup phase.
+    threading.Thread(
+        target=reconcile_mobile_recordings,
+        daemon=True,
+        name="click-mobile-recording-reconcile",
+    ).start()
+
+    def reconcile_reader_audio_notes() -> None:
+        try:
+            reconcile_reader_audio_notes_to_voice_inbox()
+        except Exception:
+            # Reader audio notes remain authoritative and are retried on the next Runtime start.
+            pass
+
+    threading.Thread(
+        target=reconcile_reader_audio_notes,
+        daemon=True,
+        name="click-reader-audio-note-reconcile",
+    ).start()
+
+    def maintain_tingle() -> None:
+        while not _tingle_maintenance_stop.is_set():
+            try:
+                reconcile_tingle_inspirations()
+                purge_due_inspirations()
+            except Exception:
+                # A maintenance failure must not block recording or Runtime startup.
+                pass
+            _tingle_maintenance_stop.wait(3600)
+
+    threading.Thread(
+        target=maintain_tingle,
+        daemon=True,
+        name="tingle-inspiration-maintenance",
+    ).start()
+
+
+@app.on_event("shutdown")
+def stop_click_voice_processing() -> None:
+    _tingle_maintenance_stop.set()
+    stop_voice_processing_worker()
 
 
 DEFAULT_HERMES_COGNITIVE_OS_DIR = Path(
@@ -59,12 +156,33 @@ LOOKUP_TTS_DIR = Path(
         str(Path.home() / "Library" / "Application Support" / "Click" / "ReaderTTS"),
     )
 )
+ANDROID_UPDATE_DIR = Path(
+    os.getenv(
+        "CLICK_ANDROID_UPDATE_DIR",
+        str(Path.home() / "Library" / "Application Support" / "Click" / "AndroidUpdates"),
+    )
+)
+ANDROID_UPDATE_SCHEMA = "click.android.app_update.v1"
+ANDROID_UPDATE_MANIFEST_NAME = "latest.json"
+ANDROID_UPDATE_ARTIFACT_PATTERN = re.compile(r"^click-android-[0-9]+-[0-9a-f]{12}$")
+ANDROID_UPDATE_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ANDROID_UPDATE_CERTIFICATE_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+EDGE_TTS_GENERATION_LOCK = threading.Lock()
+EDGE_TTS_NICE_COMMAND = Path("/usr/bin/nice")
+EDGE_TTS_NICE_LEVEL = 10
 ENABLE_HERMES_ONLINE_LOOKUP = os.getenv(
     "SENTENCE_READER_ENABLE_HERMES_ONLINE_LOOKUP",
     "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
+HERMES_MODEL_GATEWAY_BASE_URL = os.getenv("CLICK_HERMES_MODEL_GATEWAY_BASE_URL", "http://127.0.0.1:8093").rstrip("/")
+LIVING_BOOK_QWEN_MODEL = os.getenv("CLICK_LIVING_BOOK_QWEN_MODEL", "local-auto").strip() or "local-auto"
 VOICE_NOTE_PENDING_TEXT = "语音转写中..."
 VOICE_NOTE_FAILED_TEXT = "语音已保存，转写失败，可稍后重试。"
+BOOK_IMPORT_MAX_BYTES = 120 * 1024 * 1024
+ANDROID_BOOK_UPLOAD_CHUNK_BYTES = 1024 * 1024
+ANDROID_EPUB_MAX_ENTRIES = 10_000
+ANDROID_EPUB_MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+ANDROID_EPUB_MAX_MEMBER_BYTES = 64 * 1024 * 1024
 
 
 def new_id(prefix: str) -> str:
@@ -176,6 +294,55 @@ class ExportGenerate(BaseModel):
     include_json: bool = True
 
 
+class LivingBookSyncRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+
+
+class LivingBookWriteOwnerReconcileRequest(BaseModel):
+    target_bundle: str
+    expected_sha256: str
+    title: Optional[str] = None
+    author: Optional[str] = None
+    metadata_source: str = "verified_book_evidence"
+    metadata_evidence: Optional[str] = None
+
+
+class LivingBookClassifyRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+
+
+class LivingBookClassificationConfirmRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+    primary_category_id: str
+    secondary_category_ids: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    processing_policy: str = "normal"
+    evidence: Optional[str] = None
+
+
+class LivingBookTaxonomyApplyDefaultRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+    confirmation_text: str
+    evidence: Optional[str] = None
+
+
+class LivingBookGenerateDraftsRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+    use_hermes_runtime: bool = False
+
+
+class LivingBookJobsRunRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+    limit: int = 20
+    force: bool = False
+
+
+class LivingBookAnalyzeRequest(BaseModel):
+    knowledge_base_root: Optional[str] = None
+    requested_by: str = "click_user"
+    force: bool = False
+
+
 class HermesSyncGenerate(BaseModel):
     output_dir: Optional[str] = None
     annotation_ids: list[str] = Field(default_factory=list)
@@ -259,6 +426,7 @@ class AudioNotePatch(BaseModel):
 
 class LANAudioTranscribe(BaseModel):
     book_id: str
+    annotation_id: Optional[str] = None
     audio_base64: str
     mime_type: str = "audio/webm"
     duration_seconds: Optional[float] = None
@@ -269,6 +437,13 @@ class LibraryImport(BaseModel):
     content_base64: str
     title: Optional[str] = None
     author: Optional[str] = None
+
+
+class LibraryMetadataPatch(BaseModel):
+    title: Optional[str] = None
+    author: Optional[str] = None
+    source: str = "user_confirmed"
+    evidence: Optional[str] = None
 
 
 class LibraryBatchHide(BaseModel):
@@ -329,6 +504,30 @@ class LookupTTSCreate(BaseModel):
     voice: Optional[str] = None
 
 
+class AndroidSyncOperation(BaseModel):
+    operation_id: str
+    device_id: Optional[str] = None
+    operation_type: str
+    book_id: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    base_server_version: Optional[str] = None
+
+
+class AndroidSyncOperations(BaseModel):
+    device_id: str
+    operations: list[AndroidSyncOperation] = Field(default_factory=list)
+
+
+class AndroidTTSCreate(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    kind: str = "sentence"
+    book_id: Optional[str] = None
+    locator: dict[str, Any] = Field(default_factory=dict)
+
+
 def jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -348,6 +547,26 @@ def default_export_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "SentenceReader" / "Exports"
 
 
+def default_knowledge_base_root() -> Path:
+    configured = os.getenv("CLICK_KNOWLEDGE_BASE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / "Documents" / "KnowledgeBase"
+
+
+def knowledge_base_root_path(knowledge_base_root: Optional[str] = None) -> Path:
+    return Path(knowledge_base_root).expanduser() if knowledge_base_root else default_knowledge_base_root()
+
+
+def living_books_root(knowledge_base_root: Optional[str] = None) -> Path:
+    root = knowledge_base_root_path(knowledge_base_root)
+    return root / "_system"
+
+
+def legacy_living_books_root(knowledge_base_root: Optional[str] = None) -> Path:
+    return knowledge_base_root_path(knowledge_base_root) / "LivingBooks"
+
+
 def default_hermes_sync_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "SentenceReader" / "HermesSync"
 
@@ -364,6 +583,125 @@ def lookup_tts_dir() -> Path:
 def clean_lookup_tts_text(text: str) -> str:
     value = re.sub(r"\s+", " ", str(text or "")).strip()
     return value[:300]
+
+
+def android_update_dir() -> Path:
+    ANDROID_UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    return ANDROID_UPDATE_DIR
+
+
+def load_android_update_manifest() -> Optional[dict[str, Any]]:
+    root = android_update_dir().resolve()
+    manifest_path = root / ANDROID_UPDATE_MANIFEST_NAME
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise HTTPException(status_code=503, detail=f"Android update manifest is invalid: {exc.__class__.__name__}")
+    if not isinstance(payload, dict) or payload.get("schema") != ANDROID_UPDATE_SCHEMA:
+        raise HTTPException(status_code=503, detail="Android update manifest schema is invalid")
+    artifact_id = str(payload.get("artifact_id") or "")
+    apk_sha256 = str(payload.get("apk_sha256") or "").lower()
+    certificate_sha256 = str(payload.get("certificate_sha256") or "").lower()
+    try:
+        version_code = int(payload.get("version_code"))
+        apk_bytes = int(payload.get("apk_bytes"))
+        min_sdk = int(payload.get("min_sdk", 28))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=503, detail="Android update manifest numeric fields are invalid")
+    if (
+        ANDROID_UPDATE_ARTIFACT_PATTERN.fullmatch(artifact_id) is None
+        or ANDROID_UPDATE_SHA256_PATTERN.fullmatch(apk_sha256) is None
+        or ANDROID_UPDATE_CERTIFICATE_PATTERN.fullmatch(certificate_sha256) is None
+        or version_code <= 0
+        or apk_bytes <= 0
+        or min_sdk < 28
+    ):
+        raise HTTPException(status_code=503, detail="Android update manifest identity is invalid")
+    apk_path = root / f"{artifact_id}.apk"
+    if (
+        not apk_path.is_file()
+        or apk_path.is_symlink()
+        or apk_path.resolve().parent != root
+        or apk_path.stat().st_size != apk_bytes
+    ):
+        raise HTTPException(status_code=503, detail="Android update APK is missing or has the wrong size")
+    return {
+        **payload,
+        "artifact_id": artifact_id,
+        "version_code": version_code,
+        "version_name": str(payload.get("version_name") or "").strip(),
+        "apk_bytes": apk_bytes,
+        "apk_sha256": apk_sha256,
+        "certificate_sha256": certificate_sha256,
+        "min_sdk": min_sdk,
+        "apk_path": apk_path,
+    }
+
+
+def synthesize_lookup_tts_low_priority(
+    command: str,
+    text: str,
+    voice: str,
+    audio_path: Path,
+) -> tuple[bool, str]:
+    """Generate one cache entry without duplicate jobs, argv text, or normal-priority CPU."""
+    with EDGE_TTS_GENERATION_LOCK:
+        if audio_path.is_file() and audio_path.stat().st_size > 0:
+            return True, ""
+        audio_path.unlink(missing_ok=True)
+        cache_root = lookup_tts_dir()
+        input_fd, input_name = tempfile.mkstemp(
+            prefix=".edge-tts-input-",
+            suffix=".txt",
+            dir=cache_root,
+        )
+        input_path = Path(input_name)
+        partial_path = cache_root / f".{audio_path.name}.{uuid4().hex}.partial"
+        try:
+            with os.fdopen(input_fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            arguments = [
+                command,
+                "--voice",
+                voice,
+                "--file",
+                str(input_path),
+                "--write-media",
+                str(partial_path),
+            ]
+            if EDGE_TTS_NICE_COMMAND.is_file():
+                arguments = [
+                    str(EDGE_TTS_NICE_COMMAND),
+                    "-n",
+                    str(EDGE_TTS_NICE_LEVEL),
+                    *arguments,
+                ]
+            proc = subprocess.run(
+                arguments,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=45,
+                env=edge_tts_subprocess_environment(),
+            )
+            if proc.returncode != 0 or not partial_path.is_file() or partial_path.stat().st_size <= 0:
+                detail = (proc.stderr or proc.stdout or "edge-tts failed").strip()
+                return False, detail[:240]
+            with partial_path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(partial_path, audio_path)
+            return True, ""
+        except subprocess.TimeoutExpired:
+            return False, "edge-tts timed out"
+        except OSError as error:
+            return False, str(error)[:240]
+        finally:
+            input_path.unlink(missing_ok=True)
+            partial_path.unlink(missing_ok=True)
 
 
 POS_ZH_MAP = {
@@ -447,12 +785,8 @@ def xml_attr(node: ET.Element, name: str) -> str:
 
 def zip_text(epub: zipfile.ZipFile, name: str) -> str:
     raw = epub.read(name)
-    for encoding in ("utf-8", "utf-16", "gb18030"):
-        try:
-            return raw.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return raw.decode("utf-8", errors="replace")
+    text, _ = decode_epub_bytes(raw)
+    return text
 
 
 def safe_epub_member(path: str) -> str:
@@ -795,14 +1129,53 @@ def generated_cover_svg(book: dict[str, Any]) -> bytes:
     return svg.encode("utf-8")
 
 
+def pdf_cover_cache_path(book: dict[str, Any]) -> Path:
+    stable = safe_slug(str(book.get("book_hash") or book.get("id") or "pdf"))
+    return app_support_books_dir() / stable / "derived" / "cover.png"
+
+
+def ensure_pdf_cover_cache(book: dict[str, Any], source_path: Path) -> Optional[Path]:
+    target = pdf_cover_cache_path(book)
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    if not source_path.exists() or source_path.suffix.lower() != ".pdf":
+        return None
+    qlmanage = Path("/usr/bin/qlmanage")
+    if not qlmanage.exists():
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="click-pdf-cover-") as temp_dir:
+        try:
+            completed = subprocess.run(
+                [str(qlmanage), "-t", "-s", "720", "-o", temp_dir, str(source_path)],
+                check=False,
+                capture_output=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        candidates = sorted(Path(temp_dir).glob("*.png"))
+        if not candidates:
+            return None
+        shutil.copy2(candidates[0], target)
+    return target if target.exists() else None
+
+
 def library_cover_info(book: dict[str, Any], file_status: dict[str, Any]) -> dict[str, Any]:
     has_epub_cover = False
     if file_status.get("exists") and file_status.get("extension") == "epub":
         has_epub_cover = epub_cover_asset(Path(str(file_status.get("file_path") or "")).expanduser()) is not None
+    is_pdf = file_status.get("exists") and file_status.get("extension") == "pdf"
+    has_pdf_cover = False
+    if is_pdf:
+        cached = ensure_pdf_cover_cache(book, Path(str(file_status.get("file_path") or "")).expanduser())
+        has_pdf_cover = cached is not None
     return {
         "url": f"/api/library/books/{book.get('id')}/cover",
-        "kind": "epub" if has_epub_cover else "generated",
-        "has_image": has_epub_cover,
+        "kind": "epub" if has_epub_cover else ("pdf_first_page" if has_pdf_cover else "generated"),
+        "has_image": has_epub_cover or has_pdf_cover,
     }
 
 
@@ -860,13 +1233,26 @@ def book_with_latest_file(book_id: str) -> dict[str, Any]:
                    bf.file_path,
                    bf.file_kind,
                    bf.file_hash,
-                   bf.byte_size
+                   bf.byte_size,
+                   (
+                       SELECT jsonb_agg(
+                           jsonb_build_object(
+                               'file_path', candidate.file_path,
+                               'file_kind', candidate.file_kind,
+                               'file_hash', candidate.file_hash,
+                               'byte_size', candidate.byte_size
+                           )
+                           ORDER BY candidate.created_at DESC, candidate.id DESC
+                       )
+                       FROM reader.book_files candidate
+                       WHERE candidate.book_id = b.id
+                   ) AS file_candidates
             FROM reader.books b
             LEFT JOIN LATERAL (
                 SELECT file_path, file_kind, file_hash, byte_size
                 FROM reader.book_files
                 WHERE book_id = b.id
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT 1
             ) bf ON true
             WHERE b.id = %s
@@ -875,7 +1261,64 @@ def book_with_latest_file(book_id: str) -> dict[str, Any]:
         ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="book not found")
-    return dict(row)
+    return preferred_existing_book_file(dict(row))
+
+
+def preferred_existing_book_file(row: dict[str, Any]) -> dict[str, Any]:
+    result = dict(row)
+    raw_candidates = result.pop("file_candidates", None)
+    candidates = [
+        dict(candidate)
+        for candidate in (raw_candidates or [])
+        if isinstance(candidate, dict)
+        and str(candidate.get("file_path") or "").strip()
+    ]
+    if not candidates:
+        return result
+    source_kind = str(result.get("source_kind") or "").strip().lower()
+    expected_extension = source_kind if source_kind in {"epub", "pdf"} else ""
+    readable: list[tuple[dict[str, Any], bool]] = []
+    for candidate in candidates:
+        path = Path(str(candidate["file_path"])).expanduser()
+        candidate_kind = str(candidate.get("file_kind") or "").strip().lower()
+        if not path.is_file():
+            continue
+        if expected_extension and path.suffix.lower() != f".{expected_extension}":
+            continue
+        if (
+            expected_extension
+            and candidate_kind in {"epub", "pdf"}
+            and candidate_kind != expected_extension
+        ):
+            continue
+        readable.append(
+            (
+                candidate,
+                bool(library_file_status(str(path))["owned_internal_copy"]),
+            )
+        )
+    mapped_bundle = living_book_mapped_bundle_dir(result)
+    mapped_original_dir = (mapped_bundle / "1_原书").resolve() if mapped_bundle else None
+
+    def is_mapped_write_owner(candidate: dict[str, Any]) -> bool:
+        if mapped_original_dir is None:
+            return False
+        try:
+            Path(str(candidate.get("file_path") or "")).expanduser().resolve().relative_to(mapped_original_dir)
+            return True
+        except (FileNotFoundError, OSError, ValueError):
+            return False
+
+    selected = next(
+        (candidate for candidate, _owned in readable if is_mapped_write_owner(candidate)),
+        next(
+            (candidate for candidate, owned in readable if owned),
+            readable[0][0] if readable else candidates[0],
+        ),
+    )
+    for key in ("file_path", "file_kind", "file_hash", "byte_size"):
+        result[key] = selected.get(key)
+    return result
 
 
 def epub_path_for_book(book: dict[str, Any]) -> Path:
@@ -883,6 +1326,79 @@ def epub_path_for_book(book: dict[str, Any]) -> Path:
     if not file_path:
         raise HTTPException(status_code=404, detail="book has no EPUB file path")
     return Path(file_path).expanduser()
+
+
+def epub_compatibility_root() -> Path:
+    return Path(
+        os.getenv(
+            "CLICK_EPUB_COMPATIBILITY_ROOT",
+            str(Path.home() / "Library" / "Application Support" / "Click" / "EpubCompatibility"),
+        )
+    ).expanduser()
+
+
+def epub_compatibility_dir(book_id: str) -> Path:
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(book_id or "")).strip("-")
+    if not safe_id:
+        raise HTTPException(status_code=422, detail="book id is required for EPUB compatibility assets")
+    return epub_compatibility_root() / safe_id
+
+
+def ensure_book_epub_assets(book: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
+    book_id = str(book.get("id") or "").strip()
+    epub_path = epub_path_for_book(book)
+    try:
+        return ensure_epub_assets(
+            epub_path,
+            book_id=book_id,
+            output_dir=epub_compatibility_dir(book_id),
+            force=force,
+        )
+    except Exception as exc:  # noqa: BLE001 - a damaged sidecar must never discard the imported EPUB.
+        return {
+            "schema": EPUB_COMPATIBILITY_REPORT_SCHEMA,
+            "book_id": book_id,
+            "source_file": str(epub_path),
+            "checked_at": now_iso(),
+            "status": "error",
+            "reading_profile": "UNKNOWN",
+            "recommended_spread": "never",
+            "display_variants": {"available": False},
+            "original_epub_modified": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+
+def read_book_epub_assets(book_id: str) -> dict[str, Any]:
+    path = epub_compatibility_dir(book_id) / "compatibility_report.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if payload.get("schema") == EPUB_COMPATIBILITY_REPORT_SCHEMA else {}
+
+
+def android_epub_path_for_book(book: dict[str, Any], report: Optional[dict[str, Any]] = None) -> Path:
+    report = report or read_book_epub_assets(str(book.get("id") or ""))
+    runtime = Path(str(report.get("runtime_epub_path") or "")).expanduser()
+    if report.get("reading_profile") == "IMAGE_COMIC" and runtime.exists():
+        return runtime
+    return epub_path_for_book(book)
+
+
+def android_book_contract_fields(book: dict[str, Any], report: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    report = report or read_book_epub_assets(str(book.get("id") or ""))
+    analysis = living_book_analysis_state_for_book(str(book.get("id") or ""), create=False)
+    return {
+        "reading_profile": report.get("reading_profile") or "UNKNOWN",
+        "compatibility_status": "error" if report.get("status") == "error" else "ready" if report else "pending",
+        "toc_depth": report.get("toc_depth_counts") or {},
+        "display_variants_available": bool((report.get("display_variants") or {}).get("available")),
+        "analysis_state": analysis.get("state") or "not_requested",
+        "analysis_updated_at": analysis.get("updated_at") or "",
+    }
 
 
 def lan_reader_html() -> str:
@@ -4557,6 +5073,3761 @@ def render_markdown_export(book: dict[str, Any], annotations: list[dict[str, Any
     return "\n".join(lines)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def living_book_slug(book: dict[str, Any]) -> str:
+    title_slug = safe_slug(str(book.get("title") or "book"))
+    stable_part = str(book.get("book_hash") or book.get("id") or "")[:12]
+    return safe_slug(f"{title_slug}-{stable_part}") if stable_part else title_slug
+
+
+def living_book_safe_filename(book: dict[str, Any], source_path: Path) -> str:
+    stem = safe_slug(str(book.get("title") or source_path.stem or "book"))
+    suffix = source_path.suffix.lower() or ".epub"
+    return f"{stem}{suffix}"
+
+
+def relative_to_bundle(bundle_dir: Path, path: Path) -> str:
+    try:
+        return path.relative_to(bundle_dir).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def has_reviewed_marker(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        head = path.read_text(encoding="utf-8", errors="ignore")[:4096].lower()
+    except OSError:
+        return False
+    return any(
+        marker in head
+        for marker in (
+            "status: reviewed",
+            "reviewed: true",
+            '"status": "reviewed"',
+            '"reviewed": true',
+            "状态：已审阅",
+            "状态: 已审阅",
+        )
+    )
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace a generated text file atomically without exposing a partial write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        temporary_path = Path(temporary_name)
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def write_living_book_text(path: Path, text: str, *, protect_reviewed: bool = True) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if protect_reviewed and has_reviewed_marker(path):
+        return {"path": str(path), "written": False, "reason": "reviewed_file_not_overwritten"}
+    atomic_write_text(path, text.rstrip() + "\n")
+    return {"path": str(path), "written": True}
+
+
+def write_living_book_json(path: Path, payload: dict[str, Any], *, protect_reviewed: bool = True) -> dict[str, Any]:
+    return write_living_book_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        protect_reviewed=protect_reviewed,
+    )
+
+
+def living_book_book_row(book_id: str) -> dict[str, Any]:
+    return jsonable(book_with_latest_file(book_id))
+
+
+def living_book_annotations(book_id: str) -> list[dict[str, Any]]:
+    with db.connect() as conn:
+        annotation_rows = conn.execute(
+            """
+            SELECT * FROM reader.annotations
+            WHERE book_id = %s
+            ORDER BY chapter_locator ASC, created_at ASC
+            """,
+            (book_id,),
+        ).fetchall()
+        audio_rows = conn.execute(
+            """
+            SELECT * FROM reader.audio_notes
+            WHERE book_id = %s
+            ORDER BY created_at ASC
+            """,
+            (book_id,),
+        ).fetchall()
+    audio_by_annotation: dict[str, list[dict[str, Any]]] = {}
+    for audio in [jsonable(dict(row)) for row in audio_rows]:
+        annotation_id = str(audio.get("annotation_id") or "")
+        if annotation_id:
+            audio_by_annotation.setdefault(annotation_id, []).append(audio)
+    items = annotation_export_items([dict(row) for row in annotation_rows])
+    for item in items:
+        item["audio_notes"] = audio_by_annotation.get(str(item.get("id") or ""), [])
+    return items
+
+
+def render_living_annotations_markdown(book: dict[str, Any], annotations: list[dict[str, Any]], generated_at: str) -> str:
+    lines = [
+        f"# {markdown_line(book.get('title'))} - 批注",
+        "",
+        "> 本文件由 Click/Reader 数据库导出，便于人阅读和 Hermes/知识库引用；批注主存储仍是 `reader.annotations`。",
+        "",
+        f"- Book ID: `{markdown_line(book.get('id'))}`",
+        f"- Exported at: {generated_at}",
+        f"- Annotation count: {len(annotations)}",
+        "",
+    ]
+    if not annotations:
+        lines.extend(["## 暂无批注", ""])
+        return "\n".join(lines)
+    for item in annotations:
+        kind = "标红" if item.get("kind") == "red_highlight" else "备注"
+        chapter = markdown_line(item.get("chapter_title")) or markdown_line(item.get("chapter_locator"))
+        lines.extend(
+            [
+                f"## {item.get('export_index')}. {kind} · {chapter}",
+                "",
+                f"- Annotation ID: `{markdown_line(item.get('id'))}`",
+                f"- Locator: `{markdown_line(item.get('chapter_locator'))}`",
+                f"- Sentence index: `{markdown_line(item.get('sentence_index'))}`",
+                f"- Created at: {markdown_line(item.get('created_at'))}",
+                f"- Updated at: {markdown_line(item.get('updated_at'))}",
+                "",
+                "### 原文",
+                "",
+                f"> {markdown_line(item.get('source_text'))}",
+                "",
+            ]
+        )
+        note = markdown_line(item.get("note_text"))
+        if note:
+            lines.extend(["### 我的备注", "", note, ""])
+        for audio in item.get("audio_notes") or []:
+            transcript = markdown_line(audio.get("transcript"))
+            if transcript:
+                lines.extend(
+                    [
+                        "### 语音备注转写",
+                        "",
+                        transcript,
+                        "",
+                        f"- Audio note: `{markdown_line(audio.get('id'))}`",
+                        f"- Status: `{markdown_line(audio.get('status'))}`",
+                        "",
+                    ]
+                )
+    return "\n".join(lines)
+
+
+def render_book_home(book: dict[str, Any], manifest: dict[str, Any]) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    author = markdown_line(book.get("author")) or "未知作者"
+    paths = manifest["paths"]
+    return "\n".join(
+        [
+            f"# {title}",
+            "",
+            "## 这本书是什么",
+            "",
+            f"- 书名：{title}",
+            f"- 作者：{author}",
+            f"- Book ID：`{markdown_line(book.get('id'))}`",
+            f"- 文件类型：`{markdown_line(book.get('source_kind'))}`",
+            f"- 文件 hash：`{markdown_line(manifest.get('file_hash'))}`",
+            "",
+            "## 数据主从关系",
+            "",
+            "- Click/Reader 数据库是阅读运行和批注主存储。",
+            "- `reader.annotations` 是批注主表。",
+            "- `reader.audio_notes` 是语音备注主表。",
+            "- `2_批注数据/批注.json` 和 `2_批注数据/批注.md` 是导出层，可从数据库重建。",
+            "- 原书保持干净，不把批注写回 EPUB/PDF。",
+            "",
+            "## 文件入口",
+            "",
+            f"- 原书：`{paths['original_dir']}`",
+            f"- 批注 JSON：`{paths['annotations_json']}`",
+            f"- 批注 Markdown：`{paths['annotations_markdown']}`",
+            f"- 融合阅读：`{paths['fused_reading_dir']}`",
+            f"- 书籍整理：`{paths['book_notes_dir']}`",
+            f"- 思想模型：`{paths['thought_model_dir']}`",
+            f"- Hermes 调用：`{paths['hermes_dir']}`",
+            f"- 对话复盘：`{paths['dialogue_review_dir']}`",
+            "",
+            "## Hermes 使用建议",
+            "",
+            "- 如果用户问书中内容，读取原书、书籍整理或融合阅读。",
+            "- 如果用户问“我读这本书时怎么想”，优先读取批注 JSON/Markdown。",
+            "- 如果用户要求这本书参与判断，读取 Hermes 调用卡、思想模型草稿、相关原文和相关批注。",
+            "- Hermes 输出必须区分：书中明确说过、按本书逻辑推演、Hermes 综合判断。",
+        ]
+    )
+
+
+def preserve_book_home_extensions(path: Path, generated: str) -> str:
+    """Keep worker-owned sections when Click refreshes the generated book home."""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return generated
+    marker = re.search(r"(?m)^## worker_[^\n]*$", existing)
+    if marker is None:
+        return generated
+    extension = existing[marker.start():].strip()
+    return f"{generated.rstrip()}\n\n{extension}" if extension else generated
+
+
+def render_hermes_call_card(book: dict[str, Any]) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    author = markdown_line(book.get("author")) or "未知作者"
+    return "\n".join(
+        [
+            "# 书籍调用卡",
+            "",
+            "status: draft",
+            "",
+            "## 书名",
+            "",
+            title,
+            "",
+            "## 作者",
+            "",
+            author,
+            "",
+            "## 适合参与的问题",
+            "",
+            "- 待用户或 Hermes 根据批注和思想模型补充",
+            "",
+            "## 核心视角",
+            "",
+            "本调用卡是 Click 自动生成的 P1 草稿，只负责给 Hermes 路由，不替代原文、批注或思想模型。",
+            "",
+            "## Hermes 使用规则",
+            "",
+            "- 如果用户要求书中依据，必须读取原文、融合阅读或明确出处。",
+            "- 如果用户要求“我怎么想”，必须读取 `../2_批注数据/批注.json` 或 `../2_批注数据/批注.md`。",
+            "- 如果用户要求书活过来，必须读取 `../5_书籍思想模型/`，且草稿模型不能当作最终事实。",
+            "- 输出必须区分：书中明确说过、按本书逻辑推演、超出本书范围的 Hermes 综合判断。",
+            "",
+            "## 文件入口",
+            "",
+            "- 原书：`../1_原书/`",
+            "- 批注：`../2_批注数据/`",
+            "- 融合阅读：`../3_融合阅读/`",
+            "- 思想模型：`../5_书籍思想模型/`",
+        ]
+    )
+
+
+def render_fused_chapter(book: dict[str, Any], chapter: str, annotations: list[dict[str, Any]], generated_at: str) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    lines = [
+        f"# {markdown_line(chapter) or '未命名章节'}_融合阅读",
+        "",
+        f"- Book: {title}",
+        f"- Generated at: {generated_at}",
+        "- Scope: only annotated fragments for Living Books P1",
+        "",
+    ]
+    for item in annotations:
+        kind = "标红" if item.get("kind") == "red_highlight" else "备注"
+        lines.extend(
+            [
+                f"## 片段 {item.get('export_index')}",
+                "",
+                "【原文位置】",
+                "",
+                f"- Chapter locator: `{markdown_line(item.get('chapter_locator'))}`",
+                f"- Sentence index: `{markdown_line(item.get('sentence_index'))}`",
+                f"- Annotation ID: `{markdown_line(item.get('id'))}`",
+                "",
+                "【原文】",
+                "",
+                f"> {markdown_line(item.get('source_text'))}",
+                "",
+                "【我的标注】",
+                "",
+                f"- 类型：{kind}",
+                f"- 颜色：{markdown_line(item.get('color')) or ('red' if item.get('kind') == 'red_highlight' else '')}",
+                "",
+            ]
+        )
+        note = markdown_line(item.get("note_text"))
+        if note:
+            lines.extend(["【我的备注】", "", note, ""])
+        for audio in item.get("audio_notes") or []:
+            transcript = markdown_line(audio.get("transcript"))
+            if transcript:
+                lines.extend(["【语音备注转写】", "", transcript, ""])
+        lines.extend(
+            [
+                "【可用于】",
+                "",
+                "- 回答这本书相关内容",
+                "- 回答我读这本书时怎么想",
+                "- 让 Hermes 使用原文和批注作为证据",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+DEFAULT_LIVING_BOOK_TAXONOMY: list[dict[str, Any]] = [
+    {
+        "category_id": "pending",
+        "level": 1,
+        "parent_id": None,
+        "name": "待分类",
+        "directory_name": "00_待分类",
+        "description": "尚未人工确认分类的书。",
+        "aliases": ["未分类", "待整理"],
+        "status": "active",
+    },
+    {
+        "category_id": "pending.unclassified",
+        "level": 2,
+        "parent_id": "pending",
+        "name": "待分类",
+        "directory_name": "00_待分类",
+        "description": "Hermes 尚不能可靠归类，等待用户确认。",
+        "aliases": ["普通阅读", "待人工确认"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual",
+        "level": 1,
+        "parent_id": None,
+        "name": "信仰与属灵",
+        "directory_name": "01_信仰与属灵",
+        "description": "圣经、祷告、属灵生命和教会历史。",
+        "aliases": ["信仰", "属灵", "圣经"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual.prayer",
+        "level": 2,
+        "parent_id": "faith_spiritual",
+        "name": "祷告",
+        "directory_name": "祷告",
+        "description": "祷告、与主交通、属灵操练相关书籍。",
+        "aliases": ["祈祷", "交通", "亲近主"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual.bible_study",
+        "level": 2,
+        "parent_id": "faith_spiritual",
+        "name": "圣经研读",
+        "directory_name": "圣经研读",
+        "description": "经文、生命读经、解经和圣经主题研究。",
+        "aliases": ["生命读经", "经文", "福音"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual.spiritual_life",
+        "level": 2,
+        "parent_id": "faith_spiritual",
+        "name": "属灵生命",
+        "directory_name": "属灵生命",
+        "description": "生命经历、属灵成长和实行。",
+        "aliases": ["生命", "成长", "操练"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual.church_history",
+        "level": 2,
+        "parent_id": "faith_spiritual",
+        "name": "教会历史",
+        "directory_name": "教会历史",
+        "description": "教会史、人物和传统。",
+        "aliases": ["历史", "教会史"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning",
+        "level": 1,
+        "parent_id": None,
+        "name": "认知与学习",
+        "directory_name": "02_认知与学习",
+        "description": "学习、阅读、认知科学和研究方法。",
+        "aliases": ["学习", "认知", "阅读"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.learning_methods",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "学习方法",
+        "directory_name": "学习方法",
+        "description": "学习方法、技能训练和复习系统。",
+        "aliases": ["学习", "技能", "训练"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.reading_writing",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "阅读写作",
+        "directory_name": "阅读写作",
+        "description": "阅读、笔记、写作和知识表达。",
+        "aliases": ["阅读", "写作", "笔记"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.cognitive_science",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "认知科学",
+        "directory_name": "认知科学",
+        "description": "记忆、注意力、心理学和认知机制。",
+        "aliases": ["记忆", "心理学", "大脑"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.research_methods",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "研究方法",
+        "directory_name": "研究方法",
+        "description": "研究、论文、调查和论证方法。",
+        "aliases": ["研究", "论文", "调查"],
+        "status": "active",
+    },
+    {
+        "category_id": "business",
+        "level": 1,
+        "parent_id": None,
+        "name": "商业与经营",
+        "directory_name": "03_商业与经营",
+        "description": "战略、运营、营销和管理。",
+        "aliases": ["经营", "管理", "商业"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.strategy",
+        "level": 2,
+        "parent_id": "business",
+        "name": "战略",
+        "directory_name": "战略",
+        "description": "竞争、定位、资源配置和长期选择。",
+        "aliases": ["策略", "竞争", "定位"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.operations",
+        "level": 2,
+        "parent_id": "business",
+        "name": "运营",
+        "directory_name": "运营",
+        "description": "流程、供应链、组织运转和指标。",
+        "aliases": ["流程", "供应链", "指标"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.marketing",
+        "level": 2,
+        "parent_id": "business",
+        "name": "营销",
+        "directory_name": "营销",
+        "description": "品牌、增长、广告和销售。",
+        "aliases": ["品牌", "广告", "销售"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.management",
+        "level": 2,
+        "parent_id": "business",
+        "name": "管理",
+        "directory_name": "管理",
+        "description": "组织、团队和管理方法。",
+        "aliases": ["组织", "团队"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai",
+        "level": 1,
+        "parent_id": None,
+        "name": "AI与技术",
+        "directory_name": "04_AI与技术",
+        "description": "AI、编程、自动化和产品设计。",
+        "aliases": ["AI", "技术", "软件"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai.ai_tools",
+        "level": 2,
+        "parent_id": "technology_ai",
+        "name": "AI工具",
+        "directory_name": "AI工具",
+        "description": "AI 工具、模型、agent 和工作流。",
+        "aliases": ["人工智能", "模型", "agent"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai.programming",
+        "level": 2,
+        "parent_id": "technology_ai",
+        "name": "编程",
+        "directory_name": "编程",
+        "description": "编程、软件工程和代码实践。",
+        "aliases": ["代码", "软件工程"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai.automation",
+        "level": 2,
+        "parent_id": "technology_ai",
+        "name": "自动化",
+        "directory_name": "自动化",
+        "description": "自动化、脚本和系统集成。",
+        "aliases": ["自动化", "脚本"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai.product_design",
+        "level": 2,
+        "parent_id": "technology_ai",
+        "name": "产品设计",
+        "directory_name": "产品设计",
+        "description": "产品、交互、体验和系统设计。",
+        "aliases": ["产品", "设计", "交互"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth",
+        "level": 1,
+        "parent_id": None,
+        "name": "个人成长",
+        "directory_name": "05_个人成长",
+        "description": "判断、时间、表达和行动能力。",
+        "aliases": ["成长", "能力"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth.decision",
+        "level": 2,
+        "parent_id": "personal_growth",
+        "name": "决策判断",
+        "directory_name": "决策判断",
+        "description": "判断、选择和复杂问题处理。",
+        "aliases": ["判断", "决策", "选择"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth.time_management",
+        "level": 2,
+        "parent_id": "personal_growth",
+        "name": "时间管理",
+        "directory_name": "时间管理",
+        "description": "时间、精力、习惯和执行。",
+        "aliases": ["时间", "习惯", "执行"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth.communication",
+        "level": 2,
+        "parent_id": "personal_growth",
+        "name": "表达沟通",
+        "directory_name": "表达沟通",
+        "description": "表达、演讲、写作沟通和说服。",
+        "aliases": ["表达", "沟通", "说服"],
+        "status": "active",
+    },
+    {
+        "category_id": "faith_spiritual.training",
+        "level": 2,
+        "parent_id": "faith_spiritual",
+        "name": "晨兴与训练",
+        "directory_name": "晨兴与训练",
+        "description": "晨兴圣言、特会训练、长老训练和成全材料。",
+        "aliases": ["晨兴", "训练", "特会", "ITERO", "HWMR"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.logic_reasoning",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "逻辑与论证",
+        "directory_name": "逻辑与论证",
+        "description": "形式逻辑、批判性思维、论证与推理方法。",
+        "aliases": ["逻辑", "论证", "推理", "批判性思维"],
+        "status": "active",
+    },
+    {
+        "category_id": "cognition_learning.psychology",
+        "level": 2,
+        "parent_id": "cognition_learning",
+        "name": "心理学",
+        "directory_name": "心理学",
+        "description": "人格、社会、发展和应用心理学。",
+        "aliases": ["心理", "人格", "行为"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.fundamentals",
+        "level": 2,
+        "parent_id": "business",
+        "name": "商业基础",
+        "directory_name": "商业基础",
+        "description": "商业通识、商业认知和经营基本原理。",
+        "aliases": ["商业通识", "商业认知", "底层逻辑"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.product_user",
+        "level": 2,
+        "parent_id": "business",
+        "name": "产品与用户",
+        "directory_name": "产品与用户",
+        "description": "用户研究、需求、产品方法与商业模式。",
+        "aliases": ["产品", "用户", "需求", "商业模式"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.economics_finance",
+        "level": 2,
+        "parent_id": "business",
+        "name": "经济与金融",
+        "directory_name": "经济与金融",
+        "description": "经济学、宏观经济、金融和公司财务。",
+        "aliases": ["经济", "宏观", "金融", "财务"],
+        "status": "active",
+    },
+    {
+        "category_id": "business.review_execution",
+        "level": 2,
+        "parent_id": "business",
+        "name": "复盘与执行",
+        "directory_name": "复盘与执行",
+        "description": "经营复盘、方法落地、执行改进和组织学习。",
+        "aliases": ["复盘", "打法", "执行", "改进"],
+        "status": "active",
+    },
+    {
+        "category_id": "technology_ai.data_systems",
+        "level": 2,
+        "parent_id": "technology_ai",
+        "name": "数据与系统",
+        "directory_name": "数据与系统",
+        "description": "数据工程、信息系统和系统架构。",
+        "aliases": ["数据", "系统", "架构"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth.execution_reflection",
+        "level": 2,
+        "parent_id": "personal_growth",
+        "name": "行动与复盘",
+        "directory_name": "行动与复盘",
+        "description": "个人行动、习惯改进、自我复盘和能力精进。",
+        "aliases": ["行动", "复盘", "精进"],
+        "status": "active",
+    },
+    {
+        "category_id": "personal_growth.career_growth",
+        "level": 2,
+        "parent_id": "personal_growth",
+        "name": "职业与成长",
+        "directory_name": "职业与成长",
+        "description": "职业发展、职场能力和长期成长。",
+        "aliases": ["职业", "职场", "成长"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health",
+        "level": 1,
+        "parent_id": None,
+        "name": "中医与健康",
+        "directory_name": "06_中医与健康",
+        "description": "中医理论、经典、诊疗、方药、针灸和文献研究。",
+        "aliases": ["中医", "健康", "医学"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.fundamentals",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "基础理论",
+        "directory_name": "基础理论",
+        "description": "中医基础理论和学科总论。",
+        "aliases": ["中医基础", "基础理论"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.classics",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "经典",
+        "directory_name": "经典",
+        "description": "内经、伤寒、金匮及经典选读。",
+        "aliases": ["内经", "伤寒", "金匮", "经典"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.herbs_formulas",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "中药与方剂",
+        "directory_name": "中药与方剂",
+        "description": "中药、方剂和配伍应用。",
+        "aliases": ["中药", "方剂", "本草"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.acupuncture_meridians",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "针灸与经络",
+        "directory_name": "针灸与经络",
+        "description": "针灸、经络和腧穴。",
+        "aliases": ["针灸", "经络", "腧穴"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.diagnosis_clinical",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "诊断与临床",
+        "directory_name": "诊断与临床",
+        "description": "中医诊断、辨证和临床应用。",
+        "aliases": ["诊断", "辨证", "临床"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.pharmacology_research",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "药理与研究",
+        "directory_name": "药理与研究",
+        "description": "中药药理、实验和现代研究。",
+        "aliases": ["药理", "实验", "现代研究"],
+        "status": "active",
+    },
+    {
+        "category_id": "tcm_health.literature",
+        "level": 2,
+        "parent_id": "tcm_health",
+        "name": "文献与医史",
+        "directory_name": "文献与医史",
+        "description": "中医文献、目录学和医学史。",
+        "aliases": ["文献", "医史", "目录"],
+        "status": "active",
+    },
+    {
+        "category_id": "history_humanities",
+        "level": 1,
+        "parent_id": None,
+        "name": "历史与人文",
+        "directory_name": "07_历史与人文",
+        "description": "中国史、世界史、思想经典和社会文化。",
+        "aliases": ["历史", "人文", "思想"],
+        "status": "active",
+    },
+    {
+        "category_id": "history_humanities.chinese_history",
+        "level": 2,
+        "parent_id": "history_humanities",
+        "name": "中国史",
+        "directory_name": "中国史",
+        "description": "中国通史、断代史、人物和制度。",
+        "aliases": ["中国历史", "明史", "清史"],
+        "status": "active",
+    },
+    {
+        "category_id": "history_humanities.world_history",
+        "level": 2,
+        "parent_id": "history_humanities",
+        "name": "世界史",
+        "directory_name": "世界史",
+        "description": "世界历史、地区史和文明史。",
+        "aliases": ["世界历史", "文明史"],
+        "status": "active",
+    },
+    {
+        "category_id": "history_humanities.thought_classics",
+        "level": 2,
+        "parent_id": "history_humanities",
+        "name": "思想与经典",
+        "directory_name": "思想与经典",
+        "description": "哲学、思想史和传统经典。",
+        "aliases": ["思想", "哲学", "经典"],
+        "status": "active",
+    },
+    {
+        "category_id": "history_humanities.social_culture",
+        "level": 2,
+        "parent_id": "history_humanities",
+        "name": "社会与文化",
+        "directory_name": "社会与文化",
+        "description": "社会研究、文化观察和民俗。",
+        "aliases": ["社会", "文化", "民俗"],
+        "status": "active",
+    },
+    {
+        "category_id": "literature_arts",
+        "level": 1,
+        "parent_id": None,
+        "name": "文学与艺术",
+        "directory_name": "08_文学与艺术",
+        "description": "文学作品、散文、漫画和艺术。",
+        "aliases": ["文学", "小说", "艺术", "漫画"],
+        "status": "active",
+    },
+    {
+        "category_id": "literature_arts.classical_chinese",
+        "level": 2,
+        "parent_id": "literature_arts",
+        "name": "中国古典文学",
+        "directory_name": "中国古典文学",
+        "description": "中国古典小说、诗文和文学作品。",
+        "aliases": ["古典文学", "古典小说", "诗词"],
+        "status": "active",
+    },
+    {
+        "category_id": "literature_arts.modern_chinese",
+        "level": 2,
+        "parent_id": "literature_arts",
+        "name": "中国现当代文学",
+        "directory_name": "中国现当代文学",
+        "description": "中国现代与当代文学作品。",
+        "aliases": ["现代文学", "当代文学"],
+        "status": "active",
+    },
+    {
+        "category_id": "literature_arts.world_literature",
+        "level": 2,
+        "parent_id": "literature_arts",
+        "name": "外国文学",
+        "directory_name": "外国文学",
+        "description": "外国小说、诗歌和戏剧。",
+        "aliases": ["外国小说", "世界文学"],
+        "status": "active",
+    },
+    {
+        "category_id": "literature_arts.comics_visual",
+        "level": 2,
+        "parent_id": "literature_arts",
+        "name": "漫画与图像",
+        "directory_name": "漫画与图像",
+        "description": "漫画、图像叙事和轻阅读。",
+        "aliases": ["漫画", "绘本", "图像"],
+        "status": "active",
+    },
+    {
+        "category_id": "projects_systems",
+        "level": 1,
+        "parent_id": None,
+        "name": "项目与工作系统",
+        "directory_name": "09_项目与工作系统",
+        "description": "项目手册、内部知识资产和工作系统资料。",
+        "aliases": ["项目", "工作系统", "内部资料"],
+        "status": "active",
+    },
+    {
+        "category_id": "projects_systems.marketplace_os",
+        "level": 2,
+        "parent_id": "projects_systems",
+        "name": "Marketplace OS",
+        "directory_name": "Marketplace OS",
+        "description": "Marketplace OS 经营系统和训练资料。",
+        "aliases": ["亚马逊", "Marketplace", "电商经营"],
+        "status": "active",
+    },
+    {
+        "category_id": "projects_systems.click_reader",
+        "level": 2,
+        "parent_id": "projects_systems",
+        "name": "Click / Reader",
+        "directory_name": "Click Reader",
+        "description": "Click、Reader 和学习系统的产品资料。",
+        "aliases": ["Click", "Reader", "阅读系统"],
+        "status": "active",
+    },
+    {
+        "category_id": "projects_systems.content_creation",
+        "level": 2,
+        "parent_id": "projects_systems",
+        "name": "内容创作",
+        "directory_name": "内容创作",
+        "description": "选题、配文、脚本和内容资产。",
+        "aliases": ["内容", "配文", "脚本", "选题"],
+        "status": "active",
+    },
+]
+
+
+LIVING_BOOK_JOB_TERMINAL_STATUSES = {"needs_review", "complete", "reviewed", "skipped_reviewed"}
+LIVING_BOOK_ANALYSIS_STATES = {
+    "not_requested",
+    "queued",
+    "running",
+    "draft_ready",
+    "needs_review",
+    "complete",
+    "failed",
+}
+LIVING_BOOK_ANALYSIS_THREAD_LOCK = threading.Lock()
+LIVING_BOOK_ANALYSIS_THREADS: set[str] = set()
+
+
+def read_living_book_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_living_book_json_unprotected(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2).rstrip() + "\n")
+    return {"path": str(path), "written": True}
+
+
+def living_book_index_dir(lb_root: Path) -> Path:
+    return lb_root / ("indexes" if lb_root.name == "_system" else "index")
+
+
+def living_book_jobs_path(lb_root: Path) -> Path:
+    jobs_dir = "jobs" if lb_root.name == "_system" else "_jobs"
+    return lb_root / jobs_dir / "living_book_jobs.json"
+
+
+def living_book_status_path(bundle_dir: Path) -> Path:
+    return bundle_dir / "_status" / "living_book_status.json"
+
+
+def living_book_analysis_path(bundle_dir: Path) -> Path:
+    return bundle_dir / "_status" / "analysis.json"
+
+
+def default_living_book_analysis(book_id: str, bundle_dir: Optional[Path] = None) -> dict[str, Any]:
+    return {
+        "schema": "click.living_book.analysis_state.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir) if bundle_dir else "",
+        "state": "not_requested",
+        "requested_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "requested_by": None,
+        "runtime": None,
+        "model": None,
+        "invocation_id": None,
+        "last_error": None,
+        "outputs": {},
+        "updated_at": now_iso(),
+    }
+
+
+def write_living_book_analysis(bundle_dir: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    state = str(payload.get("state") or "not_requested")
+    if state not in LIVING_BOOK_ANALYSIS_STATES:
+        raise ValueError(f"invalid Living Book analysis state: {state}")
+    normalized = {
+        **payload,
+        "schema": "click.living_book.analysis_state.v1",
+        "bundle_dir": str(bundle_dir),
+        "state": state,
+        "updated_at": now_iso(),
+    }
+    write_living_book_json_unprotected(living_book_analysis_path(bundle_dir), normalized)
+    return normalized
+
+
+def living_book_analysis_state_for_book(
+    book_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+    create: bool = False,
+) -> dict[str, Any]:
+    try:
+        book = living_book_book_row(book_id)
+    except HTTPException:
+        return default_living_book_analysis(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    path = living_book_analysis_path(bundle_dir)
+    payload = read_living_book_json(path, {})
+    if payload.get("schema") == "click.living_book.analysis_state.v1" and payload.get("state") in LIVING_BOOK_ANALYSIS_STATES:
+        return payload
+    default = default_living_book_analysis(book_id, bundle_dir)
+    if create:
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        return write_living_book_analysis(bundle_dir, default)
+    return default
+
+
+def living_book_legacy_bundle_dir(book: dict[str, Any], knowledge_base_root: Optional[str] = None) -> Path:
+    return legacy_living_books_root(knowledge_base_root) / "books" / living_book_slug(book)
+
+
+def living_book_pending_bundle_dir(book: dict[str, Any], knowledge_base_root: Optional[str] = None) -> Path:
+    return knowledge_base_root_path(knowledge_base_root) / "00_待分类" / living_book_slug(book)
+
+
+def living_book_identity(
+    book: dict[str, Any], knowledge_base_root: Optional[str] = None
+) -> dict[str, str]:
+    migration_entry = living_book_migration_entry(book, knowledge_base_root)
+    if migration_entry:
+        mapped_work_id = str(migration_entry.get("work_id") or "").strip()
+        mapped_edition_id = str(migration_entry.get("edition_id") or "").strip()
+        if mapped_work_id and mapped_edition_id:
+            return {
+                "work_id": mapped_work_id,
+                "edition_id": mapped_edition_id,
+            }
+    title = re.sub(r"\s+", " ", str(book.get("title") or "").strip().casefold())
+    author = re.sub(r"\s+", " ", str(book.get("author") or "").strip().casefold())
+    source_kind = str(book.get("source_kind") or book.get("file_kind") or "unknown").strip().casefold()
+    source_hash = str(book.get("file_hash") or book.get("book_hash") or "").strip()
+    normalized_source_hash = (
+        source_hash if not source_hash or source_hash.startswith("sha256:") else f"sha256:{source_hash}"
+    )
+    work_key = f"{title}\n{author}"
+    edition_key = normalized_source_hash or (
+        f"{source_kind}\n{book.get('id') or ''}\n{book.get('file_path') or ''}"
+    )
+    return {
+        "work_id": f"work_{hashlib.sha256(work_key.encode('utf-8')).hexdigest()[:16]}",
+        "edition_id": f"edition_{hashlib.sha256(edition_key.encode('utf-8')).hexdigest()[:16]}",
+    }
+
+
+def living_book_v2_bundle_dir(book: dict[str, Any], knowledge_base_root: Optional[str] = None) -> Path:
+    identity = living_book_identity(book, knowledge_base_root)
+    return (
+        knowledge_base_root_path(knowledge_base_root)
+        / "30_Resources"
+        / "Books"
+        / identity["work_id"]
+        / identity["edition_id"]
+    )
+
+
+def living_book_migration_map_path(knowledge_base_root: Optional[str] = None) -> Path:
+    return knowledge_base_root_path(knowledge_base_root) / "_system" / "migrations" / "living_books_v1_map.json"
+
+
+def living_book_migration_entry(
+    book: dict[str, Any], knowledge_base_root: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    payload = read_living_book_json(living_book_migration_map_path(knowledge_base_root), {})
+    book_id = str(book.get("id") or "")
+    for entry in payload.get("entries") or []:
+        if str(entry.get("book_id") or "") == book_id:
+            return entry
+    return None
+
+
+def living_book_mapped_bundle_dir(book: dict[str, Any], knowledge_base_root: Optional[str] = None) -> Optional[Path]:
+    entry = living_book_migration_entry(book, knowledge_base_root)
+    if entry is None:
+        return None
+    root = knowledge_base_root_path(knowledge_base_root).resolve()
+    candidate_value = entry.get("write_owner_path") or entry.get("legacy_bundle_path")
+    if not candidate_value:
+        return None
+    candidate = Path(str(candidate_value)).expanduser()
+    try:
+        candidate.resolve().relative_to(root)
+    except ValueError:
+        return None
+    return candidate if candidate.exists() else None
+
+
+def _bundle_from_canonical_source(path: Path, knowledge_base_root: Path) -> Optional[Path]:
+    try:
+        relative = path.resolve().relative_to(knowledge_base_root.resolve())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if "1_原书" not in relative.parts:
+        return None
+    index = relative.parts.index("1_原书")
+    return knowledge_base_root.joinpath(*relative.parts[:index])
+
+
+def reconcile_living_book_write_owner(
+    book_id: str,
+    payload: LivingBookWriteOwnerReconcileRequest,
+    *,
+    knowledge_base_root: Optional[str] = None,
+) -> dict[str, Any]:
+    """Adopt a verified existing V2 bundle through the official migration map."""
+    kb_root = knowledge_base_root_path(knowledge_base_root).resolve()
+    books_root = (kb_root / "30_Resources" / "Books").resolve()
+    target = Path(payload.target_bundle).expanduser().resolve()
+    try:
+        target_relative = target.relative_to(books_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="target_bundle must be inside KnowledgeBase/30_Resources/Books") from exc
+    if len(target_relative.parts) != 2:
+        raise HTTPException(status_code=422, detail="target_bundle must have work_id/edition_id shape")
+    work_id, edition_id = target_relative.parts
+    if not re.fullmatch(r"work_[a-z0-9]{12,64}", work_id) or not re.fullmatch(
+        r"edition_[a-z0-9]{12,64}", edition_id
+    ):
+        raise HTTPException(status_code=422, detail="target_bundle has invalid V2 identity")
+    manifest_path = target / "book_manifest.json"
+    manifest = read_living_book_json(manifest_path, {})
+    if manifest.get("schema") != "jiangyu.knowledge.book_manifest.v2":
+        raise HTTPException(status_code=422, detail="target bundle does not have a V2 manifest")
+    if manifest.get("work_id") != work_id or manifest.get("edition_id") != edition_id:
+        raise HTTPException(status_code=409, detail="target manifest identity does not match its path")
+    if str(manifest.get("book_id") or "") != book_id:
+        raise HTTPException(status_code=409, detail="target manifest belongs to another Reader book")
+    expected_hash = str(payload.expected_sha256 or "").strip().lower().removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise HTTPException(status_code=422, detail="expected_sha256 is invalid")
+    canonical_relative = str(
+        (manifest.get("source") or {}).get("canonical_file")
+        or manifest.get("canonical_source_file")
+        or ""
+    )
+    canonical_source = target / canonical_relative
+    if not canonical_relative or not canonical_source.is_file():
+        raise HTTPException(status_code=409, detail="target canonical source is missing")
+    if file_sha256(canonical_source) != expected_hash:
+        raise HTTPException(status_code=409, detail="target canonical source hash mismatch")
+
+    book_before = book_with_latest_file(book_id)
+    if str(book_before.get("book_hash") or "").strip().lower() != expected_hash:
+        raise HTTPException(status_code=409, detail="Reader book hash does not match the target edition")
+    source_path = Path(str(book_before.get("file_path") or "")).expanduser()
+    previous_write_owner = _bundle_from_canonical_source(source_path, kb_root)
+    map_path = living_book_migration_map_path(str(kb_root))
+    migration_map = read_living_book_json(map_path, {})
+    entries = list(migration_map.get("entries") or [])
+    matches = [entry for entry in entries if str(entry.get("book_id") or "") == book_id]
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="migration map has multiple entries for this book")
+    if matches and Path(str(matches[0].get("write_owner_path") or "")).expanduser().resolve() != target:
+        raise HTTPException(status_code=409, detail="book already has a different official write owner")
+    target_owners = [
+        entry
+        for entry in entries
+        if Path(str(entry.get("write_owner_path") or "")).expanduser().resolve() == target
+        and str(entry.get("book_id") or "") != book_id
+    ]
+    if target_owners:
+        raise HTTPException(status_code=409, detail="target bundle is already owned by another book")
+
+    previous_entry = dict(matches[0]) if matches else None
+    previous_migration_map = json.loads(json.dumps(migration_map))
+    observed_at = now_iso()
+    retained_legacy_bundle = str(
+        (previous_entry or {}).get("legacy_bundle_path")
+        or previous_write_owner
+        or source_path.parent
+    )
+    retained_previous_owner = str(
+        (previous_entry or {}).get("previous_write_owner_path")
+        or previous_write_owner
+        or source_path.parent
+    )
+    entry = {
+        **(previous_entry or {}),
+        "entry_id": str((previous_entry or {}).get("entry_id") or stable_id("living_book_asset", str(target))),
+        "book_id": book_id,
+        "book_slug": manifest.get("book_slug") or target.name,
+        "title": payload.title or manifest.get("title") or book_before.get("title"),
+        "author": payload.author if payload.author is not None else manifest.get("author") or book_before.get("author"),
+        "source_kind": manifest.get("source_kind") or book_before.get("source_kind"),
+        "source_hash": f"sha256:{expected_hash}",
+        "work_id": work_id,
+        "edition_id": edition_id,
+        "legacy_bundle_path": retained_legacy_bundle,
+        "proposed_v2_path": str(target),
+        "migration_state": "cutover",
+        "previous_write_owner_path": retained_previous_owner,
+        "write_owner_path": str(target),
+        "copy_completed": True,
+        "verified": True,
+        "cutover_allowed": True,
+        "cutover_at": str((previous_entry or {}).get("cutover_at") or observed_at),
+        "canonical_source_sha256_at_cutover": expected_hash,
+        "legacy_read_compatible": True,
+        "legacy_deleted": False,
+        "runtime_binding": "reader_api",
+        "runtime_refresh_required": True,
+        "reconciliation_mode": "adopt_existing_v2_target",
+    }
+    if matches:
+        entries[entries.index(matches[0])] = entry
+    else:
+        entries.append(entry)
+    migration_map["entries"] = entries
+    migration_map["entry_count"] = len(entries)
+    migration_map["updated_at"] = observed_at
+    migration_map["policy"] = {
+        **(migration_map.get("policy") or {}),
+        "cutover_books": sum(1 for item in entries if item.get("migration_state") == "cutover"),
+        "existing_v2_reconciliation_uses_verified_source_hash": True,
+        "duplicate_sidecars_are_preserved": True,
+    }
+
+    rollback_root = Path(
+        os.environ.get(
+            "CLICK_LIVING_BOOK_ROLLBACK_DIR",
+            str(Path.home() / "Documents" / "ClickData" / "migrations" / "rollback"),
+        )
+    ).expanduser()
+    rollback_path = rollback_root / (
+        f"living_book_reconcile_{book_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+    book_title_before = str(book_before.get("title") or "")
+    book_author_before = str(book_before.get("author") or "") or None
+    write_living_book_json_unprotected(map_path, migration_map)
+    metadata_updated = payload.title is not None or payload.author is not None
+    metadata_audit_updates: list[str] = []
+    try:
+        if metadata_updated:
+            update_library_book_metadata(
+                book_id,
+                LibraryMetadataPatch(
+                    title=payload.title,
+                    author=payload.author,
+                    source=payload.metadata_source,
+                    evidence=payload.metadata_evidence,
+                ),
+            )
+        runtime_refresh = generate_living_book_bundle(book_id, knowledge_base_root=str(kb_root))
+        if Path(str(runtime_refresh.get("bundle_dir") or "")).resolve() != target:
+            raise RuntimeError("Reader refreshed a bundle other than the official write owner")
+        runtime_book = book_with_latest_file(book_id)
+        runtime_path = Path(str(runtime_book.get("file_path") or "")).expanduser().resolve()
+        try:
+            runtime_path.relative_to((target / "1_原书").resolve())
+        except ValueError as exc:
+            raise RuntimeError("Reader did not prefer the official write-owner source") from exc
+        refreshed_manifest = read_living_book_json(manifest_path, {})
+        if refreshed_manifest.get("work_id") != work_id or refreshed_manifest.get("edition_id") != edition_id:
+            raise RuntimeError("runtime refresh changed the official V2 identity")
+        if metadata_updated:
+            for key, value in list(refreshed_manifest.items()):
+                if not re.fullmatch(r"worker_[a-z0-9_]+_model_extraction", str(key)) or not isinstance(value, dict):
+                    continue
+                audit = value.get("metadata_audit")
+                if not isinstance(audit, dict):
+                    continue
+                value["metadata_audit"] = {
+                    **audit,
+                    "status": "resolved",
+                    "disposition": "corrected_via_click_formal_metadata_override",
+                    "resolution": {
+                        "title": payload.title or refreshed_manifest.get("title"),
+                        "author": payload.author if payload.author is not None else refreshed_manifest.get("author"),
+                        "source": payload.metadata_source,
+                        "evidence": payload.metadata_evidence,
+                        "resolved_at": now_iso(),
+                    },
+                }
+                refreshed_manifest[key] = value
+                metadata_audit_updates.append(str(key))
+            if metadata_audit_updates:
+                write_living_book_json_unprotected(manifest_path, refreshed_manifest)
+        entry.update(
+            {
+                "runtime_refresh_completed": True,
+                "runtime_refresh_at": now_iso(),
+                "runtime_manifest_schema": refreshed_manifest.get("schema"),
+                "runtime_refresh_kind": "reader_api_reconciliation",
+            }
+        )
+        migration_map["updated_at"] = now_iso()
+        write_living_book_json_unprotected(map_path, migration_map)
+    except Exception:
+        write_living_book_json_unprotected(map_path, previous_migration_map)
+        if metadata_updated:
+            update_library_book_metadata(
+                book_id,
+                LibraryMetadataPatch(
+                    title=book_title_before,
+                    author=book_author_before,
+                    source="write_owner_reconciliation_rollback",
+                    evidence=str(rollback_path),
+                ),
+            )
+        raise
+
+    rollback_payload = {
+        "schema": "jiangyu.migration.rollback.living_book_reconciliation.v1",
+        "created_at": now_iso(),
+        "map_path": str(map_path),
+        "book_id": book_id,
+        "previous_entry": previous_entry,
+        "activated_entry": entry,
+        "source_bundle_preserved": bool(previous_write_owner and previous_write_owner.is_dir()),
+        "target_bundle": str(target),
+        "canonical_source_sha256": expected_hash,
+        "rollback_action": "restore previous_entry or remove the reconciliation entry; do not delete either bundle",
+    }
+    write_living_book_json_unprotected(rollback_path, rollback_payload)
+    return {
+        "ok": True,
+        "schema": "click.living_book.write_owner_reconciliation.v1",
+        "book_id": book_id,
+        "previous_write_owner": str(previous_write_owner) if previous_write_owner else None,
+        "write_owner": str(target),
+        "runtime_file_path": str(runtime_path),
+        "rollback_path": str(rollback_path),
+        "metadata": {
+            "title": runtime_book.get("title"),
+            "author": runtime_book.get("author"),
+        },
+        "metadata_audit_updates": metadata_audit_updates,
+        "worker_extensions_preserved": any(
+            key.startswith("worker_") for key in refreshed_manifest
+        ),
+        "runtime_refresh": runtime_refresh,
+    }
+
+
+def living_book_bundle_dir(book: dict[str, Any], knowledge_base_root: Optional[str] = None) -> Path:
+    mapped_bundle = living_book_mapped_bundle_dir(book, knowledge_base_root)
+    if mapped_bundle is not None:
+        return mapped_bundle
+    pending_bundle = living_book_pending_bundle_dir(book, knowledge_base_root)
+    if pending_bundle.exists():
+        return pending_bundle
+    legacy_bundle = living_book_legacy_bundle_dir(book, knowledge_base_root)
+    if legacy_bundle.exists():
+        return legacy_bundle
+    v2_bundle = living_book_v2_bundle_dir(book, knowledge_base_root)
+    if v2_bundle.exists():
+        return v2_bundle
+    return v2_bundle
+
+
+def living_book_bundle_layout_status(kb_root: Path, bundle_dir: Path) -> str:
+    try:
+        relative = bundle_dir.relative_to(kb_root)
+    except ValueError:
+        return "external"
+    parts = relative.parts
+    if len(parts) >= 2 and parts[0] == "LivingBooks" and parts[1] == "books":
+        return "legacy_transition"
+    if parts and parts[0] == "00_待分类":
+        return "pending_classification"
+    if len(parts) >= 2 and parts[0] == "30_Resources" and parts[1] == "Books":
+        return "knowledgebase_v2"
+    return "classified_library"
+
+
+def initial_living_book_taxonomy() -> dict[str, Any]:
+    return {
+        "schema": "click.living_books.taxonomy.v1",
+        "updated_at": now_iso(),
+        "categories": DEFAULT_LIVING_BOOK_TAXONOMY,
+    }
+
+
+def living_book_default_index() -> dict[str, Any]:
+    return {
+        "schema": "click.living_books.book_category_index.v1",
+        "updated_at": now_iso(),
+        "books": [],
+    }
+
+
+def living_book_default_pending_categories() -> dict[str, Any]:
+    return {
+        "schema": "click.living_books.pending_categories.v1",
+        "updated_at": now_iso(),
+        "items": [],
+    }
+
+
+def living_book_default_jobs() -> dict[str, Any]:
+    return {
+        "schema": "click.living_books.jobs.v1",
+        "updated_at": now_iso(),
+        "jobs": [],
+    }
+
+
+def ensure_living_book_control_files(lb_root: Path) -> dict[str, Any]:
+    index_dir = living_book_index_dir(lb_root)
+    jobs_path = living_book_jobs_path(lb_root)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    jobs_path.parent.mkdir(parents=True, exist_ok=True)
+
+    taxonomy_path = index_dir / "taxonomy.json"
+    pending_path = index_dir / "pending_categories.json"
+    category_index_path = index_dir / "book_category_index.json"
+    topics_path = index_dir / "主题-书籍对应表.md"
+
+    if not taxonomy_path.exists():
+        write_living_book_json_unprotected(taxonomy_path, initial_living_book_taxonomy())
+    if not pending_path.exists():
+        write_living_book_json_unprotected(pending_path, living_book_default_pending_categories())
+    if not category_index_path.exists():
+        write_living_book_json_unprotected(category_index_path, living_book_default_index())
+    if not jobs_path.exists():
+        write_living_book_json_unprotected(jobs_path, living_book_default_jobs())
+    reconcile_legacy_living_book_jobs(lb_root)
+    if not topics_path.exists():
+        topics_path.write_text(
+            "# 主题-书籍对应表\n\n"
+            "> 由 Click Living Books index 生成。分类建议先写索引；物理迁移必须人工确认。\n\n"
+            "暂无书籍分类记录。\n",
+            encoding="utf-8",
+        )
+
+    return {
+        "taxonomy": str(taxonomy_path),
+        "pending_categories": str(pending_path),
+        "book_category_index": str(category_index_path),
+        "topics_markdown": str(topics_path),
+        "jobs": str(jobs_path),
+    }
+
+
+def category_by_id(taxonomy: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(item.get("category_id")): item for item in taxonomy.get("categories") or []}
+
+
+def active_taxonomy_categories(taxonomy: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in taxonomy.get("categories") or [] if item.get("status") == "active"]
+
+
+def category_path_objects(taxonomy: dict[str, Any], category_id: str) -> list[dict[str, str]]:
+    by_id = category_by_id(taxonomy)
+    current = by_id.get(category_id)
+    path: list[dict[str, str]] = []
+    seen: set[str] = set()
+    while current:
+        current_id = str(current.get("category_id") or "")
+        if not current_id or current_id in seen:
+            break
+        seen.add(current_id)
+        path.append(
+            {
+                "category_id": current_id,
+                "name": str(current.get("name") or current_id),
+                "directory_name": str(current.get("directory_name") or current.get("name") or current_id),
+            }
+        )
+        parent_id = current.get("parent_id")
+        current = by_id.get(str(parent_id)) if parent_id else None
+    return list(reversed(path))
+
+
+def category_names(path: list[dict[str, Any]]) -> list[str]:
+    return [str(item.get("name") or item.get("category_id") or "") for item in path if item]
+
+
+LIVING_BOOK_PROCESSING_POLICIES = {
+    "normal",
+    "reference_only",
+    "do_not_process",
+    "incomplete_reference",
+}
+
+
+def validate_living_book_taxonomy_categories(categories: list[dict[str, Any]]) -> dict[str, Any]:
+    if not categories:
+        raise HTTPException(status_code=422, detail="taxonomy categories are empty")
+    by_id: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for item in categories:
+        category_id = str(item.get("category_id") or "").strip()
+        if not category_id:
+            errors.append("category_id is required")
+            continue
+        if category_id in by_id:
+            errors.append(f"duplicate category_id: {category_id}")
+            continue
+        by_id[category_id] = item
+        if int(item.get("level") or 0) not in {1, 2}:
+            errors.append(f"invalid level for {category_id}")
+        if not str(item.get("name") or "").strip():
+            errors.append(f"name is required for {category_id}")
+        if not str(item.get("directory_name") or "").strip():
+            errors.append(f"directory_name is required for {category_id}")
+        if item.get("status") not in {"active", "inactive"}:
+            errors.append(f"invalid status for {category_id}")
+
+    for category_id, item in by_id.items():
+        level = int(item.get("level") or 0)
+        parent_id = str(item.get("parent_id") or "").strip()
+        if level == 1 and parent_id:
+            errors.append(f"level-1 category cannot have parent: {category_id}")
+        if level == 2:
+            parent = by_id.get(parent_id)
+            if parent is None:
+                errors.append(f"missing parent for {category_id}: {parent_id}")
+            elif int(parent.get("level") or 0) != 1:
+                errors.append(f"parent must be level 1 for {category_id}")
+
+    if errors:
+        raise HTTPException(status_code=422, detail={"taxonomy_errors": errors})
+    return {
+        "category_count": len(by_id),
+        "top_level_count": sum(1 for item in by_id.values() if int(item.get("level") or 0) == 1),
+        "leaf_count": sum(1 for item in by_id.values() if int(item.get("level") or 0) == 2),
+    }
+
+
+def upgrade_living_book_classification_records_v2(
+    lb_root: Path,
+    taxonomy: dict[str, Any],
+) -> dict[str, Any]:
+    """Add the V2 processing policy to confirmed legacy index records without moving bundles."""
+    index_path = living_book_index_dir(lb_root) / "book_category_index.json"
+    index_payload = read_living_book_json(index_path, living_book_default_index())
+    kb_root = lb_root.parent.resolve()
+    active_ids = {str(item.get("category_id")) for item in active_taxonomy_categories(taxonomy)}
+    migrated_book_ids: list[str] = []
+    skipped: list[dict[str, str]] = []
+    manifest_backups: list[str] = []
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+    for entry in index_payload.get("books") or []:
+        if entry.get("processing_policy") in LIVING_BOOK_PROCESSING_POLICIES:
+            continue
+        bundle_dir = Path(str(entry.get("bundle_dir") or "")).expanduser()
+        try:
+            bundle_dir.resolve().relative_to(kb_root)
+        except (OSError, ValueError):
+            skipped.append({"book_id": str(entry.get("book_id") or ""), "reason": "bundle_outside_knowledge_base"})
+            continue
+        manifest_path = bundle_dir / "book_manifest.json"
+        if not manifest_path.is_file():
+            skipped.append({"book_id": str(entry.get("book_id") or ""), "reason": "manifest_missing"})
+            continue
+        manifest = read_living_book_json(manifest_path, {})
+        classification = manifest.get("classification") or {}
+        if classification.get("status") != "confirmed":
+            skipped.append({"book_id": str(entry.get("book_id") or ""), "reason": "classification_not_confirmed"})
+            continue
+        primary_path = classification.get("primary_category_path") or []
+        primary_id = str((primary_path[-1] if primary_path else {}).get("category_id") or "")
+        if primary_id not in active_ids or primary_id == "pending.unclassified":
+            skipped.append({"book_id": str(entry.get("book_id") or ""), "reason": "invalid_primary_category"})
+            continue
+
+        backup_path = manifest_path.with_name(f"book_manifest.json.bak-taxonomy-v2-{timestamp}")
+        shutil.copy2(manifest_path, backup_path)
+        classification["processing_policy"] = "normal"
+        classification["taxonomy_version"] = 2
+        classification["v2_migrated_at"] = now_iso()
+        manifest["classification"] = classification
+        write_living_book_json_unprotected(manifest_path, manifest)
+        entry["processing_policy"] = "normal"
+        entry["updated_at"] = now_iso()
+        migrated_book_ids.append(str(entry.get("book_id") or ""))
+        manifest_backups.append(str(backup_path))
+
+    index_backup_path: Optional[Path] = None
+    if migrated_book_ids:
+        index_backup_path = index_path.with_name(f"book_category_index.json.bak-taxonomy-v2-{timestamp}")
+        shutil.copy2(index_path, index_backup_path)
+        index_payload["updated_at"] = now_iso()
+        write_living_book_json_unprotected(index_path, index_payload)
+        render_living_book_topics_markdown(lb_root, index_payload)
+    return {
+        "migrated_count": len(migrated_book_ids),
+        "migrated_book_ids": migrated_book_ids,
+        "skipped": skipped,
+        "index_backup_path": str(index_backup_path) if index_backup_path else None,
+        "manifest_backups": manifest_backups,
+    }
+
+
+def apply_default_living_book_taxonomy(payload: LivingBookTaxonomyApplyDefaultRequest) -> dict[str, Any]:
+    if payload.confirmation_text != "APPLY LIBRARY TAXONOMY V2":
+        raise HTTPException(
+            status_code=422,
+            detail="confirmation_text must be APPLY LIBRARY TAXONOMY V2",
+        )
+    lb_root = living_books_root(payload.knowledge_base_root)
+    paths = ensure_living_book_control_files(lb_root)
+    validation = validate_living_book_taxonomy_categories(DEFAULT_LIVING_BOOK_TAXONOMY)
+    taxonomy_path = living_book_index_dir(lb_root) / "taxonomy.json"
+    backup_path: Optional[Path] = None
+    if taxonomy_path.exists():
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = taxonomy_path.with_name(f"taxonomy.json.bak-{timestamp}")
+        shutil.copy2(taxonomy_path, backup_path)
+    taxonomy = {
+        "schema": "click.living_books.taxonomy.v1",
+        "version": 2,
+        "updated_at": now_iso(),
+        "evidence": payload.evidence or "User-approved library reclassification",
+        "categories": DEFAULT_LIVING_BOOK_TAXONOMY,
+    }
+    write_living_book_json_unprotected(taxonomy_path, taxonomy)
+    classification_migration = upgrade_living_book_classification_records_v2(lb_root, taxonomy)
+    return {
+        "ok": True,
+        "schema": "click.living_books.taxonomy_apply.v1",
+        "taxonomy_path": str(taxonomy_path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "validation": validation,
+        "control_files": paths,
+        "taxonomy": taxonomy,
+        "classification_migration": classification_migration,
+    }
+
+
+def infer_living_book_category(book: dict[str, Any], annotations: list[dict[str, Any]], taxonomy: dict[str, Any]) -> dict[str, Any]:
+    text_parts = [
+        str(book.get("title") or ""),
+        str(book.get("author") or ""),
+        " ".join(str(item.get("source_text") or "") for item in annotations[:20]),
+        " ".join(str(item.get("note_text") or "") for item in annotations[:20]),
+    ]
+    haystack = " ".join(text_parts).lower()
+    candidates = [
+        (
+            "faith_spiritual.training",
+            ["晨兴", "训练", "特会", "itero", "hwmr", "半年度", "长老及负责弟兄"],
+            0.9,
+        ),
+        (
+            "faith_spiritual.prayer",
+            ["prayer", "pray", "祷告", "祈祷", "交通", "亲近主"],
+            0.82,
+        ),
+        (
+            "faith_spiritual.bible_study",
+            ["bible", "gospel", "grace", "ministry", "scripture", "christ", "神", "圣经", "经文", "生命读经", "福音"],
+            0.78,
+        ),
+        (
+            "tcm_health.acupuncture_meridians",
+            ["针灸", "经络", "腧穴", "针刺"],
+            0.9,
+        ),
+        (
+            "tcm_health.herbs_formulas",
+            ["中药学", "方剂", "本草", "配伍"],
+            0.88,
+        ),
+        (
+            "tcm_health.pharmacology_research",
+            ["中药药理", "药理学", "实验研究"],
+            0.88,
+        ),
+        (
+            "tcm_health.diagnosis_clinical",
+            ["中医诊断", "诊断学", "辨证", "临床"],
+            0.86,
+        ),
+        (
+            "tcm_health.classics",
+            ["黄帝内经", "内经选读", "金匮要略", "伤寒论"],
+            0.9,
+        ),
+        (
+            "tcm_health.literature",
+            ["中医文献", "医史", "医学史"],
+            0.86,
+        ),
+        (
+            "tcm_health.fundamentals",
+            ["中医基础", "中医学基础"],
+            0.86,
+        ),
+        (
+            "business.product_user",
+            ["用户", "需求", "产品经理", "产品方法", "商业模式"],
+            0.82,
+        ),
+        (
+            "business.economics_finance",
+            ["经济学", "宏观经济", "金融", "财务", "理财"],
+            0.82,
+        ),
+        (
+            "business.review_execution",
+            ["复盘", "打法", "执行", "经验转化"],
+            0.8,
+        ),
+        (
+            "business.management",
+            ["管理", "组织", "团队", "领导力", "向上管理"],
+            0.78,
+        ),
+        (
+            "business.marketing",
+            ["营销", "增长", "广告", "销售", "品牌"],
+            0.76,
+        ),
+        (
+            "business.strategy",
+            ["strategy", "strategic", "competitive", "战略", "策略", "竞争", "决策"],
+            0.72,
+        ),
+        (
+            "projects_systems.marketplace_os",
+            ["marketplace os", "亚马逊运营", "电商经营"],
+            0.86,
+        ),
+        (
+            "projects_systems.content_creation",
+            ["配文集", "内容创作", "文案", "脚本"],
+            0.78,
+        ),
+        (
+            "literature_arts.comics_visual",
+            ["漫画", "绘本", "桂宝"],
+            0.84,
+        ),
+        (
+            "literature_arts.classical_chinese",
+            ["演示古典小说", "古典小说", "诗词"],
+            0.78,
+        ),
+        (
+            "cognition_learning.logic_reasoning",
+            ["逻辑", "论证", "推理", "批判性思维"],
+            0.84,
+        ),
+        (
+            "cognition_learning.psychology",
+            ["人格心理", "社会心理", "发展心理"],
+            0.82,
+        ),
+        (
+            "technology_ai.ai_tools",
+            ["ai", "artificial intelligence", "software", "automation", "code", "人工智能", "软件", "自动化", "编程"],
+            0.7,
+        ),
+        (
+            "cognition_learning.learning_methods",
+            ["learning", "reading", "skill", "habit", "decision", "学习", "阅读", "技能", "习惯", "判断", "认知"],
+            0.68,
+        ),
+    ]
+    active_ids = {str(item.get("category_id")) for item in active_taxonomy_categories(taxonomy)}
+    for category_id, keywords, confidence in candidates:
+        if category_id in active_ids and any(keyword in haystack for keyword in keywords):
+            return {
+                "category_id": category_id,
+                "confidence": confidence,
+                "tags": [keyword for keyword in keywords if keyword in haystack][:5],
+                "pending_category_suggestions": [],
+            }
+    return {
+        "category_id": "pending.unclassified",
+        "confidence": 0.36,
+        "tags": ["待人工细分"],
+        "pending_category_suggestions": [
+            {
+                "suggested_path": ["待人工确认"],
+                "reason": "No precise active taxonomy match was found; use general reading until reviewed.",
+            }
+        ],
+    }
+
+
+def default_living_book_classification(generated_at: str) -> dict[str, Any]:
+    return {
+        "status": "pending",
+        "primary_category_path": [],
+        "secondary_category_paths": [],
+        "tags": [],
+        "confidence": 0,
+        "pending_category_suggestions": [],
+        "generated_by": "click_living_books",
+        "generated_at": generated_at,
+        "needs_review": True,
+    }
+
+
+def update_living_book_category_index(lb_root: Path, book: dict[str, Any], bundle_dir: Path, classification: dict[str, Any]) -> dict[str, Any]:
+    index_path = living_book_index_dir(lb_root) / "book_category_index.json"
+    index_payload = read_living_book_json(index_path, living_book_default_index())
+    books = [item for item in index_payload.get("books") or [] if item.get("book_id") != book.get("id")]
+    primary_path = category_names(classification.get("primary_category_path") or [])
+    secondary_paths = [category_names(path) for path in classification.get("secondary_category_paths") or []]
+    books.append(
+        {
+            "book_id": book.get("id"),
+            "book_slug": living_book_slug(book),
+            "bundle_dir": str(bundle_dir),
+            "layout_status": living_book_bundle_layout_status(lb_root.parent, bundle_dir),
+            "title": book.get("title"),
+            "author": book.get("author"),
+            "primary_category_path": primary_path,
+            "secondary_category_paths": secondary_paths,
+            "tags": classification.get("tags") or [],
+            "status": classification.get("status") or "draft",
+            "processing_policy": classification.get("processing_policy") or "normal",
+            "updated_at": now_iso(),
+        }
+    )
+    index_payload["updated_at"] = now_iso()
+    index_payload["books"] = sorted(books, key=lambda item: str(item.get("title") or item.get("book_slug") or ""))
+    write_living_book_json_unprotected(index_path, index_payload)
+    render_living_book_topics_markdown(lb_root, index_payload)
+    return index_payload
+
+
+def update_living_book_pending_categories(lb_root: Path, book: dict[str, Any], suggestions: list[dict[str, Any]]) -> dict[str, Any]:
+    pending_path = living_book_index_dir(lb_root) / "pending_categories.json"
+    payload = read_living_book_json(pending_path, living_book_default_pending_categories())
+    existing = [
+        item
+        for item in payload.get("items") or []
+        if item.get("book_id") != book.get("id") or item.get("status") != "pending_review"
+    ]
+    for suggestion in suggestions:
+        suggested_path = suggestion.get("suggested_path") or ["待人工确认"]
+        existing.append(
+            {
+                "pending_id": stable_id("pendingcat", book.get("id"), "/".join(suggested_path)),
+                "book_id": book.get("id"),
+                "suggested_path": suggested_path,
+                "reason": suggestion.get("reason") or "No precise active taxonomy match.",
+                "status": "pending_review",
+                "created_at": now_iso(),
+            }
+        )
+    payload["updated_at"] = now_iso()
+    payload["items"] = existing
+    write_living_book_json_unprotected(pending_path, payload)
+    return payload
+
+
+def render_living_book_topics_markdown(lb_root: Path, index_payload: dict[str, Any]) -> None:
+    lines = [
+        "# 主题-书籍对应表",
+        "",
+        "> 由 Click Living Books index 生成。分类建议先写索引；物理迁移必须人工确认。",
+        "",
+    ]
+    books = index_payload.get("books") or []
+    if not books:
+        lines.append("暂无书籍分类记录。")
+    for item in books:
+        primary = " / ".join(item.get("primary_category_path") or []) or "待分类"
+        secondary = "; ".join(" / ".join(path) for path in item.get("secondary_category_paths") or []) or "无"
+        tags = "、".join(item.get("tags") or []) or "无"
+        lines.extend(
+            [
+                f"## {markdown_line(item.get('title')) or markdown_line(item.get('book_slug'))}",
+                "",
+                f"- Book ID: `{markdown_line(item.get('book_id'))}`",
+                f"- Slug: `{markdown_line(item.get('book_slug'))}`",
+                f"- Primary: {primary}",
+                f"- Secondary: {secondary}",
+                f"- Tags: {tags}",
+                f"- Status: `{markdown_line(item.get('status'))}`",
+                f"- Processing policy: `{markdown_line(item.get('processing_policy')) or 'normal'}`",
+                "",
+            ]
+        )
+    (living_book_index_dir(lb_root) / "主题-书籍对应表.md").write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def read_living_book_jobs(lb_root: Path) -> dict[str, Any]:
+    return read_living_book_json(living_book_jobs_path(lb_root), living_book_default_jobs())
+
+
+def write_living_book_jobs(lb_root: Path, payload: dict[str, Any]) -> None:
+    payload["updated_at"] = now_iso()
+    write_living_book_json_unprotected(living_book_jobs_path(lb_root), payload)
+
+
+def reconcile_legacy_living_book_jobs(lb_root: Path) -> dict[str, Any]:
+    payload = read_living_book_json(living_book_jobs_path(lb_root), living_book_default_jobs())
+    jobs = payload.get("jobs") or []
+    changed = 0
+    for job in jobs:
+        legacy_job = job.get("job_type") == "classify_and_generate_drafts" and not job.get("manual_request")
+        if not legacy_job:
+            continue
+        state = str(job.get("status") or "")
+        if state in {"waiting_delay", "queued", "pending"}:
+            job.update(
+                {
+                    "status": "not_requested",
+                    "policy_transition": "policy_changed_to_manual",
+                    "run_after": None,
+                    "updated_at": now_iso(),
+                }
+            )
+            changed += 1
+        elif state == "running":
+            job["policy_transition"] = "finish_current_run_then_manual_only"
+            job["updated_at"] = now_iso()
+            changed += 1
+    if changed:
+        payload["jobs"] = jobs
+        write_living_book_jobs(lb_root, payload)
+    return {"changed": changed, "jobs": jobs}
+
+
+def living_book_due_at(minutes: int = 5) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
+def parse_living_book_time(value: str) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def upsert_living_book_job(lb_root: Path, book: dict[str, Any], bundle_dir: Path, *, force: bool = False, requested_by: str = "click_user") -> dict[str, Any]:
+    jobs_payload = read_living_book_jobs(lb_root)
+    jobs = jobs_payload.get("jobs") or []
+    job_id = stable_id("lbjob", book.get("id"), "manual_hermes_qwen_analysis")
+    existing = next((item for item in jobs if item.get("job_id") == job_id), None)
+    if existing and existing.get("status") in {"queued", "running"}:
+        return existing
+    if existing and existing.get("status") in LIVING_BOOK_JOB_TERMINAL_STATUSES and not force:
+        return existing
+    if existing:
+        existing.update(
+            {
+                "book_slug": living_book_slug(book),
+                "job_type": "analyze_book_with_hermes_qwen",
+                "run_after": None,
+                "status": "queued",
+                "manual_request": True,
+                "requested_by": requested_by,
+                "last_error": None,
+                "updated_at": now_iso(),
+            }
+        )
+        job = existing
+    else:
+        job = {
+            "job_id": job_id,
+            "book_id": book.get("id"),
+            "book_slug": living_book_slug(book),
+            "job_type": "analyze_book_with_hermes_qwen",
+            "run_after": None,
+            "status": "queued",
+            "manual_request": True,
+            "requested_by": requested_by,
+            "attempt_count": 0,
+            "last_error": None,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+        jobs.append(job)
+    jobs_payload["jobs"] = jobs
+    write_living_book_jobs(lb_root, jobs_payload)
+    return job
+
+
+def update_living_book_job(lb_root: Path, job_id: str, **updates: Any) -> dict[str, Any]:
+    jobs_payload = read_living_book_jobs(lb_root)
+    jobs = jobs_payload.get("jobs") or []
+    target: dict[str, Any] = {}
+    for job in jobs:
+        if job.get("job_id") == job_id:
+            job.update(updates)
+            job["updated_at"] = now_iso()
+            target = job
+            break
+    jobs_payload["jobs"] = jobs
+    write_living_book_jobs(lb_root, jobs_payload)
+    return target
+
+
+def write_living_book_status(
+    bundle_dir: Path,
+    book: dict[str, Any],
+    *,
+    classification_status: str,
+    hermes_draft_status: str,
+    last_job_id: Optional[str] = None,
+    last_error: Optional[str] = None,
+) -> dict[str, Any]:
+    payload = {
+        "schema": "click.living_book.status.v1",
+        "book_id": book.get("id"),
+        "book_slug": living_book_slug(book),
+        "bundle_dir": str(bundle_dir),
+        "bundle_status": "generated" if bundle_dir.exists() else "missing",
+        "classification_status": classification_status,
+        "hermes_draft_status": hermes_draft_status,
+        "last_job_id": last_job_id,
+        "last_error": last_error,
+        "updated_at": now_iso(),
+    }
+    write_living_book_json_unprotected(living_book_status_path(bundle_dir), payload)
+    return payload
+
+
+def living_book_status_payload(book: dict[str, Any], bundle_dir: Path, lb_root: Path) -> dict[str, Any]:
+    ensure_living_book_control_files(lb_root)
+    manifest = read_living_book_json(bundle_dir / "book_manifest.json", {})
+    status = read_living_book_json(living_book_status_path(bundle_dir), {})
+    analysis = read_living_book_json(
+        living_book_analysis_path(bundle_dir),
+        default_living_book_analysis(str(book.get("id") or ""), bundle_dir),
+    )
+    jobs = read_living_book_jobs(lb_root).get("jobs") or []
+    book_jobs = [item for item in jobs if item.get("book_id") == book.get("id")]
+    kb_root = lb_root.parent
+    thinking_protocol_path = bundle_dir / "5_书籍思想模型" / "思维协议.md"
+    reading_strategy_path = bundle_dir / "5_书籍思想模型" / "阅读策略.md"
+    dialogue_rules_path = bundle_dir / "6_Hermes调用" / "思想对话规则.md"
+    reading_coach_mode_path = bundle_dir / "6_Hermes调用" / "阅读导师模式.md"
+    return {
+        "ok": True,
+        "schema": "click.living_book.status_response.v1",
+        "book_id": book.get("id"),
+        "book_slug": living_book_slug(book),
+        "bundle_dir": str(bundle_dir),
+        "layout_status": living_book_bundle_layout_status(kb_root, bundle_dir),
+        "bundle_exists": bundle_dir.exists(),
+        "manifest_exists": (bundle_dir / "book_manifest.json").exists(),
+        "classification": manifest.get("classification"),
+        "thinking_protocol_exists": thinking_protocol_path.exists(),
+        "reading_strategy_exists": reading_strategy_path.exists(),
+        "dialogue_rules_exists": dialogue_rules_path.exists(),
+        "reading_coach_mode_exists": reading_coach_mode_path.exists(),
+        "thinking_protocol_path": str(thinking_protocol_path),
+        "reading_strategy_path": str(reading_strategy_path),
+        "dialogue_rules_path": str(dialogue_rules_path),
+        "reading_coach_mode_path": str(reading_coach_mode_path),
+        "status": status or None,
+        "analysis": analysis,
+        "jobs": book_jobs,
+        "index_paths": ensure_living_book_control_files(lb_root),
+    }
+
+
+def run_living_book_classification(book_id: str, *, knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    lb_root = living_books_root(knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+    manifest_path = bundle_dir / "book_manifest.json"
+    manifest = read_living_book_json(manifest_path, {})
+    taxonomy = read_living_book_json(living_book_index_dir(lb_root) / "taxonomy.json", initial_living_book_taxonomy())
+    annotations = living_book_annotations(book_id)
+    inferred = infer_living_book_category(book, annotations, taxonomy)
+    primary_path = category_path_objects(taxonomy, inferred["category_id"])
+    secondary_paths: list[list[dict[str, str]]] = []
+    classification = {
+        "status": "draft",
+        "primary_category_path": primary_path,
+        "secondary_category_paths": secondary_paths,
+        "tags": inferred.get("tags") or [],
+        "confidence": inferred.get("confidence", 0),
+        "pending_category_suggestions": inferred.get("pending_category_suggestions") or [],
+        "generated_by": "click_living_books_classifier",
+        "generated_at": now_iso(),
+        "needs_review": True,
+    }
+    manifest["classification"] = classification
+    write_living_book_json_unprotected(manifest_path, manifest)
+    update_living_book_category_index(lb_root, book, bundle_dir, classification)
+    update_living_book_pending_categories(lb_root, book, classification["pending_category_suggestions"])
+    status = write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status="draft",
+        hermes_draft_status=str(living_book_analysis_state_for_book(book_id, knowledge_base_root=knowledge_base_root, create=True).get("state") or "not_requested"),
+        last_job_id=None,
+    )
+    return {
+        "ok": True,
+        "schema": "click.living_book.classification_result.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir),
+        "classification": classification,
+        "status": status,
+    }
+
+
+def confirm_living_book_classification(
+    book_id: str,
+    payload: LivingBookClassificationConfirmRequest,
+) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    lb_root = living_books_root(payload.knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    bundle_dir = living_book_bundle_dir(book, payload.knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=payload.knowledge_base_root)
+    manifest_path = bundle_dir / "book_manifest.json"
+    manifest = read_living_book_json(manifest_path, {})
+    if not manifest:
+        raise HTTPException(status_code=409, detail="Living Book manifest is missing")
+
+    taxonomy_path = living_book_index_dir(lb_root) / "taxonomy.json"
+    taxonomy = read_living_book_json(taxonomy_path, initial_living_book_taxonomy())
+    validate_living_book_taxonomy_categories(list(taxonomy.get("categories") or []))
+    by_id = category_by_id(taxonomy)
+
+    def active_leaf(category_id: str) -> dict[str, Any]:
+        category = by_id.get(category_id)
+        if category is None:
+            raise HTTPException(status_code=422, detail=f"unknown category_id: {category_id}")
+        if category.get("status") != "active":
+            raise HTTPException(status_code=422, detail=f"inactive category_id: {category_id}")
+        if int(category.get("level") or 0) != 2:
+            raise HTTPException(status_code=422, detail=f"category must be a level-2 leaf: {category_id}")
+        return category
+
+    primary_category_id = str(payload.primary_category_id or "").strip()
+    active_leaf(primary_category_id)
+    if primary_category_id == "pending.unclassified":
+        raise HTTPException(status_code=422, detail="a confirmed classification cannot remain pending")
+
+    secondary_category_ids: list[str] = []
+    for raw_category_id in payload.secondary_category_ids:
+        category_id = str(raw_category_id or "").strip()
+        if not category_id or category_id == primary_category_id or category_id in secondary_category_ids:
+            continue
+        active_leaf(category_id)
+        if category_id == "pending.unclassified":
+            raise HTTPException(status_code=422, detail="pending cannot be a secondary confirmed category")
+        secondary_category_ids.append(category_id)
+    if len(secondary_category_ids) > 3:
+        raise HTTPException(status_code=422, detail="at most 3 secondary categories are allowed")
+
+    processing_policy = str(payload.processing_policy or "normal").strip()
+    if processing_policy not in LIVING_BOOK_PROCESSING_POLICIES:
+        raise HTTPException(
+            status_code=422,
+            detail={"invalid_processing_policy": processing_policy, "allowed": sorted(LIVING_BOOK_PROCESSING_POLICIES)},
+        )
+
+    tags: list[str] = []
+    seen_tags: set[str] = set()
+    for raw_tag in payload.tags:
+        tag = re.sub(r"\s+", " ", str(raw_tag or "")).strip()[:32]
+        if tag and tag not in seen_tags:
+            tags.append(tag)
+            seen_tags.add(tag)
+    tags = tags[:12]
+    generated_at = now_iso()
+    classification = {
+        "status": "confirmed",
+        "primary_category_path": category_path_objects(taxonomy, primary_category_id),
+        "secondary_category_paths": [
+            category_path_objects(taxonomy, category_id) for category_id in secondary_category_ids
+        ],
+        "tags": tags,
+        "confidence": 1,
+        "pending_category_suggestions": [],
+        "processing_policy": processing_policy,
+        "generated_by": "user_confirmed_taxonomy_v2",
+        "generated_at": generated_at,
+        "confirmed_at": generated_at,
+        "evidence": payload.evidence or "User-confirmed library reclassification",
+        "needs_review": False,
+    }
+    manifest["classification"] = classification
+    write_living_book_json_unprotected(manifest_path, manifest)
+    update_living_book_category_index(lb_root, book, bundle_dir, classification)
+    update_living_book_pending_categories(lb_root, book, [])
+    analysis_state = living_book_analysis_state_for_book(
+        book_id,
+        knowledge_base_root=payload.knowledge_base_root,
+        create=True,
+    )
+    status = write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status="confirmed",
+        hermes_draft_status=str(analysis_state.get("state") or "not_requested"),
+        last_job_id=None,
+    )
+    organization = update_library_book_organization(
+        book_id,
+        LibraryOrganizationPatch(
+            custom_category=" / ".join(category_names(classification["primary_category_path"])),
+            tags=tags,
+        ),
+        source="user_confirmed_taxonomy_v2",
+    )
+    return {
+        "ok": True,
+        "schema": "click.living_book.classification_confirmed.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir),
+        "manifest_path": str(manifest_path),
+        "classification": classification,
+        "status": status,
+        "organization": organization.get("organization"),
+    }
+
+
+def living_book_draft_header(title: str, generated_at: str) -> list[str]:
+    return [
+        f"# {title}",
+        "",
+        "status: draft",
+        "generated_by: click_living_books_static_template",
+        "needs_review: true",
+        "source_coverage: partial",
+        f"generated_at: {generated_at}",
+        "",
+        "> P1.1 自动草稿。它只整理 Click manifest、分类和已导出批注，不等于最终书籍思想模型。",
+        "",
+    ]
+
+
+def render_living_book_summary_draft(book: dict[str, Any], manifest: dict[str, Any], annotations: list[dict[str, Any]], generated_at: str) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    classification = manifest.get("classification") or {}
+    primary = " / ".join(category_names(classification.get("primary_category_path") or [])) or "待分类"
+    lines = living_book_draft_header("全书摘要", generated_at)
+    lines.extend(
+        [
+            f"- 书名：{title}",
+            f"- 作者：{markdown_line(book.get('author')) or '未知作者'}",
+            f"- 当前主分类：{primary}",
+            f"- 批注数量：{len(annotations)}",
+            "",
+            "## 草稿摘要",
+            "",
+            "这份摘要目前只基于书籍 manifest、分类结果和已导出的批注生成。Hermes 或用户后续需要结合原书与融合阅读继续补全。",
+            "",
+        ]
+    )
+    if annotations:
+        lines.extend(["## 已有批注线索", ""])
+        for item in annotations[:12]:
+            source = markdown_line(item.get("source_text"))
+            note = markdown_line(item.get("note_text"))
+            lines.append(f"- {source[:160] if source else '无原文摘录'}")
+            if note:
+                lines.append(f"  - 我的备注：{note[:160]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_living_book_concepts_draft(annotations: list[dict[str, Any]], generated_at: str) -> str:
+    lines = living_book_draft_header("核心概念", generated_at)
+    lines.extend(["## 候选概念", ""])
+    if not annotations:
+        lines.extend(["暂无批注线索。后续应由 Hermes 读取原书或融合阅读后补充。", ""])
+        return "\n".join(lines)
+    words: dict[str, int] = {}
+    for item in annotations:
+        text = f"{item.get('source_text') or ''} {item.get('note_text') or ''}".lower()
+        for token in re.findall(r"[\w\u4e00-\u9fff]{2,}", text):
+            if len(token) > 24:
+                continue
+            words[token] = words.get(token, 0) + 1
+    for token, count in sorted(words.items(), key=lambda pair: (-pair[1], pair[0]))[:20]:
+        lines.append(f"- {token}（出现 {count} 次）")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_living_book_notes_overview_draft(annotations: list[dict[str, Any]], generated_at: str) -> str:
+    lines = living_book_draft_header("我的备注总览", generated_at)
+    if not annotations:
+        lines.extend(["暂无批注。", ""])
+        return "\n".join(lines)
+    by_kind: dict[str, int] = {}
+    for item in annotations:
+        kind = str(item.get("kind") or "unknown")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+    lines.extend(["## 统计", ""])
+    for kind, count in sorted(by_kind.items()):
+        lines.append(f"- {kind}: {count}")
+    lines.extend(["", "## 备注摘录", ""])
+    for item in annotations[:30]:
+        note = markdown_line(item.get("note_text"))
+        source = markdown_line(item.get("source_text"))
+        if note:
+            lines.append(f"- {note[:180]}")
+        elif source:
+            lines.append(f"- 标红：{source[:180]}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_living_book_outline_draft(book: dict[str, Any], manifest: dict[str, Any], generated_at: str) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    lines = living_book_draft_header("目录", generated_at)
+    lines.extend(
+        [
+            f"- 书名：{title}",
+            f"- 原书：`{markdown_line(manifest.get('canonical_source_file'))}`",
+            "",
+            "P1.1 暂不强行抽取全书目录。后续 Hermes 可通过 `book_manifest.json` 和原书文件补全正式目录草稿。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_living_book_thought_draft(title: str, body: str, generated_at: str) -> str:
+    lines = living_book_draft_header(title, generated_at)
+    lines.extend([body, ""])
+    return "\n".join(lines)
+
+
+def living_book_top_chapter_lines(annotations: list[dict[str, Any]], limit: int = 5) -> list[str]:
+    counts: dict[str, int] = {}
+    for item in annotations:
+        chapter = markdown_line(item.get("chapter_title") or item.get("chapter_locator") or "未分类")
+        counts[chapter] = counts.get(chapter, 0) + 1
+    return [f"- {chapter}: {count} 条" for chapter, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]]
+
+
+def living_book_keyword_line(annotations: list[dict[str, Any]], limit: int = 12) -> str:
+    counts: dict[str, int] = {}
+    for item in annotations:
+        text = f"{item.get('source_text') or ''} {item.get('note_text') or ''}"
+        for token in re.findall(r"[\w\u4e00-\u9fff]{2,}", text):
+            token = token.strip()
+            if len(token) > 18:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+    keywords = [token for token, _ in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit]]
+    return "、".join(keywords) if keywords else "暂无足够批注关键词"
+
+
+def living_book_protocol_evidence_lines(bundle_dir: Path, annotations: list[dict[str, Any]], limit: int = 8) -> list[str]:
+    lines: list[str] = []
+    annotations_path = bundle_dir / "2_批注数据" / "批注.json"
+    for item in annotations[:limit]:
+        source = markdown_line(item.get("source_text"))
+        note = markdown_line(item.get("note_text"))
+        chapter = markdown_line(item.get("chapter_title") or item.get("chapter_locator"))
+        if note:
+            lines.append(f"- 用户批注：{note[:180]}（章节：{chapter or '未知'}，source_path: `{annotations_path}`）")
+        elif source:
+            lines.append(f"- 书中摘录：{source[:180]}（章节：{chapter or '未知'}，source_path: `{annotations_path}`）")
+    fused_dir = bundle_dir / "3_融合阅读"
+    if fused_dir.exists():
+        for path in sorted(fused_dir.glob("*.md"))[:3]:
+            lines.append(f"- 融合阅读文件：`{path}`")
+    if not lines:
+        lines.append(f"- 当前没有可用批注；只能引用 manifest 和原书路径（source_path: `{bundle_dir / 'book_manifest.json'}`）。")
+    return lines
+
+
+def living_book_protocol_draft_header(title: str, generated_at: str, phase: str = "P1.3") -> list[str]:
+    return [
+        f"# {title}",
+        "",
+        "status: draft",
+        "generated_by: click_living_books",
+        "needs_review: true",
+        "source_coverage: partial",
+        f"generated_at: {generated_at}",
+        "",
+        f"> {phase} 自动草稿。它只基于 Click manifest、批注和融合阅读元数据生成；用户审阅前不等于最终书籍思想模型。",
+        "",
+    ]
+
+
+def render_living_book_thinking_protocol_draft(
+    book: dict[str, Any],
+    manifest: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    bundle_dir: Path,
+    generated_at: str,
+) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    classification = manifest.get("classification") if isinstance(manifest.get("classification"), dict) else {}
+    primary = " / ".join(category_names(classification.get("primary_category_path") or [])) or "待分类"
+    chapter_lines = living_book_top_chapter_lines(annotations)
+    evidence_lines = living_book_protocol_evidence_lines(bundle_dir, annotations)
+    keyword_line = living_book_keyword_line(annotations)
+    lines = living_book_protocol_draft_header("思维协议", generated_at)
+    lines.extend(
+        [
+            "## 协议用途",
+            "",
+            f"- 让 Hermes 按《{title}》这一册书的资料，评价一个具体想法、项目或行动方案。",
+            "- 回答时必须分清：书中明确说过、按本书逻辑推演、Hermes 综合判断。",
+            f"- 当前分类：{primary}；批注数量：{len(annotations)}。",
+            "",
+            "## 本书关注的核心问题",
+            "",
+            f"- 从已导出批注看，当前关键词线索：{keyword_line}。",
+        ]
+    )
+    if chapter_lines:
+        lines.extend(["- 批注集中章节：", *chapter_lines])
+    else:
+        lines.append("- 暂无批注集中章节，需先补充阅读证据。")
+    lines.extend(
+        [
+            "",
+            "## 本书判断问题的顺序",
+            "",
+            "- 先读取 `6_Hermes调用/思想对话规则.md` 和 `6_Hermes调用/书籍调用卡.md`。",
+            "- 再读取 `5_书籍思想模型/思维协议.md` 与已生成的思想模型草稿。",
+            "- 然后查 `2_批注数据/批注.json`、`2_批注数据/批注.md` 和 `3_融合阅读/`。",
+            "- 最后把用户问题放进本书逻辑里，输出四段式判断。",
+            "",
+            "## 本书认为重要的证据",
+            "",
+            "- 书中原文摘录优先于模型推断。",
+            "- 用户批注用于判断用户当时关注点，不能伪装成原书观点。",
+            "- 融合阅读用于恢复上下文，不能替代原书证据。",
+            "- manifest、调用卡和状态文件只证明资料来源与生成状态。",
+            "",
+            "## 本书的推演规则",
+            "",
+            "- `书中明确说过` 只放已有原文、批注导出或融合阅读可支持的内容。",
+            "- `按本书逻辑推演` 可以从证据继续推，但必须写明这是推演。",
+            "- `Hermes 综合判断` 可以结合用户当前目标和其他常识，但不得说成原书原意。",
+            "- 若证据不足，要明确说缺哪类材料，并给下一步验证办法。",
+            "",
+            "## 本书不适合判断的问题",
+            "",
+            "- 不适合单独承担多书比较、跨学科最终结论或用户长期人生决策。",
+            "- 不适合替代用户审阅；draft 文件只提供可执行草稿。",
+            "- 不适合把本书逻辑强行套到完全无关的技术、法律、财务或医疗结论上。",
+            "",
+            "## 可引用证据",
+            "",
+            *evidence_lines,
+            "",
+            "## 使用边界",
+            "",
+            "- 必须在回答中保留证据路径或片段。",
+            "- 必须明确区分书中明说、按书推演、Hermes 综合判断。",
+            "- 不能把 reviewed 之前的草稿当成最终真理。",
+            "- 如果用户问的是“这本书怎么看/评价/反驳”，优先按本协议组织回答。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_living_book_dialogue_rules_draft(
+    book: dict[str, Any],
+    manifest: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    bundle_dir: Path,
+    generated_at: str,
+) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    lines = living_book_protocol_draft_header("思想对话规则", generated_at)
+    lines.extend(
+        [
+            "## 触发条件",
+            "",
+            f"- 用户说“按《{title}》/按这本书/这本书怎么看/这本书评价/这本书反驳”时触发。",
+            "- 用户讨论自己的读书想法、项目想法或行动方案，并要求用这本书判断时触发。",
+            "- 用户只要普通摘要、列书或查批注时，不强制进入四段式思想对话。",
+            "",
+            "## 读取顺序",
+            "",
+            "1. `6_Hermes调用/思想对话规则.md`",
+            "2. `5_书籍思想模型/思维协议.md`",
+            "3. `6_Hermes调用/书籍调用卡.md`",
+            "4. `5_书籍思想模型/这本书怎么思考.md`、`这本书的核心主张.md`、`这本书的判断标准.md`、`这本书的盲区.md`",
+            "5. `2_批注数据/批注.json`、`2_批注数据/批注.md`、`3_融合阅读/`",
+            "",
+            "## 回答格式",
+            "",
+            "## 书中明确说过",
+            "",
+            "只写有路径或片段支持的原书/批注/融合阅读证据。",
+            "",
+            "## 按本书逻辑推演",
+            "",
+            "基于上一段证据继续推理，明确标注这是推演。",
+            "",
+            "## Hermes 综合判断",
+            "",
+            "结合用户问题给直接判断，不把综合判断伪装成原书观点。",
+            "",
+            "## 下一步怎么验证",
+            "",
+            "给出用户下一步应回到哪段原文、哪条批注或哪个行动实验。",
+            "",
+            "## 禁止事项",
+            "",
+            "- 禁止整段搬运知识库结果代替回答。",
+            "- 禁止把用户批注说成作者观点。",
+            "- 禁止把模型推断写成“书中明确说”。",
+            "- 禁止在没有证据路径时假装读过某段内容。",
+            "",
+            "## 证据要求",
+            "",
+            f"- 当前批注数量：{len(annotations)}。",
+            f"- 必须优先返回 `source_path`，例如 `{bundle_dir / '2_批注数据' / '批注.json'}`。",
+            "- 若引用融合阅读，必须给出具体 `.md` 路径。",
+            "- 若证据不足，直接说明缺口，不编造。",
+            "",
+            "## 示例问题",
+            "",
+            f"- 按《{title}》的方式看我的想法。",
+            "- 让这本书评价我的项目。",
+            "- 这本书会怎么反驳我？",
+            "- 我这样读书，和这本书的逻辑差距在哪里？",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def living_book_analysis_excerpt(book: dict[str, Any], *, max_chars: int = 36000, chapter_limit: int = 10) -> dict[str, Any]:
+    epub_path = epub_path_for_book(book)
+    publication = epub_publication(epub_path, book=book)
+    chapters = publication.get("chapters") or []
+    if not chapters:
+        return {"toc": publication.get("toc") or [], "chapters": [], "source_coverage": "none"}
+    if len(chapters) <= chapter_limit:
+        selected_indexes = list(range(len(chapters)))
+    else:
+        selected_indexes = sorted({round(index * (len(chapters) - 1) / (chapter_limit - 1)) for index in range(chapter_limit)})
+    selected: list[dict[str, Any]] = []
+    remaining = max_chars
+    with zipfile.ZipFile(epub_path) as epub:
+        for index in selected_indexes:
+            chapter = chapters[index]
+            try:
+                markup = zip_text(epub, str(chapter.get("href") or ""))
+            except KeyError:
+                continue
+            plain = lite_extract_text(markup)
+            if not plain:
+                continue
+            allowance = max(1200, remaining // max(1, len(selected_indexes) - len(selected)))
+            excerpt = plain[:allowance]
+            remaining -= len(excerpt)
+            selected.append(
+                {
+                    "chapter_index": index,
+                    "title": chapter.get("title") or f"Chapter {index + 1}",
+                    "href": chapter.get("href") or "",
+                    "excerpt": excerpt,
+                }
+            )
+            if remaining <= 0:
+                break
+    return {
+        "toc": (publication.get("toc") or [])[:500],
+        "chapters": selected,
+        "source_coverage": "sampled_across_reading_order",
+        "chapter_count": len(chapters),
+        "sampled_chapter_count": len(selected),
+    }
+
+
+def call_living_book_qwen(book: dict[str, Any], context: dict[str, Any], annotations: list[dict[str, Any]]) -> dict[str, Any]:
+    invocation_id = new_id("hermesqwen")
+    chapter_blocks = []
+    for item in context.get("chapters") or []:
+        chapter_blocks.append(
+            f"### {item.get('title')}\n来源：{item.get('href')}\n{item.get('excerpt')}"
+        )
+    annotation_blocks = []
+    for item in annotations[:80]:
+        source = str(item.get("source_text") or "").strip()
+        note = str(item.get("note_text") or "").strip()
+        if source or note:
+            annotation_blocks.append(f"- 原文：{source[:500]}\n  用户备注：{note[:500]}")
+    prompt = f"""
+你是 Hermes 中负责 Living Book 的本地 Qwen 分析器。只能根据下面提供的书籍材料和用户批注工作，禁止补写没有证据的书中内容。
+
+书名：{book.get('title') or ''}
+作者：{book.get('author') or ''}
+章节总数：{context.get('chapter_count') or 0}
+抽样方式：{context.get('source_coverage') or 'none'}
+
+目录：
+{json.dumps(context.get('toc') or [], ensure_ascii=False)}
+
+章节材料：
+{chr(10).join(chapter_blocks)}
+
+用户批注：
+{chr(10).join(annotation_blocks) if annotation_blocks else '暂无用户批注'}
+
+请只输出一个 JSON 对象，不要 Markdown。字段必须为：
+- category_path: 1 到 3 个中文层级字符串数组
+- tags: 3 到 8 个短标签数组
+- summary: 基于材料的全书摘要；材料不足要明确说抽样范围
+- outline: 字符串数组
+- core_concepts: 字符串数组
+- core_claims: 字符串数组
+- thinking_rules: 字符串数组
+- judgement_standards: 字符串数组
+- blind_spots: 字符串数组
+- reading_strategy: 字符串数组
+- dialogue_rules: 字符串数组
+- evidence: 对象数组，每项含 claim、source_href、source_quote
+- confidence: 0 到 1
+- source_coverage_note: 字符串
+""".strip()
+    payload = {
+        "model": LIVING_BOOK_QWEN_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是严谨的本地书籍分析器。只使用给定证据，严格输出 JSON，不创建 Hermes memory 或 session 资产。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.15,
+        "max_tokens": 3200,
+        "stream": False,
+    }
+    request = URLRequest(
+        f"{HERMES_MODEL_GATEWAY_BASE_URL}/v1/chat/completions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Hermes-Project": "click-living-books",
+            "X-Hermes-Source": "click-manual-book-analysis",
+            "X-Hermes-Invocation": invocation_id,
+        },
+    )
+    with urlopen(request, timeout=360) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+    choices = raw.get("choices") if isinstance(raw, dict) else None
+    content = str((((choices or [{}])[0].get("message") or {}).get("content") or ""))
+    parsed = extract_json_object(content)
+    if not isinstance(parsed, dict) or not str(parsed.get("summary") or "").strip():
+        raise RuntimeError("Hermes Qwen did not return a valid Living Book JSON result")
+    model = str(raw.get("model") or LIVING_BOOK_QWEN_MODEL)
+    return {
+        "schema": "click.living_book.hermes_qwen_receipt.v1",
+        "generated_by": "hermes_qwen_model_gateway",
+        "runtime": "hermes_model_gateway",
+        "model": model,
+        "invocation_id": invocation_id,
+        "gateway_response_id": raw.get("id"),
+        "usage": raw.get("usage") or {},
+        "result": parsed,
+    }
+
+
+def _analysis_strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def render_qwen_analysis_markdown(title: str, value: Any, receipt: dict[str, Any], *, source_coverage: str) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        "status: draft",
+        "generated_by: hermes_qwen_model_gateway",
+        f"runtime: {receipt.get('runtime')}",
+        f"model: {receipt.get('model')}",
+        f"invocation_id: {receipt.get('invocation_id')}",
+        "needs_review: true",
+        f"source_coverage: {source_coverage}",
+        "",
+    ]
+    if isinstance(value, str):
+        lines.extend([value.strip() or "暂无可验证内容。", ""])
+    elif isinstance(value, list):
+        rows = _analysis_strings(value)
+        lines.extend([*(f"- {row}" for row in rows), ""] if rows else ["暂无可验证内容。", ""])
+    else:
+        lines.extend([json.dumps(value, ensure_ascii=False, indent=2), ""])
+    return "\n".join(lines)
+
+
+def run_living_book_qwen_analysis(book_id: str, *, knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+    lb_root = living_books_root(knowledge_base_root)
+    analysis = living_book_analysis_state_for_book(book_id, knowledge_base_root=knowledge_base_root, create=True)
+    job_id = str(analysis.get("job_id") or "")
+    analysis.update({"state": "running", "started_at": now_iso(), "last_error": None})
+    write_living_book_analysis(bundle_dir, analysis)
+    if job_id:
+        update_living_book_job(lb_root, job_id, status="running", last_error=None)
+    context = living_book_analysis_excerpt(book)
+    annotations = living_book_annotations(book_id)
+    receipt = call_living_book_qwen(book, context, annotations)
+    result = receipt["result"]
+    source_coverage = str(result.get("source_coverage_note") or context.get("source_coverage") or "sampled")
+    outputs = {
+        "outline": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "目录.md",
+            render_qwen_analysis_markdown("目录", result.get("outline"), receipt, source_coverage=source_coverage),
+        ),
+        "summary": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "全书摘要.md",
+            render_qwen_analysis_markdown("全书摘要", result.get("summary"), receipt, source_coverage=source_coverage),
+        ),
+        "concepts": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "核心概念.md",
+            render_qwen_analysis_markdown("核心概念", result.get("core_concepts"), receipt, source_coverage=source_coverage),
+        ),
+        "core_claims": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的核心主张.md",
+            render_qwen_analysis_markdown("这本书的核心主张", result.get("core_claims"), receipt, source_coverage=source_coverage),
+        ),
+        "thinking_rules": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "思维协议.md",
+            render_qwen_analysis_markdown("思维协议", result.get("thinking_rules"), receipt, source_coverage=source_coverage),
+        ),
+        "judgement": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的判断标准.md",
+            render_qwen_analysis_markdown("这本书的判断标准", result.get("judgement_standards"), receipt, source_coverage=source_coverage),
+        ),
+        "blind_spots": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的盲区.md",
+            render_qwen_analysis_markdown("这本书的盲区", result.get("blind_spots"), receipt, source_coverage=source_coverage),
+        ),
+        "reading_strategy": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "阅读策略.md",
+            render_qwen_analysis_markdown("阅读策略", result.get("reading_strategy"), receipt, source_coverage=source_coverage),
+        ),
+        "dialogue_rules": write_living_book_draft(
+            bundle_dir / "6_Hermes调用" / "思想对话规则.md",
+            render_qwen_analysis_markdown("思想对话规则", result.get("dialogue_rules"), receipt, source_coverage=source_coverage),
+        ),
+        "evidence": write_living_book_json_unprotected(
+            bundle_dir / "4_书籍整理" / "分析证据.json",
+            {
+                "schema": "click.living_book.analysis_evidence.v1",
+                "invocation_id": receipt["invocation_id"],
+                "items": result.get("evidence") if isinstance(result.get("evidence"), list) else [],
+            },
+        ),
+        "receipt": write_living_book_json_unprotected(
+            bundle_dir / "_status" / "hermes_qwen_analysis.json",
+            receipt,
+        ),
+    }
+    manifest_path = bundle_dir / "book_manifest.json"
+    manifest = read_living_book_json(manifest_path, {})
+    category_path = _analysis_strings(result.get("category_path"))[:3]
+    manifest["classification"] = {
+        "status": "draft",
+        "primary_category_path": [
+            {"category_id": f"hermes.{index + 1}", "name": name, "directory_name": name}
+            for index, name in enumerate(category_path)
+        ],
+        "secondary_category_paths": [],
+        "tags": _analysis_strings(result.get("tags"))[:8],
+        "confidence": float(result.get("confidence") or 0),
+        "generated_by": "hermes_qwen_model_gateway",
+        "invocation_id": receipt["invocation_id"],
+        "generated_at": now_iso(),
+        "needs_review": True,
+    }
+    write_living_book_json_unprotected(manifest_path, manifest)
+    update_living_book_category_index(lb_root, book, bundle_dir, manifest["classification"])
+    analysis.update(
+        {
+            "state": "needs_review",
+            "finished_at": now_iso(),
+            "runtime": receipt["runtime"],
+            "model": receipt["model"],
+            "invocation_id": receipt["invocation_id"],
+            "last_error": None,
+            "outputs": outputs,
+        }
+    )
+    analysis = write_living_book_analysis(bundle_dir, analysis)
+    if job_id:
+        update_living_book_job(
+            lb_root,
+            job_id,
+            status="needs_review",
+            last_error=None,
+            attempt_count=int(next((item.get("attempt_count") or 0 for item in read_living_book_jobs(lb_root).get("jobs") or [] if item.get("job_id") == job_id), 0)) + 1,
+        )
+    write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status="draft",
+        hermes_draft_status="needs_review",
+        last_job_id=job_id or None,
+    )
+    return {
+        "ok": True,
+        "schema": "click.living_book.hermes_qwen_analysis_result.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir),
+        "generated_by": receipt["generated_by"],
+        "runtime": receipt["runtime"],
+        "model": receipt["model"],
+        "invocation_id": receipt["invocation_id"],
+        "source_coverage": source_coverage,
+        "needs_review": True,
+        "outputs": outputs,
+        "analysis": analysis,
+    }
+
+
+def living_book_runtime_unavailable(exc: BaseException) -> bool:
+    if isinstance(exc, (URLError, TimeoutError, ConnectionError)):
+        return True
+    message = f"{exc.__class__.__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "connection refused",
+            "connection reset",
+            "failed to establish",
+            "timed out",
+            "timeout",
+            "network is unreachable",
+            "nodename nor servname",
+        )
+    )
+
+
+def execute_living_book_analysis_job(
+    book_id: str,
+    job_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    lb_root = living_books_root(knowledge_base_root)
+    try:
+        return run_living_book_qwen_analysis(book_id, knowledge_base_root=knowledge_base_root)
+    except Exception as exc:  # noqa: BLE001 - the persistent job owns retry/error state.
+        waiting = living_book_runtime_unavailable(exc)
+        state = "queued" if waiting else "failed"
+        analysis = living_book_analysis_state_for_book(
+            book_id,
+            knowledge_base_root=knowledge_base_root,
+            create=True,
+        )
+        analysis.update(
+            {
+                "state": state,
+                "job_id": job_id,
+                "last_error": f"{exc.__class__.__name__}: {exc}",
+                "waiting_reason": "waiting_for_local_hermes" if waiting else None,
+                "finished_at": None if waiting else now_iso(),
+            }
+        )
+        analysis = write_living_book_analysis(bundle_dir, analysis)
+        update_living_book_job(
+            lb_root,
+            job_id,
+            status=state,
+            last_error=analysis["last_error"],
+            attempt_count=int(
+                next(
+                    (
+                        item.get("attempt_count") or 0
+                        for item in read_living_book_jobs(lb_root).get("jobs") or []
+                        if item.get("job_id") == job_id
+                    ),
+                    0,
+                )
+            )
+            + 1,
+        )
+        write_living_book_status(
+            bundle_dir,
+            book,
+            classification_status="pending",
+            hermes_draft_status=state,
+            last_job_id=job_id,
+            last_error=analysis["last_error"],
+        )
+        return {
+            "ok": False,
+            "book_id": book_id,
+            "job_id": job_id,
+            "status": state,
+            "retryable": waiting,
+            "analysis": analysis,
+        }
+
+
+def start_living_book_analysis_job(
+    book_id: str,
+    job_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+) -> bool:
+    with LIVING_BOOK_ANALYSIS_THREAD_LOCK:
+        if job_id in LIVING_BOOK_ANALYSIS_THREADS:
+            return False
+        LIVING_BOOK_ANALYSIS_THREADS.add(job_id)
+
+    def runner() -> None:
+        try:
+            execute_living_book_analysis_job(
+                book_id,
+                job_id,
+                knowledge_base_root=knowledge_base_root,
+            )
+        finally:
+            with LIVING_BOOK_ANALYSIS_THREAD_LOCK:
+                LIVING_BOOK_ANALYSIS_THREADS.discard(job_id)
+
+    threading.Thread(
+        target=runner,
+        daemon=True,
+        name=f"living-book-analysis-{job_id}",
+    ).start()
+    return True
+
+
+def queue_living_book_analysis(
+    book_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+    requested_by: str = "click_user",
+    force: bool = False,
+    start_async: bool = True,
+) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+    analysis = living_book_analysis_state_for_book(
+        book_id,
+        knowledge_base_root=knowledge_base_root,
+        create=True,
+    )
+    state = str(analysis.get("state") or "not_requested")
+    if state in {"queued", "running"}:
+        return {
+            "ok": True,
+            "accepted": False,
+            "duplicate": True,
+            "book_id": book_id,
+            "job_id": analysis.get("job_id"),
+            "analysis": analysis,
+        }
+    if state in {"needs_review", "complete"} and not force:
+        raise HTTPException(status_code=409, detail="Book analysis already exists; use reanalyze with explicit confirmation")
+
+    lb_root = living_books_root(knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    job = upsert_living_book_job(
+        lb_root,
+        book,
+        bundle_dir,
+        force=force,
+        requested_by=requested_by,
+    )
+    analysis.update(
+        {
+            "state": "queued",
+            "job_id": job.get("job_id"),
+            "requested_at": now_iso(),
+            "started_at": None,
+            "finished_at": None,
+            "requested_by": requested_by,
+            "runtime": None,
+            "model": None,
+            "invocation_id": None,
+            "last_error": None,
+            "waiting_reason": None,
+        }
+    )
+    analysis = write_living_book_analysis(bundle_dir, analysis)
+    write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status="pending",
+        hermes_draft_status="queued",
+        last_job_id=str(job.get("job_id") or "") or None,
+    )
+    started = False
+    if start_async:
+        started = start_living_book_analysis_job(
+            book_id,
+            str(job.get("job_id") or ""),
+            knowledge_base_root=knowledge_base_root,
+        )
+    return {
+        "ok": True,
+        "accepted": True,
+        "duplicate": False,
+        "book_id": book_id,
+        "job_id": job.get("job_id"),
+        "worker_started": started,
+        "analysis": analysis,
+    }
+
+
+def living_book_reading_mode_recommendation(annotations: list[dict[str, Any]]) -> tuple[str, str]:
+    note_count = sum(1 for item in annotations if str(item.get("note_text") or "").strip())
+    highlight_count = len(annotations) - note_count
+    if note_count >= 8:
+        return "项目化阅读 / 模型提取", "你已经留下较多自己的备注，下一步不该停在摘要，而应把本书转成判断模型、行动规则或项目输出。"
+    if len(annotations) >= 12:
+        return "精读关键章节", "你已有足够标注线索，应先回到高密度章节做二次阅读，而不是从头平均通读。"
+    if highlight_count >= 5:
+        return "快读后补问题", "当前多为摘录线索，先补充问题和反对点，再决定是否精读。"
+    return "扫读 / 问题化阅读", "当前证据偏少，先确认这本书是否真的服务你的问题，再投入深读。"
+
+
+def render_living_book_reading_strategy_draft(
+    book: dict[str, Any],
+    manifest: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    bundle_dir: Path,
+    generated_at: str,
+) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    classification = manifest.get("classification") if isinstance(manifest.get("classification"), dict) else {}
+    primary = " / ".join(category_names(classification.get("primary_category_path") or [])) or "待分类"
+    mode, mode_reason = living_book_reading_mode_recommendation(annotations)
+    chapter_lines = living_book_top_chapter_lines(annotations, limit=6)
+    evidence_lines = living_book_protocol_evidence_lines(bundle_dir, annotations, limit=6)
+    keyword_line = living_book_keyword_line(annotations, limit=14)
+    note_count = sum(1 for item in annotations if str(item.get("note_text") or "").strip())
+    lines = living_book_protocol_draft_header("阅读策略", generated_at, phase="P1.4")
+    lines.extend(
+        [
+            "## 策略用途",
+            "",
+            f"- 帮 Hermes 判断用户应该如何读《{title}》，以及这本书该转成什么输出。",
+            "- 这个文件用于阅读策略教练，不用于替代原书、批注或最终人工审阅。",
+            f"- 当前分类：{primary}；批注数量：{len(annotations)}；备注数量：{note_count}。",
+            "",
+            "## 推荐阅读模式",
+            "",
+            f"- 建议模式：{mode}",
+            f"- 理由：{mode_reason}",
+            "",
+            "## 不建议的读法",
+            "",
+            "- 不建议平均通读后只做普通摘要。",
+            "- 不建议只收藏金句，不回答“它如何改变我的判断”。",
+            "- 不建议把用户批注等同于作者观点。",
+            "- 不建议在证据不足时强行输出成熟思想模型。",
+            "",
+            "## 用户已经有的线索",
+            "",
+            f"- 关键词线索：{keyword_line}。",
+        ]
+    )
+    if chapter_lines:
+        lines.extend(["- 批注集中章节：", *chapter_lines])
+    lines.extend(
+        [
+            "",
+            "## 知识差距清单",
+            "",
+            "- 缺少：用户当前阅读目的和要服务的项目/能力。",
+            "- 缺少：哪些观点已被用户验证，哪些只是被触动。",
+            "- 缺少：反对点、疑问点和可迁移场景。",
+            "- 缺少：读完后要沉淀成模型、项目规则、内容选题还是行动实验。",
+            "",
+            "## 章节优先级",
+            "",
+        ]
+    )
+    if chapter_lines:
+        lines.extend(chapter_lines)
+    else:
+        lines.append("- 暂无章节优先级；先从目录和少量批注建立问题清单。")
+    lines.extend(
+        [
+            "",
+            "## 阅读问题",
+            "",
+            "- 这本书真正要解决的核心问题是什么？",
+            "- 哪些内容已经被用户批注证明有触动？",
+            "- 用户原来的读法哪里太平均、太摘要化或太空泛？",
+            "- 哪些章节应该精读，哪些章节只需要扫读？",
+            "- 读完之后应沉淀成一个判断模型、项目规则、反例清单还是行动实验？",
+            "",
+            "## 输出物建议",
+            "",
+            "- 一个“本书如何判断问题”的模型卡。",
+            "- 一个“我和这本书的差距”清单。",
+            "- 一个可执行的 7 天或 14 天实践问题表。",
+            "- 一个可迁移到项目或生活决策的规则草案。",
+            "",
+            "## 可引用证据",
+            "",
+            *evidence_lines,
+            "",
+            "## 使用边界",
+            "",
+            "- 阅读策略必须根据用户问题动态调整，不能把本草稿当死规则。",
+            "- 如果用户没有给阅读目的，Hermes 应先用现有批注推断一个临时目标，并明确这是临时判断。",
+            "- 如果用户给出弱读法，Hermes 应直接挑战，但必须说明证据和理由。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_living_book_reading_coach_mode_draft(
+    book: dict[str, Any],
+    manifest: dict[str, Any],
+    annotations: list[dict[str, Any]],
+    bundle_dir: Path,
+    generated_at: str,
+) -> str:
+    title = markdown_line(book.get("title")) or markdown_line(book.get("id"))
+    mode, mode_reason = living_book_reading_mode_recommendation(annotations)
+    lines = living_book_protocol_draft_header("阅读导师模式", generated_at, phase="P1.4")
+    lines.extend(
+        [
+            "## 触发条件",
+            "",
+            f"- 用户问“我该怎么读《{title}》/这本书应该怎么读/我这样读对吗”。",
+            "- 用户问“我和这本书的差距在哪里/这本书该用于哪个项目或能力”。",
+            "- 用户给出一个阅读计划，希望 Hermes 挑战、修正或排序。",
+            "",
+            "## 读取顺序",
+            "",
+            "1. `6_Hermes调用/阅读导师模式.md`",
+            "2. `5_书籍思想模型/阅读策略.md`",
+            "3. `5_书籍思想模型/思维协议.md`",
+            "4. `6_Hermes调用/思想对话规则.md` 和 `书籍调用卡.md`",
+            "5. `2_批注数据/批注.json`、`2_批注数据/批注.md`、`3_融合阅读/`",
+            "",
+            "## 回答格式",
+            "",
+            "## 你的读法判断",
+            "",
+            "直接判断用户当前读法强在哪里、弱在哪里。弱读法要明确挑战，不要只鼓励。",
+            "",
+            "## 应该怎么读",
+            "",
+            f"默认建议：{mode}。理由：{mode_reason}",
+            "",
+            "## 你和这本书的差距",
+            "",
+            "列出用户已经知道什么、缺什么、误用或低估了什么。",
+            "",
+            "## 章节和问题优先级",
+            "",
+            "给出先读哪些章节/片段，以及用哪些问题检验。",
+            "",
+            "## 读完要沉淀什么",
+            "",
+            "必须建议输出物：模型卡、项目规则、行动清单、反例清单、内容选题或实践实验。",
+            "",
+            "## 禁止事项",
+            "",
+            "- 禁止把阅读导师模式变成普通摘要。",
+            "- 禁止无差别建议精读全书。",
+            "- 禁止不看批注就判断用户差距。",
+            "- 禁止把模型综合判断伪装成原书明说。",
+            "",
+            "## 证据要求",
+            "",
+            f"- 当前批注数量：{len(annotations)}。",
+            f"- 必须优先返回 `source_path`，例如 `{bundle_dir / '5_书籍思想模型' / '阅读策略.md'}`。",
+            "- 需要区分书中内容、用户批注、阅读策略草稿和 Hermes 综合判断。",
+            "",
+            "## 示例问题",
+            "",
+            f"- 我想读《{title}》，应该怎么读？",
+            "- 我这样读对吗？",
+            "- 我和这本书要求的思维差距在哪里？",
+            "- 这本书应该转成什么模型或行动？",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_living_book_draft(path: Path, text: str) -> dict[str, Any]:
+    if has_reviewed_marker(path):
+        target = path.with_name(f"{path.stem}.new{path.suffix}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text.rstrip() + "\n", encoding="utf-8")
+        return {
+            "path": str(target),
+            "written": True,
+            "reason": "reviewed_file_not_overwritten_draft_written_new",
+            "protected_path": str(path),
+        }
+    return write_living_book_text(path, text, protect_reviewed=True)
+
+
+def run_living_book_draft_generation(
+    book_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+    use_hermes_runtime: bool = False,
+) -> dict[str, Any]:
+    if not use_hermes_runtime:
+        raise HTTPException(status_code=409, detail="Living Book analysis requires an explicit manual Hermes/Qwen request")
+    return run_living_book_qwen_analysis(book_id, knowledge_base_root=knowledge_base_root)
+
+    # Legacy static generator retained below only as unreachable migration context.
+    book = living_book_book_row(book_id)
+    lb_root = living_books_root(knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+    classification_result = run_living_book_classification(book_id, knowledge_base_root=knowledge_base_root)
+    manifest = read_living_book_json(bundle_dir / "book_manifest.json", {})
+    annotations = living_book_annotations(book_id)
+    generated_at = now_iso()
+    outputs = {
+        "outline": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "目录.md",
+            render_living_book_outline_draft(book, manifest, generated_at),
+        ),
+        "summary": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "全书摘要.md",
+            render_living_book_summary_draft(book, manifest, annotations, generated_at),
+        ),
+        "concepts": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "核心概念.md",
+            render_living_book_concepts_draft(annotations, generated_at),
+        ),
+        "notes_overview": write_living_book_draft(
+            bundle_dir / "4_书籍整理" / "我的备注总览.md",
+            render_living_book_notes_overview_draft(annotations, generated_at),
+        ),
+        "thinking": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书怎么思考.md",
+            render_living_book_thought_draft(
+                "这本书怎么思考",
+                "请后续结合原书、批注和融合阅读，将本书转化成可复用的思考方法，而不是普通摘要。",
+                generated_at,
+            ),
+        ),
+        "core_claim": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的核心主张.md",
+            render_living_book_thought_draft(
+                "这本书的核心主张",
+                "当前为占位草稿。正式版本需要区分原书明说、按书中逻辑推导、以及 Hermes 综合判断。",
+                generated_at,
+            ),
+        ),
+        "judgement": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的判断标准.md",
+            render_living_book_thought_draft(
+                "这本书的判断标准",
+                "当前为占位草稿。后续应整理这本书如何判断重要、正确、风险和行动优先级。",
+                generated_at,
+            ),
+        ),
+        "blind_spots": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "这本书的盲区.md",
+            render_living_book_thought_draft(
+                "这本书的盲区",
+                "当前为占位草稿。后续应记录本书没有覆盖、可能过时或需要其他书互补的部分。",
+                generated_at,
+            ),
+        ),
+        "thinking_protocol": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "思维协议.md",
+            render_living_book_thinking_protocol_draft(book, manifest, annotations, bundle_dir, generated_at),
+        ),
+        "reading_strategy": write_living_book_draft(
+            bundle_dir / "5_书籍思想模型" / "阅读策略.md",
+            render_living_book_reading_strategy_draft(book, manifest, annotations, bundle_dir, generated_at),
+        ),
+        "dialogue_rules": write_living_book_draft(
+            bundle_dir / "6_Hermes调用" / "思想对话规则.md",
+            render_living_book_dialogue_rules_draft(book, manifest, annotations, bundle_dir, generated_at),
+        ),
+        "reading_coach_mode": write_living_book_draft(
+            bundle_dir / "6_Hermes调用" / "阅读导师模式.md",
+            render_living_book_reading_coach_mode_draft(book, manifest, annotations, bundle_dir, generated_at),
+        ),
+        "call_card": write_living_book_draft(
+            bundle_dir / "6_Hermes调用" / "书籍调用卡.md",
+            render_hermes_call_card(book)
+            + "\n\n## P1.1 生成状态\n\nstatus: draft\ngenerated_by: click_living_books_static_template\nneeds_review: true\nsource_coverage: partial\n",
+        ),
+    }
+    hermes_runtime_status = "not_requested"
+    if use_hermes_runtime:
+        hermes_runtime_status = "legacy_static_pipeline_disabled"
+    job = upsert_living_book_job(lb_root, book, bundle_dir)
+    update_living_book_job(
+        lb_root,
+        str(job.get("job_id")),
+        status="needs_review",
+        last_error=None,
+        attempt_count=int(job.get("attempt_count") or 0) + 1,
+    )
+    status = write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status="draft",
+        hermes_draft_status="needs_review",
+        last_job_id=str(job.get("job_id")),
+    )
+    return {
+        "ok": True,
+        "schema": "click.living_book.hermes_draft_result.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir),
+        "generated_by": "click_living_books_static_template",
+        "source_coverage": "partial",
+        "needs_review": True,
+        "hermes_runtime_status": hermes_runtime_status,
+        "classification": classification_result.get("classification"),
+        "outputs": outputs,
+        "status": status,
+    }
+
+
+def run_due_living_book_jobs(*, knowledge_base_root: Optional[str] = None, limit: int = 20, force: bool = False) -> dict[str, Any]:
+    lb_root = living_books_root(knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    jobs_payload = read_living_book_jobs(lb_root)
+    results: list[dict[str, Any]] = []
+    processed = 0
+    for job in jobs_payload.get("jobs") or []:
+        if processed >= limit:
+            break
+        if job.get("job_type") != "analyze_book_with_hermes_qwen" or not job.get("manual_request"):
+            continue
+        status = str(job.get("status") or "")
+        if status == "running":
+            continue
+        if status != "queued" and not (force and status in {"failed", "needs_review", "complete"}):
+            continue
+        result = execute_living_book_analysis_job(
+            str(job.get("book_id") or ""),
+            str(job.get("job_id") or ""),
+            knowledge_base_root=knowledge_base_root,
+        )
+        results.append({"job_id": job.get("job_id"), "status": (result.get("analysis") or {}).get("state"), "result": result})
+        processed += 1
+    return {
+        "ok": True,
+        "schema": "click.living_books.jobs_run_result.v1",
+        "processed": processed,
+        "results": results,
+    }
+
+
+def living_book_existing_reviewed_placeholders(bundle_dir: Path) -> list[dict[str, Any]]:
+    placeholders = {
+        "5_书籍思想模型/这本书怎么思考.md": "# 这本书怎么思考\n\nstatus: draft\n\nP1 自动预留。请在后续人工或 Hermes 审阅后补充。\n",
+        "5_书籍思想模型/这本书的核心主张.md": "# 这本书的核心主张\n\nstatus: draft\n\nP1 自动预留。请在后续人工或 Hermes 审阅后补充。\n",
+        "5_书籍思想模型/这本书的判断标准.md": "# 这本书的判断标准\n\nstatus: draft\n\nP1 自动预留。请在后续人工或 Hermes 审阅后补充。\n",
+        "5_书籍思想模型/这本书的盲区.md": "# 这本书的盲区\n\nstatus: draft\n\nP1 自动预留。请在后续人工或 Hermes 审阅后补充。\n",
+        "5_书籍思想模型/思维协议.md": "# 思维协议\n\nstatus: draft\ngenerated_by: click_living_books\nneeds_review: true\nsource_coverage: partial\n\nP1.3 自动预留。请在后续生成草稿或人工审阅后补充。\n",
+        "5_书籍思想模型/阅读策略.md": "# 阅读策略\n\nstatus: draft\ngenerated_by: click_living_books\nneeds_review: true\nsource_coverage: partial\n\nP1.4 自动预留。请在后续生成草稿或人工审阅后补充。\n",
+        "6_Hermes调用/思想对话规则.md": "# 思想对话规则\n\nstatus: draft\ngenerated_by: click_living_books\nneeds_review: true\nsource_coverage: partial\n\nP1.3 自动预留。请在后续生成草稿或人工审阅后补充。\n",
+        "6_Hermes调用/阅读导师模式.md": "# 阅读导师模式\n\nstatus: draft\ngenerated_by: click_living_books\nneeds_review: true\nsource_coverage: partial\n\nP1.4 自动预留。请在后续生成草稿或人工审阅后补充。\n",
+    }
+    results = []
+    for relative_path, text in placeholders.items():
+        target = bundle_dir / relative_path
+        if target.exists():
+            continue
+        results.append(write_living_book_text(target, text, protect_reviewed=True))
+    return results
+
+
+def generate_living_book_bundle(book_id: str, *, knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    source_kind = str(book.get("source_kind") or book.get("file_kind") or "").lower()
+    if source_kind not in {"epub", "pdf"}:
+        raise HTTPException(status_code=422, detail="Living Books P1 currently supports EPUB and PDF books")
+
+    source_file_value = str(book.get("file_path") or "")
+    if not source_file_value:
+        raise HTTPException(status_code=422, detail="book has no source file path")
+    source_file = Path(source_file_value).expanduser()
+    if not source_file.exists():
+        raise HTTPException(status_code=404, detail=f"book source file missing: {source_file}")
+
+    compatibility: dict[str, Any] = {}
+    pdf_preflight: dict[str, Any] = {}
+    if source_kind == "epub":
+        compatibility = ensure_book_epub_assets(book)
+    else:
+        pdf_preflight = inspect_pdf(source_file)
+
+    generated_at = now_iso()
+    kb_root = knowledge_base_root_path(knowledge_base_root)
+    lb_root = living_books_root(str(kb_root))
+    control_paths = ensure_living_book_control_files(lb_root)
+    bundle_dir = living_book_bundle_dir(book, str(kb_root))
+    original_dir = bundle_dir / "1_原书"
+    dirs = [
+        original_dir,
+        bundle_dir / "2_批注数据",
+        bundle_dir / "3_融合阅读",
+        bundle_dir / "4_书籍整理",
+        bundle_dir / "5_书籍思想模型",
+        bundle_dir / "6_Hermes调用",
+        bundle_dir / "7_对话复盘",
+        bundle_dir / "_status",
+    ]
+    for directory in dirs:
+        directory.mkdir(parents=True, exist_ok=True)
+
+    canonical_source = original_dir / living_book_safe_filename(book, source_file)
+    copied_source = False
+    if source_file.resolve() != canonical_source.resolve():
+        if not canonical_source.exists() or file_sha256(canonical_source) != file_sha256(source_file):
+            shutil.copy2(source_file, canonical_source)
+            copied_source = True
+    source_hash = str(book.get("file_hash") or "") or file_sha256(canonical_source)
+    byte_size = canonical_source.stat().st_size
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO reader.book_files (id, book_id, file_path, file_kind, file_hash, byte_size)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (book_id, file_path) DO UPDATE
+            SET file_kind = EXCLUDED.file_kind,
+                file_hash = EXCLUDED.file_hash,
+                byte_size = EXCLUDED.byte_size
+            """,
+            (
+                stable_id("file", book["id"], str(canonical_source)),
+                book["id"],
+                str(canonical_source),
+                source_kind,
+                source_hash,
+                byte_size,
+            ),
+        )
+
+    annotations = living_book_annotations(book_id)
+    paths = {
+        "book_home": "0_书籍首页.md",
+        "original_dir": "1_原书",
+        "canonical_source_file": relative_to_bundle(bundle_dir, canonical_source),
+        "annotations_json": "2_批注数据/批注.json",
+        "annotations_markdown": "2_批注数据/批注.md",
+        "fused_reading_dir": "3_融合阅读",
+        "book_notes_dir": "4_书籍整理",
+        "thought_model_dir": "5_书籍思想模型",
+        "hermes_dir": "6_Hermes调用",
+        "dialogue_review_dir": "7_对话复盘",
+    }
+    existing_manifest = read_living_book_json(bundle_dir / "book_manifest.json", {})
+    existing_classification = existing_manifest.get("classification") or default_living_book_classification(generated_at)
+    migration_entry = living_book_migration_entry(book, str(kb_root)) or {}
+    identity = living_book_identity(book, str(kb_root))
+    layout_status = living_book_bundle_layout_status(kb_root, bundle_dir)
+    manifest_schema = (
+        "jiangyu.knowledge.book_manifest.v2"
+        if layout_status == "knowledgebase_v2"
+        else "click.living_book.manifest.v1"
+    )
+    normalized_source_hash = f"sha256:{source_hash}" if not str(source_hash).startswith("sha256:") else source_hash
+    existing_lifecycle = dict(existing_manifest.get("lifecycle") or {})
+    existing_analysis_state = str(existing_lifecycle.get("analysis_state") or "")
+    existing_review_state = str(existing_lifecycle.get("review_state") or "")
+    verified_worker_extractions = [
+        value
+        for key, value in existing_manifest.items()
+        if re.fullmatch(r"worker_[a-z0-9_]+_model_extraction", str(key))
+        and isinstance(value, dict)
+        and value.get("source_sha256_verified") is True
+        and bool(value.get("generated_files"))
+    ]
+    if verified_worker_extractions and existing_review_state == "in_review" and existing_analysis_state in {"", "not_requested"}:
+        existing_analysis_state = "draft_ready"
+    manifest = {
+        **existing_manifest,
+        "schema": manifest_schema,
+        "manifest_version": 2 if manifest_schema == "jiangyu.knowledge.book_manifest.v2" else 1,
+        "work_id": identity["work_id"],
+        "edition_id": identity["edition_id"],
+        "book_id": book["id"],
+        "book_slug": living_book_slug(book),
+        "title": book.get("title"),
+        "author": str(book.get("author") or ""),
+        "language": "unknown",
+        "source_kind": book.get("source_kind"),
+        "file_hash": normalized_source_hash,
+        "canonical_source_file": paths["canonical_source_file"],
+        "runtime_owner": "click_reader",
+        "annotation_primary_store": "reader.annotations",
+        "audio_note_primary_store": "reader.audio_notes",
+        "source": {
+            "kind": source_kind,
+            "content_hash": normalized_source_hash,
+            "canonical_file": paths["canonical_source_file"],
+            "provenance": [
+                {
+                    "path_at_import": str(source_file),
+                    "observed_at": generated_at,
+                    "retained": True,
+                }
+            ],
+        },
+        "ownership": {
+            "publication_owner": "knowledge_base",
+            "runtime_owner": "click_reader",
+            "runtime_reader": "click_reader",
+            "annotation_primary_store": "reader.annotations",
+            "audio_note_primary_store": "reader.audio_notes",
+            "hermes_role": "authorized_processor",
+        },
+        "generated_at": generated_at,
+        "canonical_bundle_dir": str(bundle_dir),
+        "library_layout": {
+            "schema": "jiangyu.knowledge_base.library_layout.v2",
+            "status": layout_status,
+            "control_root": str(lb_root),
+            "final_classified_path_requires_user_confirmation": True,
+        },
+        "provenance": {
+            "source_file_at_sync": str(source_file),
+            "copied_to_canonical_source": copied_source,
+        },
+        "paths": paths,
+        "privacy": {
+            "local_only": True,
+            "git_publish_allowed": False,
+        },
+        "classification": existing_classification,
+        "analysis_policy": {
+            "default": "not_requested",
+            "automatic_analysis_after_import": False,
+            "manual_action_required": True,
+            "processor": "hermes_qwen_local",
+        },
+        "lifecycle": {
+            "status": str(existing_lifecycle.get("status") or "captured"),
+            "analysis_state": (
+                existing_analysis_state
+                if existing_analysis_state in LIVING_BOOK_ANALYSIS_STATES
+                else "not_requested"
+            ),
+            "review_state": (
+                existing_review_state
+                if existing_review_state in {"unreviewed", "in_review", "reviewed"}
+                else "unreviewed"
+            ),
+        },
+        "legacy": {
+            "read_compatible": (
+                bool(migration_entry.get("legacy_read_compatible"))
+                if layout_status == "knowledgebase_v2"
+                else True
+            ),
+            "legacy_bundle_path": migration_entry.get("legacy_bundle_path"),
+            "legacy_manifest_schema": (
+                migration_entry.get("legacy_manifest_schema")
+                or (existing_manifest.get("legacy") or {}).get("legacy_manifest_schema")
+                or (
+                    existing_manifest.get("schema")
+                    if existing_manifest.get("schema") != "jiangyu.knowledge.book_manifest.v2"
+                    else None
+                )
+            ),
+            "migration_state": migration_entry.get("migration_state"),
+            "migration_map": str(living_book_migration_map_path(str(kb_root))),
+        },
+    }
+    if source_kind == "epub":
+        manifest["epub_compatibility"] = {
+            "schema": compatibility.get("schema") or EPUB_COMPATIBILITY_REPORT_SCHEMA,
+            "reading_profile": compatibility.get("reading_profile") or "UNKNOWN",
+            "toc_depth_counts": compatibility.get("toc_depth_counts") or {},
+            "display_variants_available": bool((compatibility.get("display_variants") or {}).get("available")),
+            "correction_queue_required": bool(compatibility.get("correction_queue_required")),
+            "original_epub_modified": bool(compatibility.get("original_epub_modified")),
+        }
+    else:
+        manifest["pdf_preflight"] = {
+            "schema": pdf_preflight.get("schema") or PDF_PREFLIGHT_SCHEMA,
+            "document_profile": pdf_preflight.get("document_profile") or "unknown",
+            "page_count": int(pdf_preflight.get("page_count") or 0),
+            "text_page_count": int(pdf_preflight.get("text_page_count") or 0),
+            "scanned_page_count": int(pdf_preflight.get("scanned_page_count") or 0),
+            "encrypted": bool(pdf_preflight.get("encrypted")),
+            "unlocked": bool(pdf_preflight.get("unlocked")),
+            "source_pdf_modified": False,
+            "capabilities": pdf_preflight.get("capabilities") or {},
+        }
+
+    outputs: dict[str, Any] = {}
+    outputs["manifest"] = write_living_book_json(bundle_dir / "book_manifest.json", manifest, protect_reviewed=False)
+    book_home_path = bundle_dir / "0_书籍首页.md"
+    outputs["book_home"] = write_living_book_text(
+        book_home_path,
+        preserve_book_home_extensions(book_home_path, render_book_home(book, manifest)),
+    )
+
+    annotation_payload = {
+        "schema": "click.living_book.annotations_export.v1",
+        "generated_at": generated_at,
+        "book": {
+            "id": book.get("id"),
+            "title": book.get("title"),
+            "author": book.get("author"),
+            "source_kind": book.get("source_kind"),
+            "book_hash": book.get("book_hash"),
+        },
+        "primary_store": {
+            "annotations": "reader.annotations",
+            "audio_notes": "reader.audio_notes",
+        },
+        "annotation_count": len(annotations),
+        "annotations": annotations,
+        "export_note": "Generated export for KnowledgeBase/Hermes. Do not treat this JSON as the runtime annotation source of truth.",
+    }
+    outputs["annotations_json"] = write_living_book_json(bundle_dir / paths["annotations_json"], annotation_payload)
+    outputs["annotations_markdown"] = write_living_book_text(
+        bundle_dir / paths["annotations_markdown"],
+        render_living_annotations_markdown(book, annotations, generated_at),
+    )
+
+    by_chapter: dict[str, list[dict[str, Any]]] = {}
+    for item in annotations:
+        chapter_key = str(item.get("chapter_title") or item.get("chapter_locator") or "chapter")
+        by_chapter.setdefault(chapter_key, []).append(item)
+    fused_outputs = []
+    for index, (chapter, chapter_annotations) in enumerate(sorted(by_chapter.items()), start=1):
+        chapter_slug = safe_slug(chapter) or f"chapter-{index:03d}"
+        target = bundle_dir / "3_融合阅读" / f"{index:03d}_{chapter_slug}_融合阅读.md"
+        fused_outputs.append(write_living_book_text(target, render_fused_chapter(book, chapter, chapter_annotations, generated_at)))
+    outputs["fused_reading"] = fused_outputs
+
+    hermes_manifest = {
+        "schema": "click.living_book.hermes_manifest.v1",
+        "book_id": book["id"],
+        "work_id": identity["work_id"],
+        "edition_id": identity["edition_id"],
+        "book_slug": living_book_slug(book),
+        "call_card": "书籍调用卡.md",
+        "book_manifest": "../book_manifest.json",
+        "authorization": {
+            "schema": "click.living_book.hermes_authorization.v1",
+            "grantee": "hermes-ai-gateway",
+            "access": "read_only",
+            "allowed_paths": [
+                "../book_manifest.json",
+                "../0_书籍首页.md",
+                "../2_批注数据/批注.json",
+                "../2_批注数据/批注.md",
+                "../3_融合阅读",
+                "../4_书籍整理",
+                "../5_书籍思想模型",
+                "书籍调用卡.md",
+                "思想对话规则.md",
+                "阅读导师模式.md",
+            ],
+            "forbidden_sinks": [
+                "hermes_memory",
+                "hermes_session",
+                "hermes_repo",
+                "marketplace_os_database",
+            ],
+            "requires_explicit_mode": True,
+        },
+        "evidence_policy": {
+            "must_distinguish_source_quote": True,
+            "must_distinguish_book_logic_inference": True,
+            "must_distinguish_hermes_synthesis": True,
+            "draft_models_are_not_final": True,
+        },
+        "read_modes": {
+            "book_summary": ["../0_书籍首页.md", "../4_书籍整理"],
+            "user_reading_memory": ["../2_批注数据/批注.json", "../2_批注数据/批注.md", "../4_书籍整理/我的备注总览.md"],
+            "living_book_dialogue": [
+                "书籍调用卡.md",
+                "思想对话规则.md",
+                "../5_书籍思想模型/思维协议.md",
+                "../5_书籍思想模型",
+                "../3_融合阅读",
+                "../2_批注数据",
+            ],
+            "reading_strategy_coach": [
+                "阅读导师模式.md",
+                "../5_书籍思想模型/阅读策略.md",
+                "../5_书籍思想模型/思维协议.md",
+                "思想对话规则.md",
+                "书籍调用卡.md",
+                "../2_批注数据/批注.json",
+                "../2_批注数据/批注.md",
+                "../3_融合阅读",
+            ],
+        },
+    }
+    outputs["hermes_manifest"] = write_living_book_json(
+        bundle_dir / "6_Hermes调用" / "hermes_manifest.json",
+        hermes_manifest,
+    )
+    outputs["call_card"] = write_living_book_text(
+        bundle_dir / "6_Hermes调用" / "书籍调用卡.md",
+        render_hermes_call_card(book),
+    )
+    outputs["thought_model_placeholders"] = living_book_existing_reviewed_placeholders(bundle_dir)
+    if source_kind == "epub":
+        compatibility_export = dict(compatibility)
+        compatibility_export.pop("source_file", None)
+        outputs["epub_compatibility"] = write_living_book_json_unprotected(
+            bundle_dir / "_status" / "epub_compatibility.json",
+            compatibility_export,
+        )
+    else:
+        pdf_export = dict(pdf_preflight)
+        pdf_export.pop("source_file", None)
+        outputs["pdf_preflight"] = write_living_book_json_unprotected(
+            bundle_dir / "_status" / "pdf_preflight.json",
+            pdf_export,
+        )
+    analysis = read_living_book_json(living_book_analysis_path(bundle_dir), {})
+    if analysis.get("state") not in LIVING_BOOK_ANALYSIS_STATES:
+        analysis = write_living_book_analysis(bundle_dir, default_living_book_analysis(book_id, bundle_dir))
+    elif analysis.get("bundle_dir") != str(bundle_dir):
+        analysis = write_living_book_analysis(bundle_dir, analysis)
+    outputs["status"] = write_living_book_status(
+        bundle_dir,
+        book,
+        classification_status=str(existing_classification.get("status") or "pending"),
+        hermes_draft_status=str(analysis.get("state") or "not_requested"),
+        last_job_id=str(analysis.get("job_id") or "") or None,
+    )
+
+    return {
+        "ok": True,
+        "schema": "click.living_book.sync_result.v1",
+        "knowledge_base_root": str(kb_root),
+        "living_books_root": str(lb_root),
+        "control_paths": control_paths,
+        "book_id": book["id"],
+        "book_slug": living_book_slug(book),
+        "bundle_dir": str(bundle_dir),
+        "layout_status": living_book_bundle_layout_status(kb_root, bundle_dir),
+        "canonical_source_file": str(canonical_source),
+        "annotation_count": len(annotations),
+        "fused_chapter_count": len(fused_outputs),
+        "annotation_primary_store": "reader.annotations",
+        "audio_note_primary_store": "reader.audio_notes",
+        "background_job": None,
+        "analysis": analysis,
+        "outputs": outputs,
+        "privacy": manifest["privacy"],
+    }
+
+
 def insert_export_record(conn: Any, book_id: str, export_kind: str, output_path: str, annotation_count: int) -> dict[str, Any]:
     row = conn.execute(
         """
@@ -4644,6 +8915,259 @@ def update_sync_event(conn: Any, sync_event_id: str, status: str, payload: dict[
     return dict(row)
 
 
+LIVING_BOOK_EVIDENCE_SYNC_TARGET = "knowledge_base_living_book"
+LIVING_BOOK_EVIDENCE_SYNC_THREAD_LOCK = threading.Lock()
+LIVING_BOOK_EVIDENCE_SYNC_THREAD: Optional[threading.Thread] = None
+
+
+def enqueue_living_book_evidence_sync(
+    conn: Any,
+    *,
+    source_kind: str,
+    source_id: str,
+    book_id: str,
+    operation: str,
+    details: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return insert_sync_event(
+        conn,
+        source_kind,
+        source_id,
+        LIVING_BOOK_EVIDENCE_SYNC_TARGET,
+        {
+            "schema": "click.living_book.evidence_sync_event.v1",
+            "book_id": book_id,
+            "operation": operation,
+            "source_kind": source_kind,
+            "source_id": source_id,
+            "queued_at": now_iso(),
+            "knowledge_base_root": str(default_knowledge_base_root()),
+            "details": details or {},
+        },
+    )
+
+
+def export_living_book_evidence(
+    book_id: str,
+    *,
+    knowledge_base_root: Optional[str] = None,
+    source_event_ids: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    kb_root = knowledge_base_root_path(knowledge_base_root)
+    manifest_path = bundle_dir / "book_manifest.json"
+    manifest = read_living_book_json(manifest_path, {})
+    identity = living_book_identity(book, knowledge_base_root)
+    layout_status = living_book_bundle_layout_status(kb_root, bundle_dir)
+    manifest_is_current = bool(manifest) and (
+        layout_status != "knowledgebase_v2"
+        or (
+            manifest.get("schema") == "jiangyu.knowledge.book_manifest.v2"
+            and manifest.get("canonical_bundle_dir") == str(bundle_dir)
+            and manifest.get("work_id") == identity["work_id"]
+            and manifest.get("edition_id") == identity["edition_id"]
+        )
+    )
+    if not manifest_is_current:
+        generated = generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+        bundle_dir = Path(str(generated["bundle_dir"]))
+        manifest_path = bundle_dir / "book_manifest.json"
+
+    generated_at = now_iso()
+    manifest = read_living_book_json(manifest_path, {})
+    annotations = living_book_annotations(book_id)
+    paths = manifest.get("paths") or {}
+    annotations_json_path = bundle_dir / str(paths.get("annotations_json") or "2_批注数据/批注.json")
+    annotations_markdown_path = bundle_dir / str(paths.get("annotations_markdown") or "2_批注数据/批注.md")
+    annotation_payload = {
+        "schema": "click.living_book.annotations_export.v1",
+        "generated_at": generated_at,
+        "book": {
+            "id": book.get("id"),
+            "title": book.get("title"),
+            "author": book.get("author"),
+            "source_kind": book.get("source_kind"),
+            "book_hash": book.get("book_hash"),
+        },
+        "primary_store": {
+            "annotations": "reader.annotations",
+            "audio_notes": "reader.audio_notes",
+        },
+        "annotation_count": len(annotations),
+        "annotations": annotations,
+        "source_event_ids": source_event_ids or [],
+        "export_note": "Generated evidence projection. PostgreSQL remains the runtime source of truth.",
+    }
+    outputs = {
+        "annotations_json": write_living_book_json(
+            annotations_json_path,
+            annotation_payload,
+            protect_reviewed=False,
+        ),
+        "annotations_markdown": write_living_book_text(
+            annotations_markdown_path,
+            render_living_annotations_markdown(book, annotations, generated_at),
+            protect_reviewed=False,
+        ),
+    }
+    status_payload = {
+        "schema": "click.living_book.evidence_sync_status.v1",
+        "book_id": book_id,
+        "bundle_dir": str(bundle_dir),
+        "annotation_count": len(annotations),
+        "source_event_ids": source_event_ids or [],
+        "primary_store": "reader.annotations",
+        "audio_note_primary_store": "reader.audio_notes",
+        "synced_at": generated_at,
+        "state": "synced",
+    }
+    outputs["status"] = write_living_book_json_unprotected(
+        bundle_dir / "_status" / "evidence_sync.json",
+        status_payload,
+    )
+    return {
+        "ok": True,
+        **status_payload,
+        "outputs": outputs,
+    }
+
+
+def pending_living_book_evidence_sync_count() -> int:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT count(*) AS count FROM reader.sync_events WHERE target_system = %s AND status = 'pending'",
+            (LIVING_BOOK_EVIDENCE_SYNC_TARGET,),
+        ).fetchone()
+    return int((row or {}).get("count") or 0)
+
+
+def process_living_book_evidence_sync_events(limit: int = 100) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 500))
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM reader.sync_events
+            WHERE target_system = %s AND status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT %s
+            """,
+            (LIVING_BOOK_EVIDENCE_SYNC_TARGET, limit),
+        ).fetchall()
+    events = [jsonable(dict(row)) for row in rows]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    missing_book_events: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") or {}
+        book_id = str(payload.get("book_id") or "").strip()
+        if book_id:
+            grouped.setdefault(book_id, []).append(event)
+        else:
+            missing_book_events.append(event)
+
+    results: list[dict[str, Any]] = []
+    for event in missing_book_events:
+        error = "evidence sync event missing book_id"
+        payload = {**(event.get("payload") or {}), "failed_at": now_iso(), "error": error}
+        with db.connect() as conn:
+            update_sync_event(conn, str(event["id"]), "failed", payload, error)
+        results.append({"event_id": event["id"], "status": "failed", "error": error})
+
+    for book_id, book_events in grouped.items():
+        event_ids = [str(event["id"]) for event in book_events]
+        try:
+            export_result = export_living_book_evidence(book_id, source_event_ids=event_ids)
+            synced_at = now_iso()
+            with db.connect() as conn:
+                for event in book_events:
+                    event_payload = event.get("payload") or {}
+                    update_sync_event(
+                        conn,
+                        str(event["id"]),
+                        "synced",
+                        {
+                            **event_payload,
+                            "synced_at": synced_at,
+                            "bundle_dir": export_result["bundle_dir"],
+                            "annotation_count": export_result["annotation_count"],
+                            "evidence_sync_schema": export_result["schema"],
+                        },
+                    )
+            results.append(
+                {
+                    "book_id": book_id,
+                    "event_ids": event_ids,
+                    "status": "synced",
+                    "bundle_dir": export_result["bundle_dir"],
+                    "annotation_count": export_result["annotation_count"],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the committed source mutation and expose retry state.
+            error = f"{exc.__class__.__name__}: {exc}"
+            failed_at = now_iso()
+            with db.connect() as conn:
+                for event in book_events:
+                    event_payload = event.get("payload") or {}
+                    update_sync_event(
+                        conn,
+                        str(event["id"]),
+                        "failed",
+                        {**event_payload, "failed_at": failed_at, "error": error},
+                        error,
+                    )
+            results.append({"book_id": book_id, "event_ids": event_ids, "status": "failed", "error": error})
+
+    failed_count = sum(1 for item in results if item["status"] == "failed")
+    return {
+        "ok": failed_count == 0,
+        "schema": "click.living_book.evidence_sync_run.v1",
+        "attempted_event_count": len(events),
+        "book_count": len(grouped),
+        "failed_count": failed_count,
+        "results": results,
+    }
+
+
+def run_living_book_evidence_sync_worker() -> None:
+    global LIVING_BOOK_EVIDENCE_SYNC_THREAD
+    try:
+        while True:
+            result = process_living_book_evidence_sync_events(limit=100)
+            if result["attempted_event_count"] == 0:
+                break
+    except Exception:
+        # Reader API must remain available if PostgreSQL or the KnowledgeBase disk is temporarily unavailable.
+        pass
+    finally:
+        with LIVING_BOOK_EVIDENCE_SYNC_THREAD_LOCK:
+            LIVING_BOOK_EVIDENCE_SYNC_THREAD = None
+        try:
+            if pending_living_book_evidence_sync_count() > 0:
+                start_living_book_evidence_sync_worker()
+        except Exception:
+            pass
+
+
+def start_living_book_evidence_sync_worker() -> bool:
+    global LIVING_BOOK_EVIDENCE_SYNC_THREAD
+    with LIVING_BOOK_EVIDENCE_SYNC_THREAD_LOCK:
+        if LIVING_BOOK_EVIDENCE_SYNC_THREAD is not None and LIVING_BOOK_EVIDENCE_SYNC_THREAD.is_alive():
+            return False
+        thread = threading.Thread(
+            target=run_living_book_evidence_sync_worker,
+            daemon=True,
+            name="living-book-evidence-sync",
+        )
+        LIVING_BOOK_EVIDENCE_SYNC_THREAD = thread
+        thread.start()
+    return True
+
+
+@app.on_event("startup")
+def start_pending_living_book_evidence_sync() -> None:
+    start_living_book_evidence_sync_worker()
+
+
 def load_hermes_sync_payload(payload_path: Path) -> dict[str, Any]:
     if not payload_path.exists():
         raise FileNotFoundError(f"sync payload missing: {payload_path}")
@@ -4700,7 +9224,20 @@ def validate_audio_status(status: str) -> str:
     return status
 
 
+def sync_reader_audio_note_to_voice_inbox(audio_note_id: str) -> None:
+    try:
+        project_reader_audio_note_to_voice_inbox(audio_note_id)
+    except Exception as exc:  # noqa: BLE001 - Reader capture must survive a temporary Voice Inbox failure.
+        print(
+            f"Click Voice projection deferred for reader audio note {audio_note_id}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def sentence_reader_app_support_dir() -> Path:
+    configured = os.getenv("SENTENCE_READER_APP_SUPPORT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
     return Path.home() / "Library" / "Application Support" / "SentenceReader"
 
 
@@ -4873,6 +9410,17 @@ def run_lan_audio_note_transcription(audio_note_id: str, audio_path: Path, mime_
         ).fetchone()
         if row:
             apply_audio_note_to_annotation(conn, dict(row))
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="audio_note",
+                source_id=audio_note_id,
+                book_id=str(row["book_id"]),
+                operation="audio_note_transcription_finished",
+                details={"status": status_value},
+            )
+    if row:
+        start_living_book_evidence_sync_worker()
+        sync_reader_audio_note_to_voice_inbox(audio_note_id)
 
 
 def start_lan_audio_note_transcription(audio_note_id: str, audio_path: Path, mime_type: str, audio_byte_count: int) -> None:
@@ -4908,13 +9456,169 @@ def library_file_status(file_path: str) -> dict[str, Any]:
         path.resolve().relative_to(app_support_books_dir().resolve())
         owned = True
     except (FileNotFoundError, ValueError):
-        owned = False
+        try:
+            relative = path.resolve().relative_to(knowledge_base_root_path().resolve())
+            owned = "1_原书" in relative.parts
+        except (FileNotFoundError, ValueError):
+            owned = False
     return {
         "file_path": str(path) if file_path else "",
         "exists": exists,
         "owned_internal_copy": owned,
         "extension": path.suffix.lower().lstrip("."),
     }
+
+
+_ANDROID_BOOK_SOURCE_CACHE_LOCK = threading.RLock()
+_ANDROID_BOOK_SOURCE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def click_owned_internal_book_source_path(file_path: str) -> Optional[Path]:
+    raw_path = str(file_path or "").strip()
+    if not raw_path:
+        return None
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    if not resolved.is_file():
+        return None
+    try:
+        resolved.relative_to(app_support_books_dir().resolve())
+        return resolved
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    try:
+        relative = resolved.relative_to(knowledge_base_root_path().resolve())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    return resolved if "1_原书" in relative.parts else None
+
+
+def android_book_source_file_hash(handle: Any) -> str:
+    digest = hashlib.sha256()
+    handle.seek(0)
+    for chunk in iter(lambda: handle.read(ANDROID_BOOK_UPLOAD_CHUNK_BYTES), b""):
+        digest.update(chunk)
+    handle.seek(0)
+    return digest.hexdigest()
+
+
+def _resolve_android_book_source(book_id: str, conn: Any, *, keep_open: bool) -> dict[str, Any]:
+    book_row = conn.execute(
+        """
+        SELECT b.*, ls.metadata AS library_metadata
+        FROM reader.books b
+        LEFT JOIN reader.library_state ls ON ls.book_id=b.id
+        WHERE b.id=%s
+        """,
+        (book_id,),
+    ).fetchone()
+    if not book_row:
+        raise HTTPException(status_code=404, detail="book not found")
+    book = dict(book_row)
+    source_kind = str(book.get("source_kind") or "").strip().lower()
+    if source_kind not in {"epub", "pdf"}:
+        raise HTTPException(status_code=404, detail="book source is unavailable")
+    candidates = conn.execute(
+        """
+        SELECT id, book_id, file_path, file_kind, file_hash, byte_size, created_at
+        FROM reader.book_files
+        WHERE book_id=%s
+        ORDER BY created_at DESC, id DESC
+        """,
+        (book_id,),
+    ).fetchall()
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate)
+        if str(candidate.get("file_kind") or "").strip().lower() != source_kind:
+            continue
+        source_path = click_owned_internal_book_source_path(str(candidate.get("file_path") or ""))
+        if source_path is None or source_path.suffix.lower() != f".{source_kind}":
+            continue
+        cache_key = (book_id, str(candidate.get("id") or ""), str(source_path))
+        for attempt in range(2):
+            try:
+                handle = source_path.open("rb")
+            except OSError:
+                break
+            try:
+                before = os.fstat(handle.fileno())
+                identity = (int(before.st_size), int(before.st_mtime_ns))
+                with _ANDROID_BOOK_SOURCE_CACHE_LOCK:
+                    cached = _ANDROID_BOOK_SOURCE_CACHE.get(cache_key)
+                    if cached and cached.get("identity") == identity:
+                        source_hash = str(cached["file_hash"])
+                    else:
+                        source_hash = android_book_source_file_hash(handle)
+                    after = os.fstat(handle.fileno())
+                    after_identity = (int(after.st_size), int(after.st_mtime_ns))
+                    if after_identity != identity:
+                        _ANDROID_BOOK_SOURCE_CACHE.pop(cache_key, None)
+                        handle.close()
+                        if attempt == 0:
+                            continue
+                        raise HTTPException(status_code=409, detail="book source changed during snapshot")
+                    _ANDROID_BOOK_SOURCE_CACHE[cache_key] = {
+                        "identity": identity,
+                        "file_hash": source_hash,
+                    }
+                byte_size = identity[0]
+                stored_hash = str(candidate.get("file_hash") or "").strip().lower()
+                stored_size = (
+                    int(candidate["byte_size"])
+                    if candidate.get("byte_size") is not None
+                    else None
+                )
+                if stored_hash != source_hash or stored_size != byte_size:
+                    conn.execute(
+                        """
+                        UPDATE reader.book_files
+                        SET file_hash=%s, byte_size=%s
+                        WHERE id=%s
+                          AND (file_hash IS DISTINCT FROM %s OR byte_size IS DISTINCT FROM %s)
+                        """,
+                        (source_hash, byte_size, candidate["id"], source_hash, byte_size),
+                    )
+                snapshot = {
+                    "book_id": book_id,
+                    "file_id": str(candidate.get("id") or ""),
+                    "file_path": str(source_path),
+                    "file_kind": source_kind,
+                    "file_hash": source_hash,
+                    "byte_size": byte_size,
+                    "mtime_ns": identity[1],
+                }
+                resolved = {
+                    **book,
+                    "file_path": snapshot["file_path"],
+                    "file_kind": snapshot["file_kind"],
+                    "file_hash": snapshot["file_hash"],
+                    "byte_size": snapshot["byte_size"],
+                    "_android_source_snapshot": snapshot,
+                }
+                if keep_open:
+                    resolved["_android_source_handle"] = handle
+                else:
+                    handle.close()
+                return resolved
+            except BaseException:
+                if not handle.closed:
+                    handle.close()
+                raise
+    raise HTTPException(status_code=404, detail="Click-owned book source is unavailable")
+
+
+def resolve_android_book_source(
+    book_id: str,
+    *,
+    conn: Any = None,
+    keep_open: bool = False,
+) -> dict[str, Any]:
+    if conn is not None:
+        return _resolve_android_book_source(book_id, conn, keep_open=keep_open)
+    with db.connect() as owned_conn:
+        return _resolve_android_book_source(book_id, owned_conn, keep_open=keep_open)
 
 
 def library_progress(position: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -4942,6 +9646,7 @@ def library_progress(position: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 
 def library_book_card(row: dict[str, Any]) -> dict[str, Any]:
+    row = preferred_existing_book_file(row)
     file_status = library_file_status(str(row.get("file_path") or ""))
     metadata = row.get("library_metadata") or row.get("metadata") or {}
     if not isinstance(metadata, dict):
@@ -4963,7 +9668,16 @@ def library_book_card(row: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     lan_available = file_status["exists"] and file_status["extension"] == "epub"
-    book_stub = {"id": row.get("id"), "title": row.get("title"), "author": row.get("author"), "book_hash": row.get("book_hash")}
+    is_pdf = file_status["exists"] and file_status["extension"] == "pdf"
+    book_stub = {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "author": row.get("author"),
+        "book_hash": row.get("book_hash"),
+        "source_kind": row.get("source_kind"),
+    }
+    compatibility = read_book_epub_assets(str(row.get("id") or ""))
+    contract = android_book_contract_fields(row, compatibility)
     return {
         "id": row.get("id"),
         "title": row.get("title"),
@@ -4982,6 +9696,18 @@ def library_book_card(row: dict[str, Any]) -> dict[str, Any]:
         },
         "progress": progress,
         "reading_state": library_reading_state(progress, row),
+        "compatibility": {
+            "status": contract["compatibility_status"],
+            "reading_profile": contract["reading_profile"],
+            "toc_depth": contract["toc_depth"],
+            "display_variants_available": contract["display_variants_available"],
+            "correction_queue_required": bool(compatibility.get("correction_queue_required")),
+        },
+        "living_book_analysis": {
+            "state": contract["analysis_state"],
+            "updated_at": contract["analysis_updated_at"],
+            "manual_only": True,
+        },
         "cover": library_cover_info(book_stub, file_status),
         "organization": {
             "favorite": bool(metadata.get("favorite") or False),
@@ -5001,11 +9727,20 @@ def library_book_card(row: dict[str, Any]) -> dict[str, Any]:
             "lan_available": lan_available,
             "owned_internal_copy": file_status["owned_internal_copy"],
         },
+        "reader_capabilities": {
+            "mac_native": file_status["exists"] and file_status["extension"] in {"epub", "pdf"},
+            "lan_web": lan_available,
+            "android_native": lan_available,
+            "pdf_local_only_p1": is_pdf,
+        },
         "actions": {
             "native_reader_url": f"sentence-reader://open-native?book_id={row.get('id')}",
             "continue_reading_url": f"/lan/reader?book_id={row.get('id')}" if lan_available else "",
             "notes_filter": f"/library?view=notes&book_id={row.get('id')}",
             "red_filter": f"/library?view=red&book_id={row.get('id')}",
+            "analysis_status_url": f"/books/{row.get('id')}/living-book/analysis-status",
+            "analyze_url": f"/books/{row.get('id')}/living-book/analyze",
+            "reanalyze_url": f"/books/{row.get('id')}/living-book/reanalyze",
         },
     }
 
@@ -5056,7 +9791,21 @@ def library_recent_annotations(limit: int = 80) -> list[dict[str, Any]]:
 
 
 def library_dashboard_payload(include_hidden: bool = False) -> dict[str, Any]:
-    owned_scan = sync_owned_epub_library()
+    # The dashboard is a read path. Re-parsing every owned EPUB here made each
+    # shelf refresh take several seconds and repeated filesystem/ZIP work while
+    # the user was only browsing. Normal imports already register their owned
+    # copy transactionally; the legacy recovery scan stays available only as an
+    # explicit maintenance switch.
+    owned_scan: dict[str, Any] = {
+        "scanned": 0,
+        "imported": 0,
+        "skipped": 0,
+        "errors": [],
+        "deferred": True,
+        "reason": "dashboard_read_path_is_side_effect_free",
+    }
+    if os.getenv("SENTENCE_READER_SCAN_OWNED_EPUB_ON_DASHBOARD") == "1":
+        owned_scan = sync_owned_epub_library()
     with db.connect() as conn:
         rows = conn.execute(
             """
@@ -5065,6 +9814,19 @@ def library_dashboard_payload(include_hidden: bool = False) -> dict[str, Any]:
                    bf.file_kind,
                    bf.file_hash,
                    bf.byte_size,
+                   (
+                       SELECT jsonb_agg(
+                           jsonb_build_object(
+                               'file_path', candidate.file_path,
+                               'file_kind', candidate.file_kind,
+                               'file_hash', candidate.file_hash,
+                               'byte_size', candidate.byte_size
+                           )
+                           ORDER BY candidate.created_at DESC, candidate.id DESC
+                       )
+                       FROM reader.book_files candidate
+                       WHERE candidate.book_id = b.id
+                   ) AS file_candidates,
                    rp.chapter_locator,
                    rp.page_index,
                    rp.total_pages,
@@ -5081,7 +9843,7 @@ def library_dashboard_payload(include_hidden: bool = False) -> dict[str, Any]:
                 SELECT file_path, file_kind, file_hash, byte_size
                 FROM reader.book_files
                 WHERE book_id = b.id
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, id DESC
                 LIMIT 1
             ) bf ON true
             LEFT JOIN reader.reading_positions rp ON rp.book_id = b.id
@@ -5183,9 +9945,340 @@ def decode_library_import_base64(value: str) -> bytes:
         raise HTTPException(status_code=422, detail="invalid content_base64") from exc
     if not data:
         raise HTTPException(status_code=422, detail="content_base64 is empty")
-    if len(data) > 120 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="EPUB import is too large")
+    if len(data) > BOOK_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="book import is too large")
     return data
+
+
+def android_import_staging_dir() -> Path:
+    return app_support_books_dir() / ".android-import-staging"
+
+
+def normalize_android_import_headers(request: FastAPIRequest, requested_sha256: str) -> dict[str, Any]:
+    book_hash = str(requested_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", book_hash):
+        raise HTTPException(status_code=422, detail="sha256 path must be 64 hexadecimal characters")
+
+    raw_filename = str(request.headers.get("X-Click-Filename") or "").strip()
+    try:
+        filename = unquote(raw_filename, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=422, detail="X-Click-Filename is not valid UTF-8") from exc
+    if (
+        not filename
+        or len(filename) > 240
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(character) < 32 for character in filename)
+    ):
+        raise HTTPException(status_code=422, detail="X-Click-Filename must be a safe file name")
+
+    source_kind = str(request.headers.get("X-Click-Source-Kind") or "").strip().lower()
+    if source_kind not in {"epub", "pdf"}:
+        raise HTTPException(status_code=422, detail="X-Click-Source-Kind must be epub or pdf")
+    if Path(filename).suffix.lower() != f".{source_kind}":
+        raise HTTPException(status_code=422, detail=f"file name extension must be .{source_kind}")
+
+    raw_byte_size = str(request.headers.get("X-Click-Byte-Size") or "").strip()
+    if not re.fullmatch(r"[0-9]+", raw_byte_size):
+        raise HTTPException(status_code=422, detail="X-Click-Byte-Size must be a positive integer")
+    byte_size = int(raw_byte_size)
+    if byte_size <= 0:
+        raise HTTPException(status_code=422, detail="X-Click-Byte-Size must be greater than zero")
+    if byte_size > BOOK_IMPORT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="book import is too large")
+
+    raw_content_length = str(request.headers.get("Content-Length") or "").strip()
+    if raw_content_length:
+        if not re.fullmatch(r"[0-9]+", raw_content_length):
+            raise HTTPException(status_code=422, detail="Content-Length is invalid")
+        content_length = int(raw_content_length)
+        if content_length > BOOK_IMPORT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="book import is too large")
+        if content_length != byte_size:
+            raise HTTPException(status_code=422, detail="Content-Length does not match X-Click-Byte-Size")
+
+    return {
+        "filename": filename,
+        "source_kind": source_kind,
+        "book_hash": book_hash,
+        "byte_size": byte_size,
+    }
+
+
+async def stage_android_book_upload(
+    request: FastAPIRequest,
+    *,
+    expected_sha256: str,
+    expected_byte_size: int,
+) -> Path:
+    directory = android_import_staging_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.chmod(0o700)
+    except OSError:
+        pass
+    staging_path = directory / f".{expected_sha256}.{uuid4().hex}.part"
+    descriptor = os.open(staging_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    digest = hashlib.sha256()
+    received = 0
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                received += len(chunk)
+                if received > BOOK_IMPORT_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="book import is too large")
+                if received > expected_byte_size:
+                    raise HTTPException(status_code=422, detail="request body exceeds X-Click-Byte-Size")
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if received != expected_byte_size:
+            raise HTTPException(status_code=422, detail="request body size does not match X-Click-Byte-Size")
+        if digest.hexdigest() != expected_sha256:
+            raise HTTPException(status_code=422, detail="request body sha256 does not match URL")
+        return staging_path
+    except BaseException:
+        staging_path.unlink(missing_ok=True)
+        raise
+
+
+def validate_android_epub_upload(path: Path) -> dict[str, Any]:
+    try:
+        with zipfile.ZipFile(path) as epub:
+            members = epub.infolist()
+            if not members or len(members) > ANDROID_EPUB_MAX_ENTRIES:
+                raise HTTPException(status_code=422, detail="EPUB archive has an invalid entry count")
+            if any(member.flag_bits & 0x1 for member in members):
+                raise HTTPException(status_code=422, detail="encrypted EPUB archives are not supported")
+            if any(member.file_size > ANDROID_EPUB_MAX_MEMBER_BYTES for member in members):
+                raise HTTPException(status_code=413, detail="EPUB contains an oversized entry")
+            if sum(member.file_size for member in members) > ANDROID_EPUB_MAX_UNCOMPRESSED_BYTES:
+                raise HTTPException(status_code=413, detail="EPUB expands beyond the safe import limit")
+            names = {member.filename for member in members}
+            if "mimetype" not in names or "META-INF/container.xml" not in names:
+                raise HTTPException(status_code=422, detail="EPUB is missing required container files")
+            if epub.read("mimetype").strip() != b"application/epub+zip":
+                raise HTTPException(status_code=422, detail="EPUB mimetype is invalid")
+        return epub_publication(path)
+    except HTTPException:
+        raise
+    except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, ET.ParseError) as exc:
+        raise HTTPException(status_code=422, detail="invalid EPUB file") from exc
+
+
+def validate_android_pdf_upload(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as source:
+            header = source.read(1024)
+            source.seek(max(0, path.stat().st_size - 65_536))
+            trailer = source.read()
+        if b"%PDF-" not in header or b"%%EOF" not in trailer:
+            raise HTTPException(status_code=422, detail="invalid PDF file")
+        reader = PdfReader(str(path), strict=False)
+        if reader.is_encrypted:
+            raise HTTPException(status_code=422, detail="password-protected PDF import is not supported")
+        if len(reader.pages) <= 0:
+            raise HTTPException(status_code=422, detail="PDF has no readable pages")
+        metadata = reader.metadata
+        return {
+            "title": str(getattr(metadata, "title", "") or "").strip(),
+            "author": str(getattr(metadata, "author", "") or "").strip(),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - parser errors must not expose local staging paths.
+        raise HTTPException(status_code=422, detail="invalid PDF file") from exc
+
+
+def validate_android_book_upload(path: Path, source_kind: str) -> dict[str, Any]:
+    if source_kind == "epub":
+        return validate_android_epub_upload(path)
+    if source_kind == "pdf":
+        return validate_android_pdf_upload(path)
+    raise HTTPException(status_code=422, detail="unsupported book source kind")
+
+
+def atomic_install_import_source(
+    source_path: Path,
+    canonical_path: Path,
+    *,
+    expected_sha256: str,
+    expected_byte_size: int,
+) -> bool:
+    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+    if canonical_path.exists():
+        if (
+            canonical_path.is_file()
+            and canonical_path.stat().st_size == expected_byte_size
+            and file_sha256(canonical_path) == expected_sha256
+        ):
+            return False
+        raise HTTPException(status_code=409, detail="canonical book file conflicts with the uploaded hash")
+
+    pending_path = canonical_path.parent / f".{canonical_path.name}.{uuid4().hex}.importing"
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        descriptor = os.open(pending_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with source_path.open("rb") as source, os.fdopen(descriptor, "wb") as output:
+            while True:
+                chunk = source.read(ANDROID_BOOK_UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if copied != expected_byte_size or digest.hexdigest() != expected_sha256:
+            raise HTTPException(status_code=422, detail="staged book changed before canonical import")
+        os.replace(pending_path, canonical_path)
+        return True
+    finally:
+        pending_path.unlink(missing_ok=True)
+
+
+def canonical_import_library_file(
+    source_path: Path,
+    *,
+    filename: str,
+    source_kind: str,
+    book_hash: str,
+    byte_size: int,
+    title: str,
+    author: Optional[str],
+    library_source: str,
+    library_metadata: Optional[dict[str, Any]] = None,
+    update_existing_book: bool = False,
+    merge_library_metadata: bool = True,
+) -> dict[str, Any]:
+    normalized_kind = str(source_kind or "").strip().lower()
+    if normalized_kind not in {"epub", "pdf"}:
+        raise HTTPException(status_code=422, detail="unsupported book source kind")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(book_hash or "").strip().lower()):
+        raise HTTPException(status_code=422, detail="invalid book sha256")
+    if not source_path.is_file() or byte_size <= 0 or source_path.stat().st_size != byte_size:
+        raise HTTPException(status_code=422, detail="staged book file is incomplete")
+
+    normalized_hash = book_hash.lower()
+    normalized_title = re.sub(r"\s+", " ", str(title or "").strip()) or Path(filename).stem
+    normalized_author = re.sub(r"\s+", " ", str(author or "").strip()) or None
+    canonical_path: Optional[Path] = None
+    created_canonical = False
+    duplicate = False
+    try:
+        with db.connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+                (f"click-book-import:{normalized_hash}",),
+            )
+            book = conn.execute(
+                """
+                INSERT INTO reader.books (
+                  id, title, author, source_kind, book_hash, created_at, updated_at, last_opened_at
+                )
+                VALUES (%s, %s, %s, %s, %s, now(), now(), now())
+                ON CONFLICT (book_hash) DO NOTHING
+                RETURNING *
+                """,
+                (new_id("book"), normalized_title, normalized_author, normalized_kind, normalized_hash),
+            ).fetchone()
+            if not book:
+                duplicate = True
+                book = conn.execute(
+                    "SELECT * FROM reader.books WHERE book_hash=%s FOR UPDATE",
+                    (normalized_hash,),
+                ).fetchone()
+                if not book:
+                    raise RuntimeError("book hash conflict did not resolve to a row")
+                if str(book.get("source_kind") or "").strip().lower() != normalized_kind:
+                    raise HTTPException(status_code=409, detail="book hash already belongs to another source kind")
+                if update_existing_book:
+                    book = conn.execute(
+                        """
+                        UPDATE reader.books
+                        SET title=%s, author=%s, updated_at=now(), last_opened_at=now()
+                        WHERE id=%s
+                        RETURNING *
+                        """,
+                        (normalized_title, normalized_author, book["id"]),
+                    ).fetchone()
+
+            book_dict = dict(book)
+            if normalized_kind == "epub":
+                canonical_path = app_support_books_dir() / normalized_hash / "book.epub"
+            else:
+                original_dir = living_book_bundle_dir(book_dict) / "1_原书"
+                canonical_path = original_dir / living_book_safe_filename(book_dict, Path(filename))
+                if canonical_path.exists() and file_sha256(canonical_path) != normalized_hash:
+                    canonical_path = original_dir / f"{canonical_path.stem}-{normalized_hash[:10]}.pdf"
+
+            created_canonical = atomic_install_import_source(
+                source_path,
+                canonical_path,
+                expected_sha256=normalized_hash,
+                expected_byte_size=byte_size,
+            )
+            conn.execute(
+                """
+                INSERT INTO reader.book_files (id, book_id, file_path, file_kind, file_hash, byte_size)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (book_id, file_path) DO UPDATE
+                SET file_kind=EXCLUDED.file_kind,
+                    file_hash=EXCLUDED.file_hash,
+                    byte_size=EXCLUDED.byte_size
+                """,
+                (
+                    stable_id("file", book["id"], str(canonical_path)),
+                    book["id"],
+                    str(canonical_path),
+                    normalized_kind,
+                    normalized_hash,
+                    byte_size,
+                ),
+            )
+            metadata = {
+                "filename": filename,
+                "owned_internal_copy": True,
+                **dict(library_metadata or {}),
+            }
+            metadata_update = (
+                "reader.library_state.metadata || EXCLUDED.metadata"
+                if merge_library_metadata
+                else "EXCLUDED.metadata"
+            )
+            conn.execute(
+                f"""
+                INSERT INTO reader.library_state (book_id, hidden, source, metadata, created_at, updated_at)
+                VALUES (%s, false, %s, %s, now(), now())
+                ON CONFLICT (book_id) DO UPDATE
+                SET hidden=false,
+                    source=EXCLUDED.source,
+                    metadata={metadata_update},
+                    updated_at=now()
+                """,
+                (book["id"], library_source, db.jsonb(metadata)),
+            )
+    except BaseException:
+        if created_canonical and canonical_path is not None:
+            canonical_path.unlink(missing_ok=True)
+        raise
+
+    if canonical_path is None:
+        raise RuntimeError("canonical book path was not created")
+    return {
+        "book": jsonable(dict(book)),
+        "file_path": str(canonical_path),
+        "file_hash": normalized_hash,
+        "byte_size": byte_size,
+        "source_kind": normalized_kind,
+        "duplicate": duplicate,
+    }
 
 
 def import_library_epub(payload: LibraryImport) -> dict[str, Any]:
@@ -5194,65 +10287,173 @@ def import_library_epub(payload: LibraryImport) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="only EPUB import is supported")
     data = decode_library_import_base64(payload.content_base64)
     book_hash = hashlib.sha256(data).hexdigest()
-    root = app_support_books_dir() / book_hash
-    root.mkdir(parents=True, exist_ok=True)
-    epub_path = root / "book.epub"
-    epub_path.write_bytes(data)
-    try:
-        publication = epub_publication(epub_path)
-    except HTTPException:
-        epub_path.unlink(missing_ok=True)
-        raise
-    title = (payload.title or publication.get("title") or Path(filename).stem).strip() or Path(filename).stem
-    author = (payload.author or publication.get("author") or "").strip() or None
-    book_id = new_id("book")
+    with tempfile.TemporaryDirectory(prefix="click-epub-import-") as temp_dir:
+        source_path = Path(temp_dir) / "source.epub"
+        source_path.write_bytes(data)
+        publication = epub_publication(source_path)
+        title = (payload.title or publication.get("title") or Path(filename).stem).strip() or Path(filename).stem
+        author = (payload.author or publication.get("author") or "").strip() or None
+        imported = canonical_import_library_file(
+            source_path,
+            filename=filename,
+            source_kind="epub",
+            book_hash=book_hash,
+            byte_size=len(data),
+            title=title,
+            author=author,
+            library_source="library_web_import",
+            library_metadata=(
+                {
+                    "bibliographic_override": {
+                        "title": title,
+                        "author": author,
+                        "source": "explicit_library_import_metadata",
+                        "evidence": "library import request",
+                        "updated_at": now_iso(),
+                    }
+                }
+                if payload.title is not None or payload.author is not None
+                else None
+            ),
+            update_existing_book=True,
+            merge_library_metadata=False,
+        )
+    living_book = generate_living_book_bundle(str(imported["book"]["id"]))
+    return {
+        "ok": True,
+        "schema": "sentence_reader.library_import.v1",
+        "book": imported["book"],
+        "file_path": imported["file_path"],
+        "owned_internal_copy": True,
+        "original_source_can_be_deleted": True,
+        "living_book": living_book,
+    }
+
+
+def import_library_pdf(payload: LibraryImport) -> dict[str, Any]:
+    filename = Path(payload.filename).name
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=422, detail="PDF filename must end with .pdf")
+    data = decode_library_import_base64(payload.content_base64)
+    book_hash = hashlib.sha256(data).hexdigest()
+    with tempfile.TemporaryDirectory(prefix="click-pdf-import-") as temp_dir:
+        source_path = Path(temp_dir) / "source.pdf"
+        source_path.write_bytes(data)
+        preflight = inspect_pdf(source_path)
+        if preflight.get("document_profile") == "invalid":
+            raise HTTPException(status_code=422, detail="invalid PDF file")
+        title = (payload.title or preflight.get("title") or Path(filename).stem).strip() or Path(filename).stem
+        author = (payload.author or preflight.get("author") or "").strip() or None
+        imported = canonical_import_library_file(
+            source_path,
+            filename=filename,
+            source_kind="pdf",
+            book_hash=book_hash,
+            byte_size=len(data),
+            title=title,
+            author=author,
+            library_source="library_web_pdf_import",
+            library_metadata={
+                "canonical_asset_owner": "knowledge_base_living_book",
+                "pdf_profile": preflight.get("document_profile"),
+            },
+            update_existing_book=True,
+            merge_library_metadata=True,
+        )
+    living_book = generate_living_book_bundle(str(imported["book"]["id"]))
+    return {
+        "ok": True,
+        "schema": "sentence_reader.library_import.v1",
+        "book": imported["book"],
+        "file_path": imported["file_path"],
+        "canonical_source_file": imported["file_path"],
+        "owned_internal_copy": True,
+        "canonical_asset_owner": "knowledge_base_living_book",
+        "original_source_can_be_deleted": True,
+        "pdf_preflight": {key: value for key, value in preflight.items() if key != "source_file"},
+        "living_book": living_book,
+    }
+
+
+def import_library_book(payload: LibraryImport) -> dict[str, Any]:
+    suffix = Path(payload.filename).suffix.lower()
+    if suffix == ".epub":
+        return import_library_epub(payload)
+    if suffix == ".pdf":
+        return import_library_pdf(payload)
+    raise HTTPException(status_code=422, detail="only EPUB and PDF import are supported")
+
+
+def library_bibliographic_override(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    value = metadata.get("bibliographic_override")
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def update_library_book_metadata(book_id: str, payload: LibraryMetadataPatch) -> dict[str, Any]:
+    if payload.title is None and payload.author is None:
+        raise HTTPException(status_code=422, detail="title or author is required")
+    source = re.sub(r"\s+", " ", str(payload.source or "user_confirmed").strip()) or "user_confirmed"
+    evidence = re.sub(r"\s+", " ", str(payload.evidence or "").strip()) or None
     with db.connect() as conn:
-        book = conn.execute(
+        row = conn.execute(
             """
-            INSERT INTO reader.books (id, title, author, source_kind, book_hash, created_at, updated_at, last_opened_at)
-            VALUES (%s, %s, %s, %s, %s, now(), now(), now())
-            ON CONFLICT (book_hash) DO UPDATE
-            SET title = EXCLUDED.title,
-                author = EXCLUDED.author,
-                updated_at = now(),
-                last_opened_at = now()
+            SELECT b.*, COALESCE(ls.metadata, '{}'::jsonb) AS library_metadata
+            FROM reader.books b
+            LEFT JOIN reader.library_state ls ON ls.book_id=b.id
+            WHERE b.id=%s
+            FOR UPDATE OF b
+            """,
+            (book_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="book not found")
+        current = dict(row)
+        title = (
+            re.sub(r"\s+", " ", str(payload.title).strip())
+            if payload.title is not None
+            else str(current.get("title") or "").strip()
+        )
+        author = (
+            re.sub(r"\s+", " ", str(payload.author).strip()) or None
+            if payload.author is not None
+            else (str(current.get("author") or "").strip() or None)
+        )
+        if not title:
+            raise HTTPException(status_code=422, detail="title cannot be empty")
+        updated = conn.execute(
+            """
+            UPDATE reader.books
+            SET title=%s, author=%s, updated_at=now()
+            WHERE id=%s
             RETURNING *
             """,
-            (book_id, title, author, "epub", book_hash),
+            (title, author, book_id),
         ).fetchone()
-        conn.execute(
-            """
-            INSERT INTO reader.book_files (id, book_id, file_path, file_kind, file_hash, byte_size)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (book_id, file_path) DO UPDATE
-            SET file_hash = EXCLUDED.file_hash,
-                byte_size = EXCLUDED.byte_size
-            """,
-            (new_id("file"), book["id"], str(epub_path), "epub", book_hash, len(data)),
-        )
+        metadata = dict(current.get("library_metadata") or {})
+        metadata["bibliographic_override"] = {
+            "title": title,
+            "author": author,
+            "source": source,
+            "evidence": evidence,
+            "updated_at": now_iso(),
+        }
         conn.execute(
             """
             INSERT INTO reader.library_state (book_id, hidden, source, metadata, created_at, updated_at)
             VALUES (%s, false, %s, %s, now(), now())
             ON CONFLICT (book_id) DO UPDATE
-            SET hidden = false,
-                source = EXCLUDED.source,
-                metadata = EXCLUDED.metadata,
-                updated_at = now()
+            SET metadata=EXCLUDED.metadata,
+                updated_at=now()
             """,
-            (
-                book["id"],
-                "library_web_import",
-                db.jsonb({"filename": filename, "owned_internal_copy": True}),
-            ),
+            (book_id, "bibliographic_metadata_patch", db.jsonb(metadata)),
         )
     return {
         "ok": True,
-        "schema": "sentence_reader.library_import.v1",
-        "book": jsonable(dict(book)),
-        "file_path": str(epub_path),
-        "owned_internal_copy": True,
-        "original_source_can_be_deleted": True,
+        "schema": "sentence_reader.library_metadata.v1",
+        "book": jsonable(dict(updated)),
+        "bibliographic_override": metadata["bibliographic_override"],
     }
 
 
@@ -5275,12 +10476,30 @@ def sync_owned_epub_library() -> dict[str, Any]:
             errors.append({"path": str(epub_path), "reason": str(exc.detail)})
             continue
 
-        title = str(publication.get("title") or epub_path.parent.name).strip() or epub_path.parent.name
-        author = str(publication.get("author") or "").strip() or None
+        publication_title = str(publication.get("title") or epub_path.parent.name).strip() or epub_path.parent.name
+        publication_author = str(publication.get("author") or "").strip() or None
         byte_size = epub_path.stat().st_size
         book_hash = root_name
         book_id = stable_id("book", "owned-epub", book_hash)
         with db.connect() as conn:
+            existing = conn.execute(
+                """
+                SELECT b.title, b.author, COALESCE(ls.metadata, '{}'::jsonb) AS library_metadata
+                FROM reader.books b
+                LEFT JOIN reader.library_state ls ON ls.book_id=b.id
+                WHERE b.book_hash=%s
+                """,
+                (book_hash,),
+            ).fetchone()
+            override = library_bibliographic_override(
+                dict(existing).get("library_metadata") if existing else {}
+            )
+            title = str(override.get("title") or publication_title).strip() or publication_title
+            author = (
+                str(override.get("author") or "").strip() or None
+                if "author" in override
+                else publication_author
+            )
             book = conn.execute(
                 """
                 INSERT INTO reader.books (id, title, author, source_kind, book_hash, created_at, updated_at, last_opened_at)
@@ -5319,6 +10538,10 @@ def sync_owned_epub_library() -> dict[str, Any]:
                     db.jsonb({"owned_internal_copy": True, "root_name": root_name, "scan_path": str(epub_path)}),
                 ),
             )
+        try:
+            generate_living_book_bundle(str(book["id"]))
+        except Exception as exc:  # noqa: BLE001 - keep the owned EPUB even when its sidecar needs repair.
+            errors.append({"path": str(epub_path), "reason": f"living_book_base_bundle: {exc}"})
         imported += 1
 
     return {"scanned": imported + skipped, "imported": imported, "skipped": skipped, "errors": errors}
@@ -5397,7 +10620,12 @@ def set_library_books_hidden(book_ids: list[str], *, hidden: bool, source: str) 
     }
 
 
-def update_library_book_organization(book_id: str, payload: LibraryOrganizationPatch) -> dict[str, Any]:
+def update_library_book_organization(
+    book_id: str,
+    payload: LibraryOrganizationPatch,
+    *,
+    source: str = "library_web_organization",
+) -> dict[str, Any]:
     book = book_with_latest_file(book_id)
     with db.connect() as conn:
         current = conn.execute(
@@ -5436,7 +10664,7 @@ def update_library_book_organization(book_id: str, payload: LibraryOrganizationP
                 updated_at = now()
             RETURNING *
             """,
-            (book_id, "library_web_organization", db.jsonb(metadata)),
+            (book_id, source, db.jsonb(metadata)),
         ).fetchone()
     return {
         "ok": True,
@@ -5576,9 +10804,9 @@ def library_page_html() -> str:
       <div class="brand"><div class="brand-mark">C</div><div><strong>Click</strong><span>本地书库</span></div></div>
       <nav class="nav" id="nav"></nav>
       <div class="drop">
-        <strong>导入 EPUB</strong>
+        <strong>导入 EPUB / PDF</strong>
         <div class="muted">文件会复制到 Mac 内部书库，原文件可删除。</div>
-        <input id="fileInput" type="file" accept=".epub,application/epub+zip" style="margin-top:10px">
+        <input id="fileInput" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf" style="margin-top:10px">
       </div>
     </aside>
     <main class="main">
@@ -5679,7 +10907,7 @@ def library_page_html() -> str:
       $('listTitle').textContent = state.filter === 'notes' ? '有笔记的书' : state.filter === 'red' ? '有红标的书' : state.filter === 'recent' ? '最近阅读' : '全部书籍';
       $('listCount').textContent = `${books.length} 本`;
       if (!books.length) {
-        $('books').innerHTML = `<div class="panel" style="padding:18px">没有匹配的书。可以导入 EPUB，或者换一个筛选条件。</div>`;
+        $('books').innerHTML = `<div class="panel" style="padding:18px">没有匹配的书。可以导入 EPUB 或 PDF，或者换一个筛选条件。</div>`;
         return;
       }
       $('books').innerHTML = books.map((book) => `
@@ -5688,7 +10916,7 @@ def library_page_html() -> str:
           <div class="book-title">${esc(book.title || book.id)}</div>
           <div class="book-meta">${esc(book.author || '未知作者')}</div>
           <div class="progress"><i style="width:${book.progress.percent}%"></i></div>
-          <div class="book-meta">${book.progress.percent}% · ${book.status.lan_available ? '可阅读' : '文件不可用'}</div>
+          <div class="book-meta">${book.progress.percent}% · ${book.reader_capabilities?.mac_native ? 'Mac 可阅读' : (book.status.lan_available ? '可阅读' : '文件不可用')}</div>
           <div class="badges">
             <span class="badge">${book.counts.notes} 笔记</span>
             <span class="badge red">${book.counts.red_highlights} 红标</span>
@@ -5705,7 +10933,7 @@ def library_page_html() -> str:
     function renderDetail() {
       const book = state.selected || state.books[0];
       if (!book) {
-        $('detail').innerHTML = `<h2>还没有书</h2><p class="muted">先导入一本 EPUB。</p>`;
+        $('detail').innerHTML = `<h2>还没有书</h2><p class="muted">先导入一本 EPUB 或 PDF。</p>`;
         return;
       }
       state.selected = book;
@@ -5719,7 +10947,7 @@ def library_page_html() -> str:
           <div><b>${book.counts.red_highlights}</b><span>红标</span></div>
         </div>
         <div class="detail-actions">
-          <button class="primary" id="continue" ${book.status.lan_available ? '' : 'disabled'}>继续阅读</button>
+          <button class="primary" id="continue" ${(isMacAppSurface() && book.reader_capabilities?.mac_native) || book.status.lan_available ? '' : 'disabled'}>继续阅读</button>
           <button id="showNotes">看笔记</button>
           <button id="showRed">看红标</button>
           <button id="reveal">显示副本</button>
@@ -5765,13 +10993,13 @@ def library_page_html() -> str:
       let binary = '';
       const bytes = new Uint8Array(buffer);
       for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      toast('正在导入 EPUB...');
+      toast('正在导入书籍...');
       await api('/api/library/import', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({ filename:file.name, content_base64:btoa(binary) })
       });
-      toast('导入完成，原 EPUB 可删除');
+      toast('导入完成，原文件可删除');
       await loadDashboard();
     }
     $('search').oninput = (event) => { state.query = event.target.value; renderBooks(); };
@@ -6625,83 +11853,113 @@ def library_page_html_v2() -> str:
   <style>
     :root {
       color-scheme: dark;
-      --bg:#070806; --surface:#0f110d; --panel:#151711; --panel-2:#20231a;
-      --line:#323829; --text:#f7f2e7; --muted:#a9a995; --soft:#ddd4b7;
-      --accent:#e4b453; --jade:#79b88b; --cyan:#7db9c4; --coral:#d9856a; --green:#8fbe7a; --danger:#e9786b;
-      --shadow:0 28px 90px rgba(0,0,0,.42);
+      --bg:#000; --surface:#1c1c1e; --panel:#171719; --panel-2:#2c2c2e;
+      --line:rgba(255,255,255,.1); --text:#f5f5f7; --muted:#98989d; --soft:#d1d1d6;
+      --accent:#0a84ff; --jade:#64d2ff; --cyan:#64d2ff; --coral:#ff9f0a; --green:#30d158; --danger:#ff453a;
+      --shadow:0 16px 42px rgba(0,0,0,.34);
     }
     * { box-sizing:border-box; }
-    html, body { margin:0; min-height:100%; background:linear-gradient(180deg,#0b0c08 0,#070806 46%,#050604 100%); color:var(--text); font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+    html, body { margin:0; min-height:100%; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",system-ui,sans-serif; }
     body { overflow-x:hidden; }
     button, input, select { font:inherit; }
-    button { border:0; border-radius:8px; background:var(--panel-2); color:var(--text); padding:9px 12px; cursor:pointer; min-height:38px; }
-    button:hover { background:#2a2f23; }
-    button.primary { background:linear-gradient(135deg,var(--accent),#f0cf75); color:#17120a; font-weight:800; }
+    button { border:0; border-radius:9px; background:var(--panel-2); color:var(--text); padding:8px 12px; cursor:pointer; min-height:36px; }
+    button:hover { background:#3a3a3c; }
+    button.primary { background:var(--accent); color:white; font-weight:700; }
     button.ghost { background:transparent; color:var(--soft); }
-    button.subtle { background:#15160f; border:1px solid var(--line); color:var(--soft); }
+    button.subtle { background:rgba(255,255,255,.065); border:1px solid var(--line); color:var(--soft); }
     button.danger { background:rgba(233,120,107,.12); color:#ffb5aa; border:1px solid rgba(233,120,107,.35); }
     button:disabled { opacity:.46; cursor:default; }
-    input, select { width:100%; border:1px solid var(--line); background:#10110c; color:var(--text); border-radius:8px; padding:10px 12px; outline:none; }
-    input:focus, select:focus { border-color:rgba(215,168,79,.75); box-shadow:0 0 0 3px rgba(215,168,79,.12); }
-    .app-shell { min-height:100vh; display:grid; grid-template-columns:232px minmax(0,1fr); }
-    .sidebar { border-right:1px solid var(--line); background:linear-gradient(180deg,#11130d,#090a07); padding:22px 15px; position:sticky; top:0; height:100vh; }
-    .brand { margin-bottom:22px; }
-    .brand strong { display:block; font-size:22px; line-height:1.1; letter-spacing:0; }
-    .nav { display:grid; gap:7px; }
-    .nav button { width:100%; display:flex; align-items:center; justify-content:space-between; background:transparent; color:var(--soft); text-align:left; }
-    .nav button.active { background:#222719; color:var(--text); box-shadow:inset 3px 0 0 var(--accent); }
+    input, select { width:100%; border:1px solid var(--line); background:rgba(255,255,255,.08); color:var(--text); border-radius:10px; padding:9px 12px; outline:none; }
+    input:focus, select:focus { border-color:rgba(10,132,255,.7); box-shadow:0 0 0 3px rgba(10,132,255,.16); }
+    .app-shell { min-height:100vh; display:grid; grid-template-columns:248px minmax(0,1fr); }
+    .sidebar { border-right:1px solid var(--line); background:rgba(28,28,30,.94); padding:24px 13px; position:sticky; top:0; height:100vh; backdrop-filter:blur(28px) saturate(1.25); }
+    .brand { margin:4px 10px 24px; }
+    .brand strong { display:block; font-size:19px; line-height:1.2; letter-spacing:-.2px; }
+    .brand span { display:block; color:var(--muted); font-size:12px; margin-top:5px; }
+    .nav { display:grid; gap:4px; }
+    .nav button { width:100%; display:grid; grid-template-columns:22px minmax(0,1fr) auto; gap:10px; align-items:center; background:transparent; color:var(--soft); text-align:left; font-weight:600; }
+    .nav button.active { background:rgba(10,132,255,.24); color:white; }
+    .nav-symbol { width:18px; height:18px; display:grid; place-items:center; color:inherit; }
+    .nav-symbol svg { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round; }
+    .nav-count { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+    .nav button.active .nav-count { color:rgba(255,255,255,.72); }
     .side-action { margin-top:18px; display:grid; gap:8px; }
-    .main { min-width:0; padding:22px 28px 42px; }
-    .topbar { display:grid; grid-template-columns:minmax(260px,1fr) auto auto auto; gap:10px; align-items:center; margin-bottom:18px; }
-    .status-pill { display:inline-flex; align-items:center; gap:7px; color:#cfe6c7; background:rgba(135,182,122,.12); border:1px solid rgba(135,182,122,.28); border-radius:999px; padding:8px 11px; font-size:12px; }
+    .main { min-width:0; padding:0 32px 48px; }
+    .topbar { position:sticky; top:0; z-index:20; display:grid; grid-template-columns:minmax(260px,560px) auto auto; justify-content:end; gap:9px; align-items:center; margin:0 -10px 8px; padding:16px 10px 12px; background:rgba(0,0,0,.78); backdrop-filter:blur(24px) saturate(1.3); }
+    .topbar input { border-radius:10px; background:rgba(118,118,128,.22); }
+    .status-pill { display:inline-flex; align-items:center; gap:7px; color:var(--muted); background:transparent; border:0; border-radius:999px; padding:8px 5px; font-size:12px; }
     .status-dot { width:7px; height:7px; border-radius:50%; background:var(--green); }
     .view { display:none; }
     .view.active { display:block; }
-    .section-head { display:flex; align-items:end; justify-content:space-between; gap:12px; margin:18px 0 12px; }
+    .section-head { display:flex; align-items:end; justify-content:space-between; gap:12px; margin:22px 0 14px; }
     .section-head h1, .section-head h2 { margin:0; letter-spacing:0; }
-    .section-head h1 { font-size:25px; }
+    .section-head h1 { font-size:28px; letter-spacing:-.5px; }
     .section-head h2 { font-size:18px; }
     .section-head p { margin:5px 0 0; color:var(--muted); font-size:13px; }
-    .continue-hero { min-height:380px; border:1px solid rgba(228,180,83,.22); border-radius:8px; background:radial-gradient(circle at 18% 15%,rgba(228,180,83,.16),transparent 28%),radial-gradient(circle at 82% 28%,rgba(125,185,196,.12),transparent 30%),linear-gradient(135deg,#171a10,#0d100b 62%,#050604); display:grid; grid-template-columns:minmax(210px,270px) minmax(0,1fr); gap:30px; padding:28px; box-shadow:var(--shadow); overflow:hidden; }
+    .continue-hero { min-height:330px; border:1px solid rgba(228,180,83,.22); border-radius:8px; background:radial-gradient(circle at 18% 15%,rgba(228,180,83,.16),transparent 28%),radial-gradient(circle at 82% 28%,rgba(125,185,196,.12),transparent 30%),linear-gradient(135deg,#171a10,#0d100b 62%,#050604); display:grid; grid-template-columns:minmax(180px,230px) minmax(0,1fr); gap:28px; padding:24px; box-shadow:var(--shadow); overflow:hidden; }
     .hero-copy { min-width:0; display:flex; flex-direction:column; justify-content:center; max-width:780px; }
     .eyebrow { color:var(--accent); font-size:12px; letter-spacing:1px; text-transform:uppercase; font-weight:900; }
-    .hero-title { font-size:38px; line-height:1.13; margin:10px 0 8px; word-break:break-word; max-width:760px; }
+    .hero-title { font-size:38px; line-height:1.13; margin:10px 0 8px; word-break:break-word; max-width:760px; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
     .hero-meta { color:var(--muted); font-size:14px; }
     .hero-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
-    .hero-manifest { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:20px; }
-    .manifest-item { border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.04); border-radius:8px; padding:10px 11px; min-width:0; }
-    .manifest-item strong { display:block; font-size:15px; line-height:1.25; color:var(--text); }
-    .manifest-item span { display:block; margin-top:4px; color:var(--muted); font-size:12px; line-height:1.35; }
-    .cover-frame { position:relative; width:100%; aspect-ratio:3/4; border-radius:8px; overflow:hidden; background:#171914; border:1px solid rgba(255,255,255,.09); box-shadow:0 22px 58px rgba(0,0,0,.48); }
+    .cover-frame { position:relative; width:100%; aspect-ratio:.72; border-radius:12px; overflow:hidden; background:#1c1c1e; border:1px solid rgba(255,255,255,.08); box-shadow:0 12px 28px rgba(0,0,0,.28); }
     .cover-frame[data-open-book] { cursor:pointer; }
     .cover-frame[data-open-book]:focus { outline:2px solid rgba(228,180,83,.65); outline-offset:3px; }
     .cover-frame img { width:100%; height:100%; object-fit:cover; display:block; }
-    .cover-frame.hero-cover { align-self:center; min-height:300px; }
+    .cover-frame.hero-cover { align-self:center; min-height:270px; }
     .cover-frame.hero-cover::after { content:""; position:absolute; inset:0; background:linear-gradient(180deg,rgba(0,0,0,.02) 25%,rgba(0,0,0,.42) 100%); pointer-events:none; }
     .cover-frame.small { width:92px; flex:0 0 92px; }
     .cover-phrases { position:absolute; z-index:2; left:14px; right:14px; bottom:14px; display:grid; gap:7px; }
     .cover-phrases span { display:block; border:1px solid rgba(255,255,255,.16); background:rgba(7,8,6,.68); color:#f9f2dc; border-radius:999px; padding:7px 10px; font-size:13px; line-height:1.1; font-weight:900; text-align:center; backdrop-filter:blur(8px); }
     .cover-phrases span:nth-child(2) { color:#cceee0; }
     .cover-phrases span:nth-child(3) { color:#f6d28a; }
-    .progress { height:8px; background:#2a2b22; border-radius:999px; overflow:hidden; margin-top:16px; }
-    .progress i { display:block; height:100%; background:linear-gradient(90deg,var(--accent),var(--green)); width:0; }
+    .progress { height:3px; background:rgba(255,255,255,.14); border-radius:999px; overflow:hidden; margin-top:9px; }
+    .progress i { display:block; height:100%; background:var(--accent); width:0; }
     .rail { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(150px, 190px); gap:12px; overflow:auto; padding-bottom:4px; }
-    .book-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(178px,1fr)); gap:14px; }
-    .book-card { position:relative; min-width:0; text-align:left; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; transition:border-color .12s ease, background .12s ease; }
-    .book-card:hover, .book-card:focus { border-color:rgba(215,168,79,.62); background:#1c1d16; outline:none; }
-    .book-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px rgba(228,180,83,.25); }
+    .book-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(142px,190px)); gap:28px 22px; align-items:start; }
+    .book-card { position:relative; min-width:0; text-align:left; background:transparent; border:0; border-radius:14px; padding:0; transition:transform .14s ease, opacity .14s ease; }
+    .book-card:hover, .book-card:focus { transform:translateY(-2px); outline:none; }
+    .book-card:focus .cover-frame { box-shadow:0 0 0 3px rgba(10,132,255,.55),0 12px 28px rgba(0,0,0,.28); }
+    .book-card.selected .cover-frame { box-shadow:0 0 0 3px var(--accent),0 12px 28px rgba(0,0,0,.28); }
+    .book-card.opening { opacity:.62; pointer-events:none; }
     .book-card .cover-frame { margin-bottom:10px; }
-    .book-title { font-weight:800; line-height:1.32; min-height:39px; word-break:break-word; }
-    .book-meta { color:var(--muted); font-size:12px; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .book-title { font-weight:650; font-size:14px; line-height:1.34; min-height:38px; word-break:break-word; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; }
+    .book-meta { color:var(--muted); font-size:12px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .book-row { display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap; }
     .badge { font-size:11px; color:var(--soft); border:1px solid var(--line); border-radius:999px; padding:3px 7px; background:#11120f; }
     .badge.state { color:#11120f; background:var(--jade); border-color:var(--jade); font-weight:800; }
     .badge.red { color:#ffc1b7; border-color:rgba(217,133,106,.4); }
     .card-check { display:none; position:absolute; z-index:4; left:12px; top:12px; width:18px; height:18px; accent-color:var(--accent); }
     .book-card.selectable .card-check { display:block; }
-    .card-secondary { margin-top:10px; padding-top:9px; border-top:1px solid rgba(255,255,255,.07); display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
-    .card-action { padding:5px 6px; min-height:30px; background:transparent; border:1px solid rgba(255,255,255,.08); color:var(--muted); font-size:12px; }
-    .card-action:hover { color:var(--text); border-color:rgba(228,180,83,.32); background:rgba(228,180,83,.06); }
+    .card-secondary { position:absolute; z-index:4; right:8px; top:8px; display:flex; opacity:0; transition:opacity .12s ease; }
+    .book-card:hover .card-secondary, .book-card:focus-within .card-secondary { opacity:1; }
+    .card-action { width:30px; height:30px; min-height:30px; padding:0; border-radius:50%; background:rgba(20,20,22,.74); border:1px solid rgba(255,255,255,.16); color:white; font-size:13px; backdrop-filter:blur(12px); }
+    .card-action:hover { color:white; border-color:rgba(255,255,255,.3); background:rgba(50,50,52,.9); }
+    .shelf-header { display:flex; align-items:center; justify-content:space-between; gap:18px; padding-top:10px; }
+    .shelf-header h1 { margin:0; font-size:31px; letter-spacing:-.7px; }
+    .shelf-header p { margin:5px 0 0; color:var(--muted); font-size:13px; }
+    .scope-tabs { width:min(380px,100%); display:grid; grid-template-columns:repeat(3,1fr); gap:2px; padding:3px; margin:20px 0 24px; border-radius:9px; background:rgba(118,118,128,.24); }
+    .scope-tabs button { min-height:29px; padding:4px 12px; border-radius:7px; background:transparent; color:var(--soft); font-size:13px; }
+    .scope-tabs button.active { background:#636366; color:white; box-shadow:0 1px 4px rgba(0,0,0,.35); }
+    .folder-breadcrumb { min-height:0; margin:0 0 14px; }
+    .folder-breadcrumb:empty { display:none; }
+    .folder-back { display:inline-flex; align-items:center; gap:7px; min-height:32px; padding:4px 8px; background:transparent; color:var(--accent); }
+    .shelf-section { margin:0 0 28px; }
+    .shelf-section.hidden { display:none; }
+    .shelf-section-title { display:flex; align-items:center; justify-content:space-between; margin:0 0 13px; }
+    .shelf-section-title h2 { margin:0; font-size:18px; letter-spacing:-.2px; }
+    .shelf-section-title span { color:var(--muted); font-size:12px; }
+    .folder-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(178px,214px)); gap:24px 22px; }
+    .folder-card { min-width:0; padding:0; background:transparent; text-align:left; color:var(--text); }
+    .folder-card:hover { background:transparent; }
+    .folder-preview { aspect-ratio:1.02; display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:12px; border-radius:18px; background:rgba(10,132,255,.12); border:1px solid rgba(10,132,255,.16); transition:background .14s ease, transform .14s ease; }
+    .folder-card:hover .folder-preview, .folder-card:focus .folder-preview { background:rgba(10,132,255,.2); transform:translateY(-2px); }
+    .folder-preview .cover-frame { aspect-ratio:.78; border-radius:7px; box-shadow:0 5px 12px rgba(0,0,0,.25); }
+    .folder-placeholder { border-radius:7px; background:rgba(255,255,255,.06); }
+    .folder-label { display:flex; align-items:center; gap:7px; margin-top:10px; font-weight:650; font-size:14px; line-height:1.3; }
+    .folder-label svg { width:16px; height:16px; fill:var(--accent); }
+    .folder-count { margin:3px 0 0 23px; color:var(--muted); font-size:12px; }
+    .home-empty { grid-column:1 / -1; min-height:240px; display:grid; place-items:center; text-align:center; }
     .toolbar { display:grid; grid-template-columns:minmax(180px,1fr) 140px 140px auto auto; gap:10px; margin-bottom:14px; align-items:center; }
     .batchbar { display:none; align-items:center; justify-content:space-between; gap:10px; border:1px solid rgba(215,168,79,.3); background:rgba(215,168,79,.09); border-radius:10px; padding:10px 12px; margin-bottom:12px; }
     .batchbar.show { display:flex; }
@@ -6738,26 +11996,21 @@ def library_page_html_v2() -> str:
     .toast.show { opacity:1; pointer-events:auto; }
     .toast button { min-height:30px; padding:5px 9px; }
     @media (max-width: 980px) {
-      .app-shell { grid-template-columns:1fr; }
-      .sidebar { position:static; height:auto; border-right:0; border-bottom:1px solid var(--line); }
-      .nav { grid-template-columns:repeat(5,minmax(0,1fr)); }
+      .app-shell { grid-template-columns:210px minmax(0,1fr); }
       .topbar, .toolbar { grid-template-columns:1fr 1fr; }
-      .continue-hero { grid-template-columns:160px minmax(0,1fr); }
-      .hero-title { font-size:32px; }
-      .hero-manifest { grid-template-columns:1fr; }
+      .main { padding-left:22px; padding-right:22px; }
     }
     @media (max-width: 640px) {
       .main { padding:14px 12px 24px; }
-      .nav { grid-template-columns:1fr 1fr; }
       .topbar, .toolbar { grid-template-columns:1fr; }
       .continue-hero { grid-template-columns:1fr; padding:18px; gap:18px; }
       .continue-hero .cover-frame { max-width:190px; min-height:252px; }
       .hero-title { font-size:28px; }
-      .hero-manifest { grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-top:14px; }
-      .manifest-item { padding:8px 6px; text-align:center; }
-      .manifest-item strong { font-size:13px; }
-      .manifest-item span { display:none; }
-      .card-secondary { grid-template-columns:1fr; }
+      .app-shell { grid-template-columns:1fr; }
+      .sidebar { position:static; height:auto; border-right:0; border-bottom:1px solid var(--line); }
+      .nav { grid-template-columns:repeat(5,minmax(0,1fr)); }
+      .nav button { grid-template-columns:1fr; justify-items:center; gap:4px; font-size:11px; }
+      .nav-count { display:none; }
       .book-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
     }
   </style>
@@ -6765,27 +12018,38 @@ def library_page_html_v2() -> str:
 <body>
   <div class="app-shell" data-library-v2="true" data-native-reader-contract="sentence-reader://open-native">
     <aside class="sidebar">
-      <div class="brand"><strong>Click</strong></div>
+      <div class="brand"><strong>Click</strong><span>本地精读</span></div>
       <nav class="nav" id="nav"></nav>
-      <div class="side-action">
-        <button class="subtle" data-view-jump="settings">状态与设置</button>
-      </div>
     </aside>
     <main class="main">
       <div class="topbar">
-        <input id="search" placeholder="搜索书名、作者、分类、标签、笔记、红标">
+        <input id="search" placeholder="搜索书名或作者">
         <span class="status-pill"><i class="status-dot"></i><span id="serviceStatus">正在连接</span></span>
-        <button class="subtle" id="refresh">刷新</button>
-        <button class="primary" id="topImport">导入</button>
+        <button class="subtle" id="refresh" aria-label="刷新" title="刷新">↻</button>
       </div>
 
       <section id="homeView" class="view active" data-product-home="true">
-        <div class="section-head"><div><h1>继续阅读</h1><p>封面、原句、单词本在同一个工作台里。</p></div></div>
-        <section id="continueHero" class="continue-hero"></section>
-        <div class="section-head"><div><h2>最近阅读</h2><p>点击封面直接进入正文。</p></div><button class="ghost" data-view-jump="library">全部书籍</button></div>
-        <section id="recentRail" class="rail"></section>
-        <div class="section-head"><div><h2>最近沉淀</h2><p>最近写下的笔记和红标。</p></div></div>
-        <section id="recentAssets" class="asset-list"></section>
+        <header class="shelf-header">
+          <div><h1 id="shelfTitle">阅读</h1><p id="shelfSubtitle">打开封面继续阅读，整理功能收在需要时出现。</p></div>
+          <div>
+            <button class="subtle" id="homeManage">整理</button>
+            <button class="primary" id="topImport" aria-label="导入书籍">＋</button>
+          </div>
+        </header>
+        <div class="scope-tabs" role="tablist" aria-label="书架范围">
+          <button class="active" data-library-scope="all" role="tab">全部</button>
+          <button data-library-scope="recent" role="tab">最近</button>
+          <button data-library-scope="favorites" role="tab">收藏</button>
+        </div>
+        <div id="folderBreadcrumb" class="folder-breadcrumb"></div>
+        <section id="folderSection" class="shelf-section">
+          <div class="shelf-section-title"><h2>文件夹</h2><span id="folderCount"></span></div>
+          <div id="homeFolderGrid" class="folder-grid"></div>
+        </section>
+        <section id="homeBookSection" class="shelf-section">
+          <div class="shelf-section-title"><h2 id="homeBookTitle">未整理</h2><span id="homeBookCount"></span></div>
+          <div id="homeBookGrid" class="book-grid"></div>
+        </section>
       </section>
 
       <section id="libraryView" class="view">
@@ -6837,7 +12101,7 @@ def library_page_html_v2() -> str:
       </section>
 
       <section id="settingsView" class="view">
-        <div class="section-head"><div><h1>设置</h1><p>日常阅读之外的状态和恢复入口。</p></div></div>
+        <div class="section-head"><div><h1>设置</h1><p>恢复和连接信息。</p></div></div>
         <section id="settingsPanel" class="asset-list"></section>
       </section>
     </main>
@@ -6846,10 +12110,10 @@ def library_page_html_v2() -> str:
   <aside id="drawer" class="drawer" aria-hidden="true"></aside>
   <div id="removeModal" class="modal-backdrop" aria-hidden="true"></div>
   <div id="orgModal" class="modal-backdrop" aria-hidden="true"></div>
-  <input id="fileInput" type="file" accept=".epub,application/epub+zip" hidden>
+  <input id="fileInput" type="file" accept=".epub,.pdf,application/epub+zip,application/pdf" hidden>
   <div id="toast" class="toast"></div>
   <script>
-    const state = { dashboard:null, books:[], hiddenBooks:[], assets:[], view:'home', query:'', sort:'recent', stateFilter:'all', manageMode:false, selectedBook:null, activeBookId:null, selectedIds:new Set(), pendingRemove:null, lastRemoved:null, lastImport:null, error:null };
+    const state = { dashboard:null, books:[], hiddenBooks:[], assets:[], view:'home', query:'', sort:'recent', stateFilter:'all', libraryScope:'all', folderPath:'', manageMode:false, selectedBook:null, activeBookId:null, selectedIds:new Set(), pendingRemove:null, lastRemoved:null, lastImport:null, error:null, openingBookId:null, openingRequestId:null };
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const isMacAppSurface = () => new URLSearchParams(window.location.search).get('surface') === 'mac-app';
@@ -6870,16 +12134,22 @@ def library_page_html_v2() -> str:
     function navItems() {
       const summary = state.dashboard?.summary || {};
       return [
-        ['home','首页',''],
-        ['library','书库', summary.book_count || 0],
-        ['favorites','收藏', summary.favorite_count || 0],
-        ['authors','作者', summary.author_count || 0],
-        ['categories','分类', summary.category_count || 0],
-        ['vocab','单词',''],
+        ['home','阅读', summary.book_count || 0],
         ['notes','笔记', summary.note_count || 0],
         ['red','红标', summary.red_highlight_count || 0],
+        ['vocab','单词',''],
         ['settings','设置','']
       ];
+    }
+    function navSymbol(id) {
+      const icons = {
+        home:'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5c3.2-.8 5.9-.2 8 1.6v12c-2.1-1.8-4.8-2.4-8-1.6zM20 5.5c-3.2-.8-5.9-.2-8 1.6v12c2.1-1.8 4.8-2.4 8-1.6z"/></svg>',
+        notes:'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg>',
+        red:'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16l-6-3-6 3z"/></svg>',
+        vocab:'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M8 6c.6 5 3.1 8.2 7.5 10M16 6c-.7 4.1-3 7.3-7 9.5M6 19h12"/></svg>',
+        settings:'<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>'
+      };
+      return icons[id] || '';
     }
     function vocabURL(bookID = null) {
       const id = bookID || state.activeBookId || state.dashboard?.current_book?.id || state.books[0]?.id || '';
@@ -6893,7 +12163,10 @@ def library_page_html_v2() -> str:
       state.view = view; closeDrawer(); render();
     }
     function renderNav() {
-      $('nav').innerHTML = navItems().map(([id,title,count]) => `<button class="${state.view === id ? 'active' : ''}" data-view="${id}"><span>${title}</span><span>${count}</span></button>`).join('');
+      $('nav').innerHTML = navItems().map(([id,title,count]) => {
+        const active = state.view === id || (id === 'home' && ['library','favorites','authors','categories'].includes(state.view));
+        return `<button class="${active ? 'active' : ''}" data-view="${id}"><span class="nav-symbol">${navSymbol(id)}</span><span>${title}</span><span class="nav-count">${count}</span></button>`;
+      }).join('');
       document.querySelectorAll('[data-view], [data-view-jump]').forEach((button) => button.onclick = () => setView(button.dataset.view || button.dataset.viewJump));
     }
     function visible(view) { document.querySelectorAll('.view').forEach((node) => node.classList.toggle('active', node.id === `${view}View`)); }
@@ -6930,12 +12203,57 @@ def library_page_html_v2() -> str:
       if (!locator) return '尚未开始';
       return locator.split('/').pop().replace(/\.(xhtml|html|htm)$/i, '') || locator;
     }
+    function syncNativeBookOpening() {
+      document.querySelectorAll('[data-open-book-card]').forEach((card) => {
+        const opening = Boolean(state.openingBookId && card.dataset.book === state.openingBookId);
+        card.classList.toggle('opening', opening);
+        card.setAttribute('aria-busy', opening ? 'true' : 'false');
+      });
+    }
+    function setNativeBookOpenState({bookId=null, requestId=null, phase='idle', message=''}) {
+      if (phase === 'opening') {
+        state.openingBookId = bookId;
+        state.openingRequestId = requestId;
+      } else if (!requestId || requestId === state.openingRequestId) {
+        state.openingBookId = null;
+        state.openingRequestId = null;
+      }
+      syncNativeBookOpening();
+      if (message) toast(message);
+    }
+    function requestNativeBookOpen(book) {
+      const handler = window.webkit?.messageHandlers?.sentenceReader;
+      if (!handler?.postMessage) return false;
+      if (state.openingBookId) {
+        toast(state.openingBookId === book.id ? '正在打开这本书...' : '正在打开另一本书，请稍候');
+        return true;
+      }
+      const requestId = `library-open-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      setNativeBookOpenState({bookId:book.id, requestId, phase:'opening', message:'正在打开正文...'});
+      try {
+        handler.postMessage({type:'libraryOpenBook', book_id:book.id, request_id:requestId});
+        return true;
+      } catch (error) {
+        setNativeBookOpenState({requestId, phase:'failed', message:'原生阅读器通信失败，正在使用兼容打开方式。'});
+        return false;
+      }
+    }
+    window.__clickNativeBookOpenState = (payload) => {
+      if (!payload || (state.openingRequestId && payload.request_id && payload.request_id !== state.openingRequestId)) return;
+      setNativeBookOpenState({
+        bookId:payload.book_id || state.openingBookId,
+        requestId:payload.request_id || state.openingRequestId,
+        phase:payload.phase || 'idle',
+        message:payload.message || '',
+      });
+    };
     function openBook(book) {
-      if (!book?.status?.lan_available) { toast('这本书的文件暂时不可读，请在详情里检查文件状态。'); return; }
-      if (isMacAppSurface() && book.actions?.native_reader_url) {
+      if (isMacAppSurface() && book?.reader_capabilities?.mac_native && book.actions?.native_reader_url) {
+        if (requestNativeBookOpen(book)) return;
         window.location.href = book.actions.native_reader_url;
         return;
       }
+      if (!book?.status?.lan_available) { toast('这本书当前只支持 Click Mac 原生阅读。'); return; }
       if (book.actions?.continue_reading_url) window.location.href = book.actions.continue_reading_url;
     }
     function cover(book, cls='', showPhrases=false, openable=false) {
@@ -6949,7 +12267,6 @@ def library_page_html_v2() -> str:
       const checked = state.selectedIds.has(book.id) ? 'checked' : '';
       const org = book.organization || {};
       const favorite = org.favorite ? '<div class="favorite-mark" title="已收藏">★</div>' : '';
-      const favoriteLabel = org.favorite ? '取消收藏' : '收藏';
       const modeClass = state.manageMode ? 'selectable' : '';
       const selectedClass = state.selectedIds.has(book.id) ? 'selected' : '';
       return `<article class="book-card ${modeClass} ${selectedClass}" tabindex="0" data-book="${esc(book.id)}" data-open-book-card="true">
@@ -6959,11 +12276,9 @@ def library_page_html_v2() -> str:
         <div class="book-title">${esc(book.title || book.id)}</div>
         <div class="book-meta">${esc(book.author || '未知作者')}</div>
         <div class="progress"><i style="width:${book.progress?.percent || 0}%"></i></div>
-        <div class="book-row"><span class="badge state">${esc(book.reading_state || '未开始')}</span><span class="badge">${progressText(book)}</span><span class="badge">${esc(org.category || '未分类')}</span><span class="badge">${book.counts?.notes || 0} 笔记</span><span class="badge red">${book.counts?.red_highlights || 0} 红标</span></div>
+        <div class="book-meta">${progressText(book)}</div>
         <div class="card-secondary" data-card-secondary="true">
-          <button class="card-action" data-favorite="${esc(book.id)}">${favoriteLabel}</button>
-          <button class="card-action" data-vocab="${esc(book.id)}">单词</button>
-          <button class="card-action" data-details="${esc(book.id)}">详情</button>
+          <button class="card-action" data-details="${esc(book.id)}" aria-label="更多">•••</button>
         </div>
       </article>`;
     }
@@ -6992,20 +12307,12 @@ def library_page_html_v2() -> str:
         };
         card.onfocus = () => { state.activeBookId = card.dataset.book; };
       });
-      document.querySelectorAll('[data-vocab]').forEach((button) => button.onclick = (event) => {
-        event.stopPropagation();
-        window.location.href = vocabURL(button.dataset.vocab);
-      });
       document.querySelectorAll('[data-details]').forEach((button) => button.onclick = () => openDrawer(byId(button.dataset.details)));
-      document.querySelectorAll('[data-favorite]').forEach((button) => button.onclick = (event) => {
-        event.stopPropagation();
-        const book = byId(button.dataset.favorite);
-        toggleFavorite(book).catch((error) => toast(`收藏失败：${error.message}`));
-      });
       document.querySelectorAll('[data-select]').forEach((box) => box.onchange = () => {
         if (box.checked) state.selectedIds.add(box.dataset.select); else state.selectedIds.delete(box.dataset.select);
         syncBookSelection(box.dataset.select);
       });
+      syncNativeBookOpening();
     }
     function bindOpenBookTargets(root = document) {
       root.querySelectorAll('[data-open-book]').forEach((target) => {
@@ -7016,6 +12323,7 @@ def library_page_html_v2() -> str:
         target.onkeydown = (event) => {
           if (event.key !== 'Enter' && event.key !== ' ') return;
           event.preventDefault();
+          event.stopPropagation();
           openBook(byId(target.dataset.openBook));
         };
       });
@@ -7056,27 +12364,111 @@ def library_page_html_v2() -> str:
       $('categoryCount').textContent = `${categoryGroups.length} 个分类`;
       renderBookGroup('categoryGroups', categoryGroups, '还没有分类。');
     }
+    function normalizedFolderPath(book) {
+      const raw = String(book?.organization?.custom_category || book?.organization?.category || '').trim();
+      if (!raw || raw === '未分类') return '';
+      return raw.split(/\s*(?:\/|›|>)\s*/).filter(Boolean).join('/');
+    }
+    function booksInsideFolder(path) {
+      if (!path) return state.books;
+      return state.books.filter((book) => {
+        const category = normalizedFolderPath(book);
+        return category === path || category.startsWith(`${path}/`);
+      });
+    }
+    function childFolders(path) {
+      const prefix = path ? `${path}/` : '';
+      const groups = new Map();
+      state.books.forEach((book) => {
+        const category = normalizedFolderPath(book);
+        if (!category || (path && category !== path && !category.startsWith(prefix))) return;
+        const rest = path ? category.slice(prefix.length) : category;
+        if (!rest) return;
+        const name = rest.split('/')[0];
+        const fullPath = prefix + name;
+        if (!groups.has(fullPath)) groups.set(fullPath, []);
+        groups.get(fullPath).push(book);
+      });
+      return Array.from(groups, ([folderPath, books]) => ({folderPath, name:folderPath.split('/').pop(), books}))
+        .sort((a,b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
+    }
+    function directBooks(path) {
+      return state.books.filter((book) => normalizedFolderPath(book) === path);
+    }
+    function folderPreview(books) {
+      const cells = Array.from({length:4}, (_, index) => {
+        const book = books[index];
+        return book ? cover(book) : '<span class="folder-placeholder" aria-hidden="true"></span>';
+      });
+      return cells.join('');
+    }
+    function folderCard(folder) {
+      return `<button class="folder-card" data-folder-path="${esc(folder.folderPath)}" aria-label="打开文件夹 ${esc(folder.name)}">
+        <span class="folder-preview">${folderPreview(folder.books.slice(0,4))}</span>
+        <span class="folder-label"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5h7l2 2h9v10H3z"/></svg><span>${esc(folder.name)}</span></span>
+        <span class="folder-count">${folder.books.length} 本</span>
+      </button>`;
+    }
     function renderHome() {
-      const current = state.dashboard?.current_book || state.books[0];
-      if (!current) {
-        $('continueHero').innerHTML = `<div class="empty"><h2>先导入一本 EPUB</h2><p>导入后会复制到内部书库，原文件可以删除。</p><button class="primary" id="emptyImport">导入 EPUB</button></div>`;
-        $('emptyImport').onclick = () => $('fileInput').click();
+      const query = (state.query || '').trim();
+      const allScope = state.libraryScope === 'all';
+      const folderPath = allScope && !query ? state.folderPath : '';
+      const folders = allScope && !query ? childFolders(folderPath) : [];
+      let books;
+      if (query) {
+        books = sortedBooks(state.books);
+      } else if (state.libraryScope === 'recent') {
+        books = sortedBooks(state.dashboard?.recent_books || state.books).slice(0, 20);
+      } else if (state.libraryScope === 'favorites') {
+        books = sortedBooks(state.dashboard?.favorite_books || []);
       } else {
-        $('continueHero').innerHTML = `${cover(current, 'hero-cover', true, true)}<div class="hero-copy"><div class="eyebrow">Continue Reading</div><div class="hero-title">${esc(current.title || current.id)}</div><div class="hero-meta">${esc(current.author || '未知作者')} · ${esc(chapterText(current))} · ${progressText(current)}</div><div class="progress"><i style="width:${current.progress?.percent || 0}%"></i></div><div class="hero-manifest"><div class="manifest-item"><strong>逐句读懂</strong><span>英文原句和中文证据一起看。</span></div><div class="manifest-item"><strong>语境查词</strong><span>先看本句义，再看词典短释。</span></div><div class="manifest-item"><strong>复习沉淀</strong><span>查过的词进入主动学习。</span></div></div><div class="hero-actions"><button class="primary" id="heroContinue">继续阅读</button><button class="subtle" id="heroDetail">查看详情</button><button class="ghost" data-view-jump="notes">整理笔记</button></div></div>`;
-        $('heroContinue').onclick = () => openBook(current);
-        $('heroDetail').onclick = () => openDrawer(current);
-        bindOpenBookTargets($('continueHero'));
+        books = sortedBooks(directBooks(folderPath));
       }
-      const recent = (state.dashboard?.recent_books || state.books).slice(0, 6);
-      $('recentRail').innerHTML = recent.length ? recent.map(bookCard).join('') : `<div class="empty">还没有最近阅读。</div>`;
-      const assets = (state.dashboard?.recent_annotations || []).slice(0, 5);
-      $('recentAssets').innerHTML = assets.length ? assets.map(assetCard).join('') : `<div class="empty">还没有笔记或红标。读书时双击写注释，双指点按标红。</div>`;
+
+      const scopeTitles = {all:'全部', recent:'最近', favorites:'收藏'};
+      $('shelfTitle').textContent = folderPath ? folderPath.split('/').pop() : '阅读';
+      $('shelfSubtitle').textContent = query
+        ? `搜索“${query}”`
+        : folderPath
+          ? `书架 › ${folderPath.replaceAll('/', ' › ')}`
+          : '打开封面继续阅读；文件夹和书籍保持同一套层级。';
+      document.querySelectorAll('[data-library-scope]').forEach((button) => {
+        const active = button.dataset.libraryScope === state.libraryScope;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+
+      $('folderBreadcrumb').innerHTML = folderPath
+        ? `<button class="folder-back" id="folderBack" aria-label="返回上一级">‹ 返回上一级</button>`
+        : '';
+      $('folderSection').classList.toggle('hidden', folders.length === 0);
+      $('folderCount').textContent = folders.length ? `${folders.length} 个` : '';
+      $('homeFolderGrid').innerHTML = folders.map(folderCard).join('');
+
+      const title = query ? '搜索结果' : state.libraryScope === 'all' ? (folderPath ? '直属书籍' : '未整理') : scopeTitles[state.libraryScope];
+      $('homeBookTitle').textContent = title;
+      $('homeBookCount').textContent = `${books.length} 本`;
+      $('homeBookGrid').innerHTML = books.length
+        ? books.map(bookCard).join('')
+        : `<div class="home-empty"><div><h2>${query ? '没有找到书籍' : '这里还没有书'}</h2><p>${query ? '换一个书名或作者试试。' : '可以导入书籍，或在整理时把书移到这里。'}</p></div></div>`;
+
+      document.querySelectorAll('[data-folder-path]').forEach((button) => button.onclick = () => {
+        state.folderPath = button.dataset.folderPath || '';
+        renderHome();
+        window.scrollTo({top:0, behavior:'smooth'});
+      });
+      if ($('folderBack')) $('folderBack').onclick = () => {
+        const parts = state.folderPath.split('/').filter(Boolean);
+        parts.pop();
+        state.folderPath = parts.join('/');
+        renderHome();
+      };
       bindBookCards();
     }
     function renderLibrary() {
       const books = sortedBooks();
       $('bookCount').textContent = `${books.length} 本`;
-      $('bookGrid').innerHTML = books.length ? books.map(bookCard).join('') : `<div class="empty"><h2>没有匹配的书</h2><p>换一个搜索词，或者导入新的 EPUB。</p></div>`;
+      $('bookGrid').innerHTML = books.length ? books.map(bookCard).join('') : `<div class="empty"><h2>没有匹配的书</h2><p>换一个搜索词，或者导入新的 EPUB / PDF。</p></div>`;
       bindBookCards();
       renderBatchbar();
     }
@@ -7090,12 +12482,29 @@ def library_page_html_v2() -> str:
       const label = asset.kind === 'note' ? '笔记' : '红标';
       return `<article class="asset-card" data-asset="${esc(asset.id)}"><div><strong>${esc(label)} · ${esc(asset.book_title || '')}</strong><p>${esc(asset.preview || asset.source_text || '')}</p><div class="book-meta">${esc(asset.chapter_title || asset.chapter_locator || '')}</div></div><button class="subtle" data-open-asset="${esc(asset.book_id)}">回到原文</button></article>`;
     }
+    function groupedAssetList(assets) {
+      const groups = new Map();
+      assets.forEach((asset) => {
+        const key = asset.book_id || asset.book_title || 'unknown';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(asset);
+      });
+      return Array.from(groups.values()).map((items, index) => {
+        const first = items[0] || {};
+        const cards = items.map((asset) => {
+          const label = asset.kind === 'note' ? '笔记' : '红标';
+          const chapter = asset.chapter_title || asset.chapter_locator || label;
+          return `<article class="asset-card" data-asset="${esc(asset.id)}"><div><strong>${esc(chapter)}</strong><p>${esc(asset.preview || asset.source_text || '')}</p></div><button class="subtle" data-open-asset="${esc(asset.book_id)}">回到原文</button></article>`;
+        }).join('');
+        return `<details ${index === 0 ? 'open' : ''}><summary>${esc(first.book_title || '未命名书籍')} · ${items.length} 条</summary><div class="asset-list" style="margin-top:10px">${cards}</div></details>`;
+      }).join('');
+    }
     function bindAssets() { document.querySelectorAll('[data-open-asset]').forEach((button) => button.onclick = () => openBook(byId(button.dataset.openAsset))); }
     function renderAssets() {
       const notes = state.assets.filter((asset) => assetMatches(asset, 'note'));
       const red = state.assets.filter((asset) => assetMatches(asset, 'red_highlight'));
-      $('notesList').innerHTML = notes.length ? notes.map(assetCard).join('') : `<div class="empty"><h2>还没有笔记</h2><p>在正文里双击句子即可写备注。</p></div>`;
-      $('redList').innerHTML = red.length ? red.map(assetCard).join('') : `<div class="empty"><h2>还没有红标</h2><p>在正文里双指点按或右键句子即可标红。</p></div>`;
+      $('notesList').innerHTML = notes.length ? groupedAssetList(notes) : `<div class="empty"><h2>还没有笔记</h2><p>在正文里双击句子即可写备注。</p></div>`;
+      $('redList').innerHTML = red.length ? groupedAssetList(red) : `<div class="empty"><h2>还没有红标</h2><p>在正文里双指点按或右键句子即可标红。</p></div>`;
       bindAssets();
     }
     function renderSettings() {
@@ -7103,7 +12512,7 @@ def library_page_html_v2() -> str:
       const importResult = state.lastImport ? `<article class="asset-card"><div><strong>最近导入成功</strong><p>${esc(state.lastImport.book?.title || '')}</p><div class="book-meta">已复制到内部书库，原文件可删除。</div></div><button class="subtle" data-open-import="${esc(state.lastImport.book?.id || '')}">打开</button></article>` : '';
       const hidden = state.hiddenBooks || [];
       const hiddenList = hidden.length ? hidden.map((book) => `<article class="asset-card"><div><strong>${esc(book.title || book.id)}</strong><p>${esc(book.author || '未知作者')} · 已移出书库，数据仍保留。</p></div><button class="subtle" data-restore-book="${esc(book.id)}">恢复</button></article>`).join('') : `<article class="asset-card"><div><strong>已移出书库</strong><p>这里暂时没有隐藏的书。</p></div><button class="subtle" id="hiddenRefresh">刷新</button></article>`;
-      $('settingsPanel').innerHTML = `${importResult}<article class="asset-card"><div><strong>阅读服务</strong><p>${ok ? '已连接，可以正常打开书库和正文。' : '未连接，请重启 App。'}</p></div><button class="subtle" id="settingsRefresh">重新检查</button></article><article class="asset-card"><div><strong>iPad 访问</strong><p>同一局域网下打开本机地址的 /library，直接阅读地址仍保留 /lan/reader。</p></div><button class="subtle" id="copyLocal">复制本机地址</button></article><details open><summary>已移出书库 · ${hidden.length} 本</summary><div class="asset-list" style="margin-top:10px">${hiddenList}</div></details><details><summary>高级信息</summary><p id="advancedInfo">书籍 ${state.books.length} 本，已移出 ${hidden.length} 本，笔记 ${state.dashboard?.summary?.note_count || 0} 条，红标 ${state.dashboard?.summary?.red_highlight_count || 0} 条。文件状态可在书籍详情中查看。</p></details>`;
+      $('settingsPanel').innerHTML = `${importResult}<article class="asset-card"><div><strong>Click 状态</strong><p>${ok ? '运行正常。' : '暂时未连接，请重启 App。'}</p></div><button class="subtle" id="settingsRefresh">重新检查</button></article><article class="asset-card"><div><strong>手机同步</strong><p>Android Click 打开时，会在同一 Wi‑Fi 自动发现这台 Mac；无需常驻后台。</p></div></article><details><summary>已移出书库 · ${hidden.length} 本</summary><div class="asset-list" style="margin-top:10px">${hiddenList}</div></details><details><summary>高级信息</summary><p id="advancedInfo">书籍 ${state.books.length} 本，已移出 ${hidden.length} 本，笔记 ${state.dashboard?.summary?.note_count || 0} 条，红标 ${state.dashboard?.summary?.red_highlight_count || 0} 条。文件状态可在书籍详情中查看。</p><button class="subtle" id="copyLocal">复制连接地址</button></details>`;
       $('settingsRefresh').onclick = () => loadDashboard();
       if ($('hiddenRefresh')) $('hiddenRefresh').onclick = () => loadDashboard();
       $('copyLocal').onclick = () => navigator.clipboard?.writeText(location.origin + '/library').then(() => toast('已复制地址')).catch(() => toast(location.origin + '/library'));
@@ -7240,9 +12649,12 @@ def library_page_html_v2() -> str:
       const org = book.organization || {};
       const tagText = (org.tags || []).join('，');
       const favoriteText = org.favorite ? '取消收藏' : '收藏';
+      const analysisState = book.living_book_analysis?.state || 'not_requested';
+      const analysisText = analysisState === 'queued' ? '已排队' : analysisState === 'running' ? '分析中' : analysisState === 'needs_review' ? '待审阅' : analysisState === 'complete' ? '已完成' : analysisState === 'failed' ? '分析失败' : '未分析';
+      const analysisAction = ['queued','running'].includes(analysisState) ? '查看分析状态' : ['needs_review','complete'].includes(analysisState) ? '重新分析' : analysisState === 'failed' ? '重试分析' : '分析';
       const categoryOptions = Array.from(new Set((state.dashboard?.category_groups || []).map((group) => group.category).filter(Boolean))).filter((name) => name !== '未分类');
       const chips = (org.tags || []).length ? `<div class="org-tags">${org.tags.map((tag) => `<span class="badge">${esc(tag)}</span>`).join('')}</div>` : '';
-      $('drawer').innerHTML = `<button class="ghost" id="drawerClose">关闭</button>${cover(book)}<h2>${esc(book.title || book.id)}</h2><div class="book-meta">${esc(book.author || '未知作者')} · ${esc(book.reading_state || '')}</div><div class="book-row"><span class="badge">${esc(org.category || '未分类')}</span>${org.favorite ? '<span class="badge">已收藏</span>' : ''}</div><div class="progress"><i style="width:${book.progress?.percent || 0}%"></i></div><div class="drawer-actions"><button class="primary" id="drawerOpen">继续阅读</button><button class="subtle" id="drawerFavorite">${favoriteText}</button><button class="subtle" id="drawerVocab">单词本</button><button class="subtle" data-view-jump="notes">笔记</button><button class="subtle" data-view-jump="red">红标</button><button class="subtle" id="drawerReveal">显示副本</button><button class="subtle" id="drawerExport">导出</button><button class="subtle" id="drawerManage">选择管理</button></div><section class="org-panel"><strong>自定义分类</strong><div class="org-row"><input id="categoryField" list="categoryList" value="${esc(org.custom_category || '')}" placeholder="例如：战略、英语、属灵书籍"><button class="primary" id="saveCategory">保存</button></div><datalist id="categoryList">${categoryOptions.map((name) => `<option value="${esc(name)}"></option>`).join('')}</datalist><strong>标签</strong><div class="org-row"><input id="tagField" value="${esc(tagText)}" placeholder="用逗号分隔，例如：面试,精读,复习"><button class="subtle" id="saveTags">保存</button></div>${chips}</section><details><summary>高级信息</summary><p>文件存在：${book.file?.exists ? '是' : '否'}<br>内部副本：${book.file?.owned_internal_copy ? '是' : '否'}<br>${esc(book.file?.file_path || '')}</p></details>`;
+      $('drawer').innerHTML = `<button class="ghost" id="drawerClose">关闭</button>${cover(book)}<h2>${esc(book.title || book.id)}</h2><div class="book-meta">${esc(book.author || '未知作者')} · ${esc(book.reading_state || '')}</div><div class="book-row"><span class="badge">${esc(org.category || '未分类')}</span><span class="badge">${esc(analysisText)}</span>${book.compatibility?.correction_queue_required ? '<span class="badge">待纠错</span>' : ''}${org.favorite ? '<span class="badge">已收藏</span>' : ''}</div><div class="progress"><i style="width:${book.progress?.percent || 0}%"></i></div><div class="drawer-actions"><button class="primary" id="drawerOpen">继续阅读</button><button class="subtle" id="drawerFavorite">${favoriteText}</button><button class="subtle" id="drawerVocab">单词本</button><button class="subtle" id="drawerAnalyze">${esc(analysisAction)}</button><button class="subtle" data-view-jump="notes">笔记</button><button class="subtle" data-view-jump="red">红标</button><button class="subtle" id="drawerReveal">显示副本</button><button class="subtle" id="drawerExport">导出</button><button class="subtle" id="drawerManage">选择管理</button></div><section class="org-panel"><strong>自定义分类</strong><div class="org-row"><input id="categoryField" list="categoryList" value="${esc(org.custom_category || '')}" placeholder="例如：战略、英语、属灵书籍"><button class="primary" id="saveCategory">保存</button></div><datalist id="categoryList">${categoryOptions.map((name) => `<option value="${esc(name)}"></option>`).join('')}</datalist><strong>标签</strong><div class="org-row"><input id="tagField" value="${esc(tagText)}" placeholder="用逗号分隔，例如：面试,精读,复习"><button class="subtle" id="saveTags">保存</button></div>${chips}</section><details><summary>高级信息</summary><p>文件存在：${book.file?.exists ? '是' : '否'}<br>内部副本：${book.file?.owned_internal_copy ? '是' : '否'}<br>阅读类型：${esc(book.compatibility?.reading_profile || 'UNKNOWN')}<br>${esc(book.file?.file_path || '')}</p></details>`;
       $('drawer').classList.add('open');
       $('drawer').setAttribute('aria-hidden', 'false');
       $('drawerBackdrop').classList.add('show');
@@ -7250,6 +12662,21 @@ def library_page_html_v2() -> str:
       $('drawerOpen').onclick = () => openBook(book);
       $('drawerFavorite').onclick = () => toggleFavorite(book).catch((error) => toast(`收藏失败：${error.message}`));
       $('drawerVocab').onclick = () => { window.location.href = vocabURL(book.id); };
+      $('drawerAnalyze').onclick = async () => {
+        if (['queued','running'].includes(analysisState)) {
+          const status = await api(book.actions.analysis_status_url);
+          toast(`分析状态：${status.analysis?.state || analysisState}`);
+          await loadDashboard();
+          return;
+        }
+        const reanalyze = ['needs_review','complete'].includes(analysisState);
+        if (reanalyze && !confirm('重新分析不会覆盖已审阅文件；新结果将写入草稿。继续吗？')) return;
+        $('drawerAnalyze').disabled = true;
+        $('drawerAnalyze').textContent = '已排队';
+        await api(reanalyze ? book.actions.reanalyze_url : book.actions.analyze_url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({requested_by:'click_library', force:reanalyze})});
+        toast('分析已排队，可继续阅读');
+        await loadDashboard();
+      };
       $('drawerReveal').onclick = async () => { await api(`/api/library/books/${book.id}/reveal`, {method:'POST'}); toast('已在 Finder 显示'); };
       $('drawerExport').onclick = async () => { await api(`/books/${book.id}/export`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({include_json:true})}); toast('导出完成'); };
       $('drawerManage').onclick = () => { state.manageMode = true; state.selectedIds.add(book.id); closeDrawer(); setView('library'); toast('已进入管理模式，可移出单本或批量整理'); };
@@ -7287,7 +12714,7 @@ def library_page_html_v2() -> str:
       let binary = '';
       const bytes = new Uint8Array(buffer);
       for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      toast('正在导入 EPUB...');
+      toast('正在导入书籍...');
       state.lastImport = await api('/api/library/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:file.name, content_base64:btoa(binary)})});
       toast('导入完成');
       await loadDashboard();
@@ -7308,10 +12735,20 @@ def library_page_html_v2() -> str:
     $('stateFilter').onchange = (event) => { state.stateFilter = event.target.value; render(); };
     $('refresh').onclick = () => loadDashboard().catch((error) => { state.error = error.message; render(); });
     ['topImport'].forEach((id) => $(id).onclick = () => $('fileInput').click());
+    document.querySelectorAll('[data-library-scope]').forEach((button) => button.onclick = () => {
+      state.libraryScope = button.dataset.libraryScope || 'all';
+      state.folderPath = '';
+      renderHome();
+    });
+    $('homeManage').onclick = () => {
+      state.manageMode = true;
+      setView('library');
+      toast('已进入整理模式，完成后会回到阅读书架');
+    };
     $('manageToggle').onclick = () => {
       state.manageMode = !state.manageMode;
       if (!state.manageMode) state.selectedIds.clear();
-      render();
+      if (!state.manageMode) setView('home'); else render();
     };
     $('selectAllCurrent').onclick = () => {
       const books = sortedBooks();
@@ -7320,7 +12757,7 @@ def library_page_html_v2() -> str:
       renderLibrary();
     };
     $('batchClear').onclick = () => { state.selectedIds.clear(); renderLibrary(); };
-    $('batchExit').onclick = () => { state.manageMode = false; state.selectedIds.clear(); render(); };
+    $('batchExit').onclick = () => { state.manageMode = false; state.selectedIds.clear(); setView('home'); };
     $('batchFavorite').onclick = () => favoriteSelectedBooks().catch((error) => toast(`批量收藏失败：${error.message}`));
     $('batchOrganize').onclick = openBatchOrgModal;
     $('batchHide').onclick = () => batchHide().catch((error) => toast(`移出失败：${error.message}`));
@@ -7332,6 +12769,7 @@ def library_page_html_v2() -> str:
       event.target.value = '';
     };
     document.addEventListener('keydown', (event) => {
+      if (event.defaultPrevented) return;
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') { event.preventDefault(); $('search').focus(); return; }
       if (event.key === 'Escape') { closeDrawer(); closeOrgModal(); closeRemoveModal(); return; }
       if (event.key === 'ArrowRight' || event.key === 'ArrowDown') { selectNext(1); return; }
@@ -7749,10 +13187,24 @@ def lifestudy_vocab_review_page_html() -> str:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    processing_worker = voice_processing_worker_metrics()
     try:
-        return {"ok": True, "database": db.health()}
+        return {
+            "ok": True,
+            "schema": RUNTIME_HEALTH_SCHEMA,
+            "runtime": runtime_payload(),
+            "database": db.health(),
+            "voice_processing_worker": processing_worker,
+        }
     except Exception as exc:  # noqa: BLE001 - health endpoint must expose boundary failures.
-        return {"ok": False, "error": exc.__class__.__name__, "detail": str(exc)}
+        return {
+            "ok": False,
+            "schema": RUNTIME_HEALTH_SCHEMA,
+            "runtime": runtime_payload(),
+            "voice_processing_worker": processing_worker,
+            "error": exc.__class__.__name__,
+            "detail": str(exc),
+        }
 
 
 @app.get("/favicon.ico")
@@ -8089,12 +13541,21 @@ def get_library_book_cover(book_id: str) -> Response:
                     return Response(content=data, media_type=media_type)
                 except KeyError:
                     pass
+    if path.exists() and path.suffix.lower() == ".pdf":
+        cached = ensure_pdf_cover_cache(book, path)
+        if cached:
+            return FileResponse(cached, media_type="image/png")
     return Response(content=generated_cover_svg(book), media_type="image/svg+xml")
 
 
 @app.post("/api/library/import")
 def post_library_import(payload: LibraryImport) -> dict[str, Any]:
-    return import_library_epub(payload)
+    return import_library_book(payload)
+
+
+@app.patch("/api/library/books/{book_id}/metadata")
+def patch_library_book_metadata(book_id: str, payload: LibraryMetadataPatch) -> dict[str, Any]:
+    return update_library_book_metadata(book_id, payload)
 
 
 @app.post("/api/library/books/batch-hide")
@@ -8182,6 +13643,12 @@ def lan_books() -> list[dict[str, Any]]:
 @app.get("/lan/books/{book_id}/manifest")
 def lan_book_manifest(book_id: str) -> dict[str, Any]:
     book = book_with_latest_file(book_id)
+    source_kind = str(book.get("source_kind") or book.get("file_kind") or "").lower()
+    if source_kind != "epub":
+        raise HTTPException(
+            status_code=422,
+            detail="LAN web reader currently supports EPUB only; open PDF in Click for Mac",
+        )
     publication = epub_publication(epub_path_for_book(book), book=book)
     with db.connect() as conn:
         position = conn.execute("SELECT * FROM reader.reading_positions WHERE book_id = %s", (book_id,)).fetchone()
@@ -8241,6 +13708,1727 @@ def lan_book_asset(book_id: str, asset_path: str) -> Response:
     return Response(content=data, media_type=media_type)
 
 
+def android_sync_cursor(conn: Any) -> str:
+    rows = conn.execute(
+        """
+        SELECT max(updated_at) AS value FROM reader.books
+        UNION ALL
+        SELECT max(updated_at) AS value FROM reader.library_state
+        UNION ALL
+        SELECT max(updated_at) AS value FROM reader.reading_positions
+        UNION ALL
+        SELECT max(updated_at) AS value FROM reader.annotations
+        UNION ALL
+        SELECT max(updated_at) AS value FROM reader.audio_notes
+        """
+    ).fetchall()
+    values = [row.get("value") for row in rows if row and row.get("value")]
+    try:
+        for path in knowledge_base_root_path().glob("**/_status/analysis.json"):
+            analysis = read_living_book_json(path, {})
+            updated_at = parse_living_book_time(str(analysis.get("updated_at") or ""))
+            if updated_at:
+                values.append(updated_at)
+    except OSError:
+        pass
+    return jsonable(max(values)) if values else now_iso()
+
+
+def android_visible_books_and_removed_ids(conn: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    visible_rows = conn.execute(
+        """
+        SELECT b.*,
+               ls.metadata AS library_metadata
+        FROM reader.books b
+        LEFT JOIN reader.library_state ls ON ls.book_id = b.id
+        WHERE COALESCE(ls.hidden, false) = false
+          AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+        ORDER BY b.last_opened_at DESC NULLS LAST, b.created_at DESC
+        """
+    ).fetchall()
+    removed_rows = conn.execute(
+        """
+        SELECT ls.book_id
+        FROM reader.library_state ls
+        JOIN reader.books b ON b.id = ls.book_id
+        WHERE ls.hidden = true
+          AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+        ORDER BY ls.updated_at DESC
+        """
+    ).fetchall()
+    visible_books: list[dict[str, Any]] = []
+    for row in visible_rows:
+        try:
+            visible_books.append(resolve_android_book_source(str(row["id"]), conn=conn))
+        except HTTPException as exc:
+            if exc.status_code not in {404, 409}:
+                raise
+            visible_books.append({**dict(row), "_android_source_error": str(exc.detail)})
+    return visible_books, [str(row["book_id"]) for row in removed_rows]
+
+
+def android_book_organization(book: dict[str, Any]) -> dict[str, Any]:
+    raw_metadata = book.get("library_metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    custom_category = re.sub(r"\s+", " ", str(metadata.get("custom_category") or "")).strip()
+    tags = [str(value).strip() for value in (metadata.get("tags") or []) if str(value).strip()]
+    return {
+        "favorite": bool(metadata.get("favorite") or False),
+        "custom_category": custom_category,
+        "category": custom_category or "未分类",
+        "tags": tags,
+    }
+
+
+def android_safe_book_payload(book: dict[str, Any]) -> dict[str, Any]:
+    safe_keys = (
+        "id",
+        "title",
+        "author",
+        "source_kind",
+        "book_hash",
+        "created_at",
+        "updated_at",
+        "last_opened_at",
+        "file_kind",
+        "file_hash",
+        "byte_size",
+    )
+    return {key: jsonable(book.get(key)) for key in safe_keys if key in book}
+
+
+def android_source_contract(book: dict[str, Any]) -> dict[str, Any]:
+    resolved = (
+        book
+        if isinstance(book.get("_android_source_snapshot"), dict)
+        else resolve_android_book_source(str(book.get("id") or ""))
+    )
+    snapshot = dict(resolved["_android_source_snapshot"])
+    return {
+        "kind": snapshot["file_kind"],
+        "url": f"/v1/android/books/{snapshot['book_id']}/source",
+        "file_hash": snapshot["file_hash"],
+        "byte_size": snapshot["byte_size"],
+        "persistent_original": True,
+        "cached_by_android": False,
+    }
+
+
+def android_source_projection_fields(book: dict[str, Any]) -> dict[str, Any]:
+    source = android_source_contract(book)
+    return {
+        "source_kind": source["kind"],
+        "source_url": source["url"],
+        "source_hash": source["file_hash"],
+        "source_byte_size": source["byte_size"],
+    }
+
+
+def android_publication_payload(book: dict[str, Any], *, include_chapters: bool) -> dict[str, Any]:
+    epub_path = epub_path_for_book(book)
+    compatibility = ensure_book_epub_assets(book)
+    android_epub_path = android_epub_path_for_book(book, compatibility)
+    publication = epub_publication(epub_path, book=book)
+    contract = android_book_contract_fields(book, compatibility)
+    payload: dict[str, Any] = {
+        "book": {**android_safe_book_payload(book), **contract},
+        "source": android_source_contract(book),
+        "publication": publication,
+        "epub": {
+            "url": f"/v1/android/books/{book.get('id')}/epub",
+            "file_hash": file_sha256(android_epub_path),
+            "source_file_hash": book.get("file_hash") or book.get("book_hash") or file_sha256(epub_path),
+            "byte_size": android_epub_path.stat().st_size,
+            "runtime_derivative": android_epub_path != epub_path,
+            "cached_by_android": True,
+        },
+        "cover": {
+            "url": f"/v1/android/books/{book.get('id')}/cover",
+            "cached_by_android": True,
+            "source": "library_cover_api",
+        },
+        "compatibility": {
+            "schema": compatibility.get("schema") or EPUB_COMPATIBILITY_REPORT_SCHEMA,
+            **contract,
+            "image_only_ratio": compatibility.get("image_only_ratio", 0),
+            "page_progression": compatibility.get("page_progression") or "ltr",
+            "source_fixed_layout": bool(compatibility.get("source_fixed_layout")),
+            "recommended_spread": compatibility.get("recommended_spread") or "never",
+            "correction_queue_required": bool(compatibility.get("correction_queue_required")),
+        },
+        "display_variants": {
+            "schema": DISPLAY_VARIANT_SCHEMA,
+            "available": contract["display_variants_available"],
+            "url": f"/v1/android/books/{book.get('id')}/display-variants" if contract["display_variants_available"] else "",
+            "cached_by_android": True,
+            "offset_contract": (compatibility.get("display_variants") or {}).get("offset_contract") or "",
+        },
+        "living_book_analysis": {
+            "state": contract["analysis_state"],
+            "updated_at": contract["analysis_updated_at"],
+            "status_url": f"/books/{book.get('id')}/living-book/analysis-status",
+            "analyze_url": f"/books/{book.get('id')}/living-book/analyze",
+        },
+        "organization": android_book_organization(book),
+    }
+    if include_chapters:
+        chapters: list[dict[str, Any]] = []
+        with zipfile.ZipFile(epub_path) as epub:
+            for chapter in publication.get("chapters") or []:
+                try:
+                    raw_html = zip_text(epub, chapter["href"])
+                except KeyError:
+                    raw_html = ""
+                chapters.append(
+                    {
+                        "index": chapter.get("index"),
+                        "locator": chapter.get("locator"),
+                        "title": chapter.get("title"),
+                        "href": chapter.get("href"),
+                        "html": transform_epub_html_assets(str(book.get("id") or ""), str(chapter.get("href") or ""), raw_html)
+                        if raw_html
+                        else "",
+                    }
+                )
+        payload["chapters"] = chapters
+    return payload
+
+
+def android_pdf_sync_payload(book: dict[str, Any]) -> dict[str, Any]:
+    contract = android_book_contract_fields(book, {})
+    return {
+        "book": {**android_safe_book_payload(book), **contract},
+        "source": android_source_contract(book),
+        "cover": {
+            "url": f"/v1/android/books/{book.get('id')}/cover",
+            "cached_by_android": True,
+            "source": "library_cover_api",
+        },
+        "living_book_analysis": {
+            "state": contract["analysis_state"],
+            "updated_at": contract["analysis_updated_at"],
+            "status_url": f"/books/{book.get('id')}/living-book/analysis-status",
+            "analyze_url": f"/books/{book.get('id')}/living-book/analyze",
+        },
+        "organization": android_book_organization(book),
+    }
+
+
+def android_book_sync_payload(
+    book: dict[str, Any],
+    *,
+    include_chapters: bool = False,
+    conn: Any = None,
+) -> dict[str, Any]:
+    book_id = str(book.get("id") or "")
+    if not isinstance(book.get("_android_source_snapshot"), dict):
+        book = resolve_android_book_source(book_id, conn=conn)
+    source_kind = str(book.get("source_kind") or book.get("file_kind") or "").strip().lower()
+    if source_kind == "epub":
+        payload = android_publication_payload(book, include_chapters=include_chapters)
+    elif source_kind == "pdf":
+        # PDF participates in metadata/position/annotation sync, but never enters the EPUB
+        # publication/chapter builder.
+        payload = android_pdf_sync_payload(book)
+    else:
+        raise ValueError("unsupported Android book source kind")
+    def load_rows(active_conn: Any) -> tuple[Any, list[Any], list[Any], int]:
+        position = active_conn.execute(
+            """
+            SELECT rp.*, COALESCE(rv.version, 1) AS server_version
+            FROM reader.reading_positions rp
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='position' AND rv.resource_id=rp.book_id
+            WHERE rp.book_id = %s
+            """,
+            (book_id,),
+        ).fetchone()
+        annotations = active_conn.execute(
+            """
+            SELECT a.*, COALESCE(rv.version, 1) AS server_version
+            FROM reader.annotations a
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='annotation' AND rv.resource_id=a.id
+            WHERE a.book_id = %s
+            ORDER BY a.chapter_locator ASC, a.created_at ASC
+            """,
+            (book_id,),
+        ).fetchall()
+        audio_notes = active_conn.execute(
+            """
+            SELECT an.id, an.annotation_id, an.book_id, an.audio_hash, an.duration_seconds, an.provider,
+                   an.transcript, an.status, an.error_message, an.created_at, an.updated_at,
+                   COALESCE(rv.version, 1) AS server_version
+            FROM reader.audio_notes an
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='audio_note' AND rv.resource_id=an.id
+            WHERE an.book_id = %s
+            ORDER BY an.created_at ASC
+            """,
+            (book_id,),
+        ).fetchall()
+        version_row = active_conn.execute(
+            """
+            SELECT COALESCE(version, 1) AS version
+            FROM reader.android_sync_resource_versions
+            WHERE resource_type='book' AND resource_id=%s
+            """,
+            (book_id,),
+        ).fetchone()
+        return position, list(annotations), list(audio_notes), int((version_row or {}).get("version") or 1)
+
+    if conn is None:
+        with db.connect() as owned_conn:
+            position, annotations, audio_notes, book_version = load_rows(owned_conn)
+    else:
+        position, annotations, audio_notes, book_version = load_rows(conn)
+    payload["book"]["server_version"] = book_version
+    payload.update(
+        {
+            "position": jsonable(dict(position)) if position else None,
+            "annotations": [jsonable(dict(row)) for row in annotations],
+            "audio_notes": [jsonable(dict(row)) for row in audio_notes],
+        }
+    )
+    return payload
+
+
+def android_changed_rows(since: str) -> dict[str, Any]:
+    with db.connect() as conn:
+        cursor = android_sync_cursor(conn)
+        books = conn.execute(
+            """
+            SELECT b.*,
+                   ls.metadata AS library_metadata,
+                   bf.file_path,
+                   bf.file_kind,
+                   bf.file_hash,
+                   bf.byte_size
+            FROM reader.books b
+            LEFT JOIN reader.library_state ls ON ls.book_id = b.id
+            LEFT JOIN LATERAL (
+                SELECT file_path, file_kind, file_hash, byte_size
+                FROM reader.book_files
+                WHERE book_id = b.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) bf ON true
+            WHERE COALESCE(ls.hidden, false) = false
+              AND lower(COALESCE(b.source_kind, bf.file_kind, '')) IN ('epub', 'pdf')
+              AND (
+                b.updated_at > %s::timestamptz
+                OR COALESCE(b.last_opened_at, b.created_at) > %s::timestamptz
+                OR COALESCE(ls.updated_at, b.updated_at) > %s::timestamptz
+              )
+            ORDER BY b.updated_at DESC
+            """,
+            (since, since, since),
+        ).fetchall()
+        resolved_books: list[dict[str, Any]] = []
+        for row in books:
+            try:
+                resolved_books.append(resolve_android_book_source(str(row["id"]), conn=conn))
+            except HTTPException as exc:
+                if exc.status_code not in {404, 409}:
+                    raise
+        books = resolved_books
+        removed_books = conn.execute(
+            """
+            SELECT ls.book_id
+            FROM reader.library_state ls
+            JOIN reader.books b ON b.id = ls.book_id
+            WHERE ls.hidden = true
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+              AND ls.updated_at > %s::timestamptz
+            ORDER BY ls.updated_at ASC
+            """,
+            (since,),
+        ).fetchall()
+        positions = conn.execute(
+            """
+            SELECT rp.*
+            FROM reader.reading_positions rp
+            JOIN reader.books b ON b.id = rp.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id = rp.book_id
+            WHERE rp.updated_at > %s::timestamptz
+              AND COALESCE(ls.hidden, false) = false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            ORDER BY rp.updated_at ASC
+            """,
+            (since,),
+        ).fetchall()
+        annotations = conn.execute(
+            """
+            SELECT a.*
+            FROM reader.annotations a
+            JOIN reader.books b ON b.id = a.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id = a.book_id
+            WHERE (a.updated_at > %s::timestamptz OR a.created_at > %s::timestamptz)
+              AND COALESCE(ls.hidden, false) = false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            ORDER BY a.updated_at ASC, a.created_at ASC
+            """,
+            (since, since),
+        ).fetchall()
+        audio_notes = conn.execute(
+            """
+            SELECT an.id, an.annotation_id, an.book_id, an.audio_hash, an.duration_seconds, an.provider,
+                   an.transcript, an.raw_result, an.status, an.error_message, an.created_at, an.updated_at
+            FROM reader.audio_notes an
+            JOIN reader.books b ON b.id = an.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id = an.book_id
+            WHERE (an.updated_at > %s::timestamptz OR an.created_at > %s::timestamptz)
+              AND COALESCE(ls.hidden, false) = false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            ORDER BY an.updated_at ASC, an.created_at ASC
+            """,
+            (since, since),
+        ).fetchall()
+        visible_contract_books = conn.execute(
+            """
+            SELECT b.*,
+                   ls.metadata AS library_metadata,
+                   bf.file_path,
+                   bf.file_kind,
+                   bf.file_hash,
+                   bf.byte_size
+            FROM reader.books b
+            LEFT JOIN reader.library_state ls ON ls.book_id = b.id
+            LEFT JOIN LATERAL (
+                SELECT file_path, file_kind, file_hash, byte_size
+                FROM reader.book_files
+                WHERE book_id = b.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) bf ON true
+            WHERE COALESCE(ls.hidden, false) = false
+              AND lower(COALESCE(b.source_kind, bf.file_kind, '')) IN ('epub', 'pdf')
+            """
+        ).fetchall()
+    since_time = parse_living_book_time(since)
+    book_contracts: list[dict[str, Any]] = []
+    for row in visible_contract_books:
+        book = jsonable(dict(row))
+        contract = android_book_contract_fields(book)
+        contract_time = parse_living_book_time(str(contract.get("analysis_updated_at") or ""))
+        if contract_time and (since_time is None or contract_time > since_time):
+            book_contracts.append({"book_id": book.get("id"), **contract})
+    return {
+        "cursor": cursor,
+        "books": [
+            {
+                **android_safe_book_payload(dict(row)),
+                **android_source_projection_fields(dict(row)),
+                **android_book_contract_fields(dict(row)),
+                "organization": android_book_organization(dict(row)),
+            }
+            for row in books
+        ],
+        "book_contracts": book_contracts,
+        "removed_book_ids": [str(row["book_id"]) for row in removed_books],
+        "positions": [jsonable(dict(row)) for row in positions],
+        "annotations": [jsonable(dict(row)) for row in annotations],
+        "audio_notes": [jsonable(dict(row)) for row in audio_notes],
+    }
+
+
+def android_event_changes(conn: Any, events: list[dict[str, Any]]) -> dict[str, Any]:
+    book_resource_types = {"book", "library_state", "book_asset"}
+    book_ids = {
+        str(event["resource_id"])
+        for event in events
+        if str(event.get("resource_type") or "") in book_resource_types
+    }
+    position_ids = {
+        str(event["resource_id"])
+        for event in events
+        if str(event.get("resource_type") or "") == "position"
+    }
+    annotation_ids = {
+        str(event["resource_id"])
+        for event in events
+        if str(event.get("resource_type") or "") == "annotation"
+    }
+    audio_note_ids = {
+        str(event["resource_id"])
+        for event in events
+        if str(event.get("resource_type") or "") == "audio_note"
+    }
+    books_to_refresh = {
+        str(event["resource_id"])
+        for event in events
+        if str(event.get("resource_type") or "") in {"book", "book_asset"}
+    }
+
+    visible_books, _ = android_visible_books_and_removed_ids(conn)
+    visible_by_id = {
+        str(row.get("id") or ""): row
+        for row in visible_books
+        if isinstance(row.get("_android_source_snapshot"), dict)
+    }
+    changed_books: list[dict[str, Any]] = []
+    removed_book_ids: list[str] = []
+    for book_id in sorted(book_ids):
+        book = visible_by_id.get(book_id)
+        if not book:
+            removed_book_ids.append(book_id)
+            continue
+        version = conn.execute(
+            """
+            SELECT COALESCE(version, 1) AS version
+            FROM reader.android_sync_resource_versions
+            WHERE resource_type='book' AND resource_id=%s
+            """,
+            (book_id,),
+        ).fetchone()
+        changed_books.append(
+            {
+                **android_safe_book_payload(book),
+                **android_source_projection_fields(book),
+                **android_book_contract_fields(book),
+                "server_version": int((version or {}).get("version") or 1),
+                "organization": android_book_organization(book),
+            }
+        )
+
+    positions: list[dict[str, Any]] = []
+    if position_ids:
+        rows = conn.execute(
+            """
+            SELECT rp.*, COALESCE(rv.version, 1) AS server_version
+            FROM reader.reading_positions rp
+            JOIN reader.books b ON b.id=rp.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id=rp.book_id
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='position' AND rv.resource_id=rp.book_id
+            WHERE rp.book_id = ANY(%s)
+              AND COALESCE(ls.hidden, false)=false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            """,
+            (list(position_ids),),
+        ).fetchall()
+        positions = [jsonable(dict(row)) for row in rows]
+    returned_position_ids = {str(row.get("book_id") or "") for row in positions}
+
+    annotations: list[dict[str, Any]] = []
+    if annotation_ids:
+        rows = conn.execute(
+            """
+            SELECT a.*, COALESCE(rv.version, 1) AS server_version
+            FROM reader.annotations a
+            JOIN reader.books b ON b.id=a.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id=a.book_id
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='annotation' AND rv.resource_id=a.id
+            WHERE a.id = ANY(%s)
+              AND COALESCE(ls.hidden, false)=false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            """,
+            (list(annotation_ids),),
+        ).fetchall()
+        annotations = [jsonable(dict(row)) for row in rows]
+    returned_annotation_ids = {str(row.get("id") or "") for row in annotations}
+
+    audio_notes: list[dict[str, Any]] = []
+    if audio_note_ids:
+        rows = conn.execute(
+            """
+            SELECT an.id, an.annotation_id, an.book_id, an.audio_hash, an.duration_seconds,
+                   an.provider, an.transcript, an.status, an.error_message,
+                   an.created_at, an.updated_at, COALESCE(rv.version, 1) AS server_version
+            FROM reader.audio_notes an
+            JOIN reader.books b ON b.id=an.book_id
+            LEFT JOIN reader.library_state ls ON ls.book_id=an.book_id
+            LEFT JOIN reader.android_sync_resource_versions rv
+              ON rv.resource_type='audio_note' AND rv.resource_id=an.id
+            WHERE an.id = ANY(%s)
+              AND COALESCE(ls.hidden, false)=false
+              AND lower(COALESCE(b.source_kind, '')) IN ('epub', 'pdf')
+            """,
+            (list(audio_note_ids),),
+        ).fetchall()
+        audio_notes = [jsonable(dict(row)) for row in rows]
+    returned_audio_note_ids = {str(row.get("id") or "") for row in audio_notes}
+
+    return {
+        "books": changed_books,
+        "books_to_refresh": sorted(book_id for book_id in books_to_refresh if book_id in visible_by_id),
+        "book_contracts": [],
+        "removed_book_ids": removed_book_ids,
+        "positions": positions,
+        "removed_position_book_ids": sorted(position_ids - returned_position_ids),
+        "annotations": annotations,
+        "removed_annotation_ids": sorted(annotation_ids - returned_annotation_ids),
+        "audio_notes": audio_notes,
+        "removed_audio_note_ids": sorted(audio_note_ids - returned_audio_note_ids),
+    }
+
+
+def android_operation_metadata(operation: AndroidSyncOperation) -> dict[str, Any]:
+    return {
+        "source": "android_readium_native_reader",
+        "operation_id": operation.operation_id,
+        "device_id": operation.device_id or "",
+        "base_server_version": operation.base_server_version or "",
+        "client_created_at": operation.created_at or "",
+        "client_updated_at": operation.updated_at or "",
+    }
+
+
+def android_operation_dict(operation: AndroidSyncOperation) -> dict[str, Any]:
+    if hasattr(operation, "model_dump"):
+        return operation.model_dump()
+    return operation.dict()
+
+
+def android_operation_base_version(operation: AndroidSyncOperation) -> Optional[int]:
+    raw = str(operation.base_server_version or (operation.payload or {}).get("base_server_version") or "").strip()
+    if not raw or not re.fullmatch(r"\d+", raw):
+        return None
+    return int(raw)
+
+
+def android_annotation_conflict(
+    operation: AndroidSyncOperation,
+    *,
+    current: Optional[dict[str, Any]],
+    version_state: Optional[dict[str, Any]],
+    reason: str,
+) -> tuple[dict[str, Any], str, int]:
+    current_version = int((version_state or {}).get("version") or 0)
+    result = {
+        "ok": False,
+        "operation_id": operation.operation_id,
+        "operation_type": operation.operation_type,
+        "conflict": True,
+        "retryable": False,
+        "error": reason,
+        "base_server_version": operation.base_server_version or "",
+        "server_version": current_version,
+        "server_deleted": bool((version_state or {}).get("deleted")),
+        "server_record": jsonable(current) if current else None,
+        "client_payload": jsonable(dict(operation.payload or {})),
+    }
+    return result, "conflict", 409
+
+
+def apply_android_sync_operation_v2(
+    conn: Any,
+    operation: AndroidSyncOperation,
+    default_device_id: str,
+) -> tuple[dict[str, Any], str, int]:
+    payload = dict(operation.payload or {})
+    operation.device_id = operation.device_id or default_device_id
+    op_type = operation.operation_type.strip().lower()
+    if not operation.operation_id:
+        return {
+            "ok": False,
+            "operation_id": "",
+            "operation_type": op_type,
+            "retryable": False,
+            "error": "operation_id is required",
+        }, "permanent_failed", 422
+
+    conn.execute("SELECT set_config('click.android_device_id', %s, true)", (default_device_id,))
+    conn.execute("SELECT set_config('click.android_operation_id', %s, true)", (operation.operation_id,))
+
+    if op_type == "reading_position_updated":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        chapter_locator = str(payload.get("chapter_locator") or "").strip()
+        if not book_id or not chapter_locator:
+            return {
+                "ok": False,
+                "operation_id": operation.operation_id,
+                "operation_type": op_type,
+                "retryable": False,
+                "error": "book_id and chapter_locator are required",
+            }, "permanent_failed", 422
+        client_updated_at = parse_living_book_time(str(operation.updated_at or operation.created_at or ""))
+        checkpoint = conn.execute(
+            """
+            INSERT INTO reader.android_reading_position_checkpoints (
+              book_id, device_id, chapter_id, chapter_locator, page_index, total_pages,
+              page_ratio, locator, client_updated_at, operation_id, server_updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (book_id, device_id) DO UPDATE
+            SET chapter_id=EXCLUDED.chapter_id,
+                chapter_locator=EXCLUDED.chapter_locator,
+                page_index=EXCLUDED.page_index,
+                total_pages=EXCLUDED.total_pages,
+                page_ratio=EXCLUDED.page_ratio,
+                locator=EXCLUDED.locator,
+                client_updated_at=EXCLUDED.client_updated_at,
+                operation_id=EXCLUDED.operation_id,
+                server_updated_at=now()
+            RETURNING *
+            """,
+            (
+                book_id,
+                default_device_id,
+                payload.get("chapter_id"),
+                chapter_locator,
+                int(payload.get("page_index") or 0),
+                max(1, int(payload.get("total_pages") or 1)),
+                float(payload.get("page_ratio") or 0),
+                db.jsonb(dict(payload.get("locator") or {})),
+                client_updated_at,
+                operation.operation_id,
+            ),
+        ).fetchone()
+        position = conn.execute(
+            """
+            INSERT INTO reader.reading_positions (
+              book_id, chapter_id, chapter_locator, page_index, total_pages, page_ratio, locator, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (book_id) DO UPDATE
+            SET chapter_id=EXCLUDED.chapter_id,
+                chapter_locator=EXCLUDED.chapter_locator,
+                page_index=EXCLUDED.page_index,
+                total_pages=EXCLUDED.total_pages,
+                page_ratio=EXCLUDED.page_ratio,
+                locator=EXCLUDED.locator,
+                updated_at=now()
+            RETURNING *
+            """,
+            (
+                book_id,
+                payload.get("chapter_id"),
+                chapter_locator,
+                int(payload.get("page_index") or 0),
+                max(1, int(payload.get("total_pages") or 1)),
+                float(payload.get("page_ratio") or 0),
+                db.jsonb(dict(payload.get("locator") or {})),
+            ),
+        ).fetchone()
+        version = android_resource_version(conn, "position", book_id) or {}
+        result = {
+            **jsonable(dict(position)),
+            "device_id": default_device_id,
+            "device_checkpoint_updated_at": jsonable(checkpoint["server_updated_at"]),
+            "server_version": int(version.get("version") or 1),
+        }
+        return {
+            "ok": True,
+            "operation_id": operation.operation_id,
+            "operation_type": op_type,
+            "result": result,
+        }, "applied", 200
+
+    if op_type in {"annotation_created", "red_highlight_created", "note_created"}:
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        chapter_locator = str(payload.get("chapter_locator") or "").strip()
+        if not book_id or not chapter_locator:
+            return {
+                "ok": False,
+                "operation_id": operation.operation_id,
+                "operation_type": op_type,
+                "retryable": False,
+                "error": "book_id and chapter_locator are required",
+            }, "permanent_failed", 422
+        metadata = dict(payload.get("metadata") or {})
+        metadata.update(android_operation_metadata(operation))
+        kind = str(payload.get("kind") or ("red_highlight" if op_type == "red_highlight_created" else "note"))
+        annotation_id = new_id("ann")
+        row = conn.execute(
+            """
+            INSERT INTO reader.annotations (
+              id, book_id, sentence_id, kind, source_text, note_text, color,
+              chapter_title, chapter_locator, range_locator, metadata, created_at, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
+            RETURNING *
+            """,
+            (
+                annotation_id,
+                book_id,
+                payload.get("sentence_id"),
+                kind,
+                str(payload.get("source_text") or ""),
+                payload.get("note_text"),
+                payload.get("color") or ("red" if kind == "red_highlight" else None),
+                payload.get("chapter_title"),
+                chapter_locator,
+                db.jsonb(dict(payload.get("range_locator") or {})),
+                db.jsonb(metadata),
+            ),
+        ).fetchone()
+        enqueue_living_book_evidence_sync(
+            conn,
+            source_kind="annotation",
+            source_id=annotation_id,
+            book_id=book_id,
+            operation="annotation_created",
+            details={"kind": kind},
+        )
+        version = android_resource_version(conn, "annotation", annotation_id) or {}
+        result = {**jsonable(dict(row)), "server_version": int(version.get("version") or 1)}
+        return {
+            "ok": True,
+            "operation_id": operation.operation_id,
+            "operation_type": op_type,
+            "result": result,
+        }, "applied", 200
+
+    if op_type in {"annotation_updated", "annotation_deleted"}:
+        annotation_id = str(payload.get("annotation_id") or "").strip()
+        if not annotation_id:
+            return {
+                "ok": False,
+                "operation_id": operation.operation_id,
+                "operation_type": op_type,
+                "retryable": False,
+                "error": "annotation_id is required",
+            }, "permanent_failed", 422
+        current_row = conn.execute(
+            "SELECT * FROM reader.annotations WHERE id=%s FOR UPDATE",
+            (annotation_id,),
+        ).fetchone()
+        current = dict(current_row) if current_row else None
+        version_state = android_resource_version(conn, "annotation", annotation_id)
+        if op_type == "annotation_deleted" and not current and version_state and version_state.get("deleted"):
+            return {
+                "ok": True,
+                "operation_id": operation.operation_id,
+                "operation_type": op_type,
+                "already_deleted": True,
+                "result": {
+                    "id": annotation_id,
+                    "deleted": True,
+                    "server_version": int(version_state.get("version") or 1),
+                },
+            }, "applied", 200
+        if not current:
+            return android_annotation_conflict(
+                operation,
+                current=None,
+                version_state=version_state,
+                reason="annotation was deleted or does not exist; client content was preserved in this conflict receipt",
+            )
+        current_version = int((version_state or {}).get("version") or 1)
+        base_version = android_operation_base_version(operation)
+        if base_version is None:
+            return android_annotation_conflict(
+                operation,
+                current=current,
+                version_state=version_state or {"version": current_version, "deleted": False},
+                reason="base_server_version is required for annotation updates and deletes",
+            )
+        if base_version != current_version:
+            return android_annotation_conflict(
+                operation,
+                current=current,
+                version_state=version_state or {"version": current_version, "deleted": False},
+                reason="annotation changed on another device; no content was overwritten",
+            )
+        if op_type == "annotation_updated":
+            metadata_patch = payload.get("metadata")
+            if isinstance(metadata_patch, dict):
+                metadata_patch = {**metadata_patch, **android_operation_metadata(operation)}
+            row = conn.execute(
+                """
+                UPDATE reader.annotations
+                SET note_text=COALESCE(%s, note_text),
+                    color=COALESCE(%s, color),
+                    metadata=COALESCE(%s, metadata),
+                    updated_at=now()
+                WHERE id=%s
+                RETURNING *
+                """,
+                (
+                    payload.get("note_text"),
+                    payload.get("color"),
+                    db.jsonb(metadata_patch) if isinstance(metadata_patch, dict) else None,
+                    annotation_id,
+                ),
+            ).fetchone()
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="annotation",
+                source_id=annotation_id,
+                book_id=str(row["book_id"]),
+                operation="annotation_updated",
+            )
+            version = android_resource_version(conn, "annotation", annotation_id) or {}
+            result = {**jsonable(dict(row)), "server_version": int(version.get("version") or current_version + 1)}
+        else:
+            row = conn.execute(
+                "DELETE FROM reader.annotations WHERE id=%s RETURNING id, book_id, kind, chapter_locator",
+                (annotation_id,),
+            ).fetchone()
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="annotation",
+                source_id=annotation_id,
+                book_id=str(row["book_id"]),
+                operation="annotation_deleted",
+                details={"kind": row.get("kind"), "chapter_locator": row.get("chapter_locator"), "tombstone": True},
+            )
+            version = android_resource_version(conn, "annotation", annotation_id) or {}
+            result = {
+                "id": annotation_id,
+                "deleted": True,
+                "server_version": int(version.get("version") or current_version + 1),
+            }
+        return {
+            "ok": True,
+            "operation_id": operation.operation_id,
+            "operation_type": op_type,
+            "result": result,
+        }, "applied", 200
+
+    if op_type == "book_organization_updated":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        exists = conn.execute("SELECT 1 AS value FROM reader.books WHERE id=%s", (book_id,)).fetchone()
+        if not book_id or not exists:
+            return {
+                "ok": False,
+                "operation_id": operation.operation_id,
+                "operation_type": op_type,
+                "retryable": False,
+                "error": "book does not exist",
+            }, "permanent_failed", 404
+        current = conn.execute(
+            "SELECT metadata FROM reader.library_state WHERE book_id=%s",
+            (book_id,),
+        ).fetchone()
+        metadata = dict((current or {}).get("metadata") or {})
+        if "favorite" in payload:
+            metadata["favorite"] = bool(payload.get("favorite"))
+        if "custom_category" in payload:
+            category = re.sub(r"\s+", " ", str(payload.get("custom_category") or "")).strip()
+            if category:
+                metadata["custom_category"] = category[:48]
+            else:
+                metadata.pop("custom_category", None)
+        if "tags" in payload:
+            tags = list(dict.fromkeys(str(tag or "").strip()[:32] for tag in payload.get("tags") or [] if str(tag or "").strip()))
+            if tags:
+                metadata["tags"] = tags[:12]
+            else:
+                metadata.pop("tags", None)
+        row = conn.execute(
+            """
+            INSERT INTO reader.library_state (book_id, hidden, source, metadata, created_at, updated_at)
+            VALUES (%s, false, 'android_readium_organization', %s, now(), now())
+            ON CONFLICT (book_id) DO UPDATE
+            SET metadata=EXCLUDED.metadata,
+                source=EXCLUDED.source,
+                updated_at=now()
+            RETURNING *
+            """,
+            (book_id, db.jsonb(metadata)),
+        ).fetchone()
+        version = android_resource_version(conn, "library_state", book_id) or {}
+        return {
+            "ok": True,
+            "operation_id": operation.operation_id,
+            "operation_type": op_type,
+            "result": {
+                "book_id": book_id,
+                "organization": android_book_organization({"library_metadata": metadata}),
+                "server_version": int(version.get("version") or 1),
+                "updated_at": jsonable(row["updated_at"]),
+            },
+        }, "applied", 200
+
+    if op_type in {"audio_note_created", "living_book_analysis_requested"}:
+        # These paths include a durable audio file or an asynchronous Mac job,
+        # so they retain their existing reconciliation logic. The operation
+        # receipt still prevents normal retries from duplicating the outcome.
+        result = apply_android_sync_operation(operation, default_device_id)
+        if op_type == "audio_note_created" and isinstance(result.get("result"), dict):
+            audio = result["result"].get("audio_note")
+            if isinstance(audio, dict):
+                result["result"]["audio_note"] = {
+                    key: jsonable(audio.get(key))
+                    for key in (
+                        "id",
+                        "annotation_id",
+                        "book_id",
+                        "audio_hash",
+                        "duration_seconds",
+                        "provider",
+                        "transcript",
+                        "status",
+                        "error_message",
+                        "created_at",
+                        "updated_at",
+                    )
+                    if key in audio
+                }
+        return result, "applied" if result.get("ok") else "permanent_failed", 200 if result.get("ok") else 422
+
+    return {
+        "ok": False,
+        "operation_id": operation.operation_id,
+        "operation_type": op_type,
+        "retryable": False,
+        "error": f"unsupported operation_type: {operation.operation_type}",
+    }, "permanent_failed", 422
+
+
+def apply_android_sync_operation(operation: AndroidSyncOperation, default_device_id: str) -> dict[str, Any]:
+    payload = dict(operation.payload or {})
+    operation.device_id = operation.device_id or default_device_id
+    op_type = operation.operation_type.strip().lower()
+    if not operation.operation_id:
+        raise HTTPException(status_code=400, detail="operation_id is required")
+    with db.connect() as conn:
+        duplicate = conn.execute(
+            """
+            SELECT id, kind
+            FROM reader.annotations
+            WHERE metadata->>'operation_id' = %s
+            LIMIT 1
+            """,
+            (operation.operation_id,),
+        ).fetchone()
+    if duplicate and op_type in {"annotation_created", "red_highlight_created", "note_created"}:
+        return {"ok": True, "duplicate": True, "operation_id": operation.operation_id, "result": jsonable(dict(duplicate))}
+
+    if op_type == "living_book_analysis_requested":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        if not book_id:
+            raise HTTPException(status_code=400, detail="book_id is required for living_book_analysis_requested")
+        result = queue_living_book_analysis(
+            book_id,
+            requested_by=f"android:{operation.device_id or default_device_id or 'unknown'}",
+            force=bool(payload.get("force")),
+            start_async=True,
+        )
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type == "book_organization_updated":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        if not book_id:
+            raise HTTPException(status_code=400, detail="book_id is required for book_organization_updated")
+        result = update_library_book_organization(
+            book_id,
+            LibraryOrganizationPatch(
+                favorite=payload.get("favorite") if "favorite" in payload else None,
+                custom_category=payload.get("custom_category") if "custom_category" in payload else None,
+                tags=payload.get("tags") if "tags" in payload else None,
+            ),
+            source="android_readium_organization",
+        )
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type == "reading_position_updated":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        if not book_id:
+            raise HTTPException(status_code=400, detail="book_id is required for reading_position_updated")
+        result = upsert_position(
+            book_id,
+            PositionUpsert(
+                chapter_id=payload.get("chapter_id"),
+                chapter_locator=str(payload.get("chapter_locator") or ""),
+                page_index=int(payload.get("page_index") or 0),
+                total_pages=max(1, int(payload.get("total_pages") or 1)),
+                page_ratio=float(payload.get("page_ratio") or 0),
+                locator=dict(payload.get("locator") or {}),
+            ),
+        )
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type in {"annotation_created", "red_highlight_created", "note_created"}:
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        if not book_id:
+            raise HTTPException(status_code=400, detail="book_id is required for annotation operation")
+        metadata = dict(payload.get("metadata") or {})
+        metadata.update(android_operation_metadata(operation))
+        kind = str(payload.get("kind") or ("red_highlight" if op_type == "red_highlight_created" else "note"))
+        result = create_annotation(
+            AnnotationCreate(
+                book_id=book_id,
+                sentence_id=payload.get("sentence_id"),
+                kind=kind,
+                source_text=str(payload.get("source_text") or ""),
+                note_text=payload.get("note_text"),
+                color=payload.get("color") or ("red" if kind == "red_highlight" else None),
+                chapter_title=payload.get("chapter_title"),
+                chapter_locator=str(payload.get("chapter_locator") or ""),
+                range_locator=dict(payload.get("range_locator") or {}),
+                metadata=metadata,
+            ),
+        )
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type == "annotation_updated":
+        annotation_id = str(payload.get("annotation_id") or "").strip()
+        if not annotation_id:
+            raise HTTPException(status_code=400, detail="annotation_id is required")
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            metadata = {**metadata, **android_operation_metadata(operation)}
+        result = patch_annotation(
+            annotation_id,
+            AnnotationPatch(note_text=payload.get("note_text"), color=payload.get("color"), metadata=metadata),
+        )
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type == "annotation_deleted":
+        annotation_id = str(payload.get("annotation_id") or "").strip()
+        if not annotation_id:
+            raise HTTPException(status_code=400, detail="annotation_id is required")
+        result = delete_annotation(annotation_id)
+        return {"ok": True, "operation_id": operation.operation_id, "result": jsonable(result)}
+
+    if op_type == "audio_note_created":
+        book_id = str(operation.book_id or payload.get("book_id") or "").strip()
+        audio_base64 = str(payload.get("audio_base64") or "")
+        if not book_id or not audio_base64:
+            raise HTTPException(status_code=400, detail="book_id and audio_base64 are required")
+        annotation_id = str(duplicate.get("id") or "") if duplicate else ""
+        if not annotation_id:
+            metadata = dict(payload.get("metadata") or {})
+            metadata.update(android_operation_metadata(operation))
+            annotation = create_annotation(
+                AnnotationCreate(
+                    book_id=book_id,
+                    kind="note",
+                    source_text=str(payload.get("source_text") or ""),
+                    note_text=VOICE_NOTE_PENDING_TEXT,
+                    chapter_title=payload.get("chapter_title"),
+                    chapter_locator=str(payload.get("chapter_locator") or ""),
+                    range_locator=dict(payload.get("range_locator") or {}),
+                    metadata=metadata,
+                )
+            )
+            annotation_id = str(annotation.get("id") or "")
+
+        with db.connect() as conn:
+            existing_audio = conn.execute(
+                "SELECT * FROM reader.audio_notes WHERE annotation_id = %s ORDER BY created_at DESC LIMIT 1",
+                (annotation_id,),
+            ).fetchone()
+        if existing_audio:
+            audio_result = jsonable(dict(existing_audio))
+        else:
+            audio_result = lan_audio_note_transcribe(
+                LANAudioTranscribe(
+                    book_id=book_id,
+                    annotation_id=annotation_id,
+                    audio_base64=audio_base64,
+                    mime_type=str(payload.get("mime_type") or "audio/wav"),
+                    duration_seconds=payload.get("duration_seconds"),
+                )
+            )
+        with db.connect() as conn:
+            annotation = conn.execute("SELECT * FROM reader.annotations WHERE id = %s", (annotation_id,)).fetchone()
+        result = jsonable(dict(annotation)) if annotation else {"id": annotation_id, "kind": "note"}
+        result["audio_note"] = audio_result
+        return {"ok": True, "operation_id": operation.operation_id, "result": result}
+
+    return {"ok": False, "operation_id": operation.operation_id, "error": f"unsupported operation_type: {operation.operation_type}"}
+
+
+@app.get("/v1/android/readium/health")
+def android_readium_health(request: FastAPIRequest) -> dict[str, Any]:
+    require_android_access(request)
+    return {
+        "ok": True,
+        "schema": "click.android.readium.health.v1",
+        "reader_api": "available",
+        "readium": {
+            "toolkit": "Readium Kotlin Toolkit",
+            "expected_dependency": "org.readium.kotlin-toolkit",
+            "version_policy": "Maven Central dependency; Android client owns runtime integration",
+            "forked_legado": False,
+            "forked_moon_reader": False,
+        },
+        "sync": {
+            "source_of_truth": "Mac Reader API / PostgreSQL",
+            "android_role": "local replica + offline operation queue",
+            "full_sync": "/v1/android/sync/full",
+            "changes": "/v1/android/sync/changes",
+            "operations": "/v1/android/sync/operations",
+        },
+        "tts": {
+            "default": "Android sherpa-onnx local voice package",
+            "local_runtime": "sherpa-onnx",
+            "local_model_delivery": "user-imported verified package in Android app-private storage",
+            "online_optional": "Mac edge-tts",
+            "online_voice": EDGE_TTS_VOICE,
+            "offline_fallback": "installed Android TextToSpeech voice with network_required=false",
+            "local_private_network_tts": False,
+            "azure_default": False,
+        },
+    }
+
+
+@app.get("/v1/android/app-update")
+def android_app_update(
+    request: FastAPIRequest,
+    current_version_code: int = 0,
+) -> dict[str, Any]:
+    require_android_access(request)
+    latest = load_android_update_manifest()
+    if latest is None:
+        return {
+            "ok": True,
+            "schema": ANDROID_UPDATE_SCHEMA,
+            "available": False,
+            "reason": "not_published",
+        }
+    available = latest["version_code"] > max(0, current_version_code)
+    return {
+        "ok": True,
+        "schema": ANDROID_UPDATE_SCHEMA,
+        "available": available,
+        "version_code": latest["version_code"],
+        "version_name": latest["version_name"],
+        "apk_url": f"/v1/android/app-update/{latest['artifact_id']}/apk" if available else "",
+        "apk_bytes": latest["apk_bytes"],
+        "apk_sha256": latest["apk_sha256"],
+        "certificate_sha256": latest["certificate_sha256"],
+        "min_sdk": latest["min_sdk"],
+        "mandatory": bool(latest.get("mandatory", False)),
+        "release_notes": str(latest.get("release_notes") or "")[:2000],
+        "published_at": str(latest.get("published_at") or ""),
+    }
+
+
+@app.get("/v1/android/app-update/{artifact_id}/apk")
+def android_app_update_apk(request: FastAPIRequest, artifact_id: str) -> FileResponse:
+    require_android_access(request)
+    latest = load_android_update_manifest()
+    if latest is None or artifact_id != latest["artifact_id"]:
+        raise HTTPException(status_code=404, detail="Android update artifact not found")
+    return FileResponse(
+        latest["apk_path"],
+        media_type="application/vnd.android.package-archive",
+        filename=f"Click-{latest['version_name']}.apk",
+    )
+
+
+@app.put("/v1/android/imports/{requested_sha256}")
+async def android_import_book(request: FastAPIRequest, requested_sha256: str) -> dict[str, Any]:
+    device_id = require_android_access(request)
+    upload = normalize_android_import_headers(request, requested_sha256)
+    staging_path: Optional[Path] = None
+    try:
+        staging_path = await stage_android_book_upload(
+            request,
+            expected_sha256=upload["book_hash"],
+            expected_byte_size=upload["byte_size"],
+        )
+        metadata = validate_android_book_upload(staging_path, upload["source_kind"])
+        imported = canonical_import_library_file(
+            staging_path,
+            filename=upload["filename"],
+            source_kind=upload["source_kind"],
+            book_hash=upload["book_hash"],
+            byte_size=upload["byte_size"],
+            title=str(metadata.get("title") or Path(upload["filename"]).stem),
+            author=str(metadata.get("author") or "").strip() or None,
+            library_source="android_stream_import",
+            library_metadata={
+                "android_device_id": device_id,
+                "canonical_asset_owner": (
+                    "knowledge_base_living_book"
+                    if upload["source_kind"] == "pdf"
+                    else "sentence_reader_app_support"
+                ),
+            },
+            update_existing_book=False,
+            merge_library_metadata=True,
+        )
+        return {
+            "ok": True,
+            "book_id": imported["book"]["id"],
+            "source_kind": imported["source_kind"],
+            "file_hash": imported["file_hash"],
+            "byte_size": imported["byte_size"],
+            "duplicate": imported["duplicate"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - internal paths and database details must never reach Android.
+        raise HTTPException(status_code=500, detail="book import failed") from exc
+    finally:
+        if staging_path is not None:
+            staging_path.unlink(missing_ok=True)
+        try:
+            android_import_staging_dir().rmdir()
+        except OSError:
+            pass
+
+
+@app.get("/v1/android/sync/manifest")
+def android_sync_manifest(request: FastAPIRequest) -> dict[str, Any]:
+    require_android_access(request)
+    with db.connect() as conn:
+        books, removed_book_ids = android_visible_books_and_removed_ids(conn)
+        cursor = android_sync_cursor(conn)
+        sequence = android_current_sequence(conn)
+    projectable_books = [
+        book
+        for book in books
+        if isinstance(book.get("_android_source_snapshot"), dict)
+    ]
+    return {
+        "ok": True,
+        "schema": "click.android.sync.manifest.v1",
+        "generated_at": now_iso(),
+        "cursor": cursor,
+        "watermark_sequence": sequence,
+        "source_of_truth": "mac_reader_api_postgresql",
+        "android_role": "local_replica_offline_queue",
+        "full_sync_url": "/v1/android/sync/full",
+        "changes_url": "/v1/android/sync/changes",
+        "operations_url": "/v1/android/sync/operations",
+        "book_count": len(projectable_books),
+        "removed_book_ids": removed_book_ids,
+        "books": [
+            {
+                "id": book.get("id"),
+                "title": book.get("title"),
+                "author": book.get("author"),
+                "source_kind": book.get("source_kind"),
+                "book_hash": book.get("book_hash"),
+                "lan_reader_url": f"/lan/reader?book_id={book.get('id')}",
+                "file_kind": book.get("file_kind"),
+                "byte_size": book.get("byte_size"),
+                **android_source_projection_fields(book),
+                "last_opened_at": book.get("last_opened_at"),
+                **android_book_contract_fields(book),
+            }
+            for book in projectable_books
+        ],
+    }
+
+
+@app.get("/v1/android/sync/full")
+def android_sync_full(request: FastAPIRequest, include_chapters: bool = True) -> dict[str, Any]:
+    require_android_access(request)
+    payloads: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    with db.connect() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        books, removed_book_ids = android_visible_books_and_removed_ids(conn)
+        cursor = android_sync_cursor(conn)
+        watermark_sequence = android_current_sequence(conn)
+        for book in books:
+            file_path_raw = str(book.get("file_path") or "").strip()
+            file_path = Path(file_path_raw).expanduser()
+            source_kind = str(book.get("source_kind") or book.get("file_kind") or "").lower()
+            contract_marker = hashlib.sha256(
+                "\0".join(
+                    [
+                        str(book.get("id") or ""),
+                        str(book.get("updated_at") or ""),
+                        str(book.get("file_hash") or ""),
+                        str(book.get("book_hash") or ""),
+                        str(book.get("byte_size") or ""),
+                        source_kind,
+                    ]
+                ).encode("utf-8")
+            ).hexdigest()
+            if source_kind not in {"epub", "pdf"}:
+                skipped.append(
+                    {
+                        "book_id": str(book.get("id") or ""),
+                        "reason": "unsupported_source_kind",
+                        "source_kind": source_kind or "unknown",
+                    }
+                )
+                continue
+            if (
+                not file_path_raw
+                or not file_path.exists()
+                or file_path.suffix.lower() != f".{source_kind}"
+            ):
+                errors.append(
+                    {
+                        "book_id": str(book.get("id") or ""),
+                        "reason": "missing_source",
+                        "source_kind": source_kind,
+                        "error": f"{source_kind.upper()} source is unavailable",
+                        "contract_marker": contract_marker,
+                    }
+                )
+                continue
+            try:
+                payloads.append(android_book_sync_payload(book, include_chapters=include_chapters, conn=conn))
+            except Exception as exc:  # noqa: BLE001 - one damaged book must not block sync of the rest.
+                errors.append(
+                    {
+                        "book_id": str(book.get("id") or ""),
+                        "reason": "publication_build_failed",
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                        "contract_marker": contract_marker,
+                    }
+                )
+    return {
+        # A damaged book must not prevent a new Android device from accepting the
+        # valid part of the same repeatable-read baseline. Per-book failures stay
+        # explicit so the client can show a repair warning without retrying the
+        # entire library forever.
+        "ok": True,
+        "partial_success": bool(errors),
+        "error_count": len(errors),
+        "schema": f"{ANDROID_SYNC_SCHEMA}.full",
+        "generated_at": now_iso(),
+        "cursor": cursor,
+        "watermark_sequence": watermark_sequence,
+        "include_chapters": include_chapters,
+        "source_of_truth": "mac_reader_api_postgresql",
+        "sync_deletion_semantics": "books hidden in Click library are removed from Android local cache; Mac EPUB and annotations are retained",
+        "visible_book_ids": [str(book.get("id") or "") for book in books],
+        "removed_book_ids": removed_book_ids,
+        "android_cache_scope": [
+            "books",
+            "source",
+            "epub",
+            "pdf",
+            "publication",
+            "chapters",
+            "annotations",
+            "audio_notes",
+            "positions",
+            "epub_compatibility",
+            "display_variants",
+            "living_book_analysis_state",
+        ],
+        "books": payloads,
+        "errors": errors,
+        "skipped_books": skipped,
+    }
+
+
+@app.get("/v1/android/sync/changes")
+def android_sync_changes(
+    request: FastAPIRequest,
+    after_sequence: int = 0,
+    limit: int = 100,
+    since: str = "",
+) -> dict[str, Any]:
+    require_android_access(request)
+    requested_since = since.strip()
+    if requested_since:
+        if parse_living_book_time(requested_since) is None:
+            raise HTTPException(status_code=400, detail="since must be an ISO-8601 timestamp")
+        changes = android_changed_rows(requested_since)
+        return {
+            "ok": True,
+            "schema": "click.android.sync.changes.v1",
+            "generated_at": now_iso(),
+            "since": requested_since,
+            "deprecated_cursor": True,
+            **changes,
+        }
+    with db.connect() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        page = android_event_page(conn, after_sequence, limit)
+        changes = android_event_changes(conn, page["events"])
+    return {
+        "ok": True,
+        "schema": f"{ANDROID_SYNC_SCHEMA}.changes",
+        "generated_at": now_iso(),
+        "after_sequence": page["after_sequence"],
+        "next_sequence": page["next_sequence"],
+        "cursor": str(page["next_sequence"]),
+        "has_more": page["has_more"],
+        "limit": page["limit"],
+        "events": [
+            {
+                "sequence": event["sequence"],
+                "resource_type": event["resource_type"],
+                "resource_id": event["resource_id"],
+                "action": event["action"],
+                "version": event["version"],
+                "committed_at": jsonable(event["committed_at"]),
+            }
+            for event in page["events"]
+        ],
+        **changes,
+    }
+
+
+@app.post("/v1/android/sync/operations")
+def android_sync_operations(request: FastAPIRequest, payload: AndroidSyncOperations) -> dict[str, Any]:
+    authorized_device_id = require_android_access(request)
+    if payload.device_id != authorized_device_id:
+        raise HTTPException(status_code=403, detail="Android payload device ID does not match credentials")
+    prepared: list[tuple[AndroidSyncOperation, str, Optional[dict[str, Any]]]] = []
+    batch_hashes: dict[str, str] = {}
+    with db.connect() as conn:
+        for operation in payload.operations:
+            if not operation.operation_id:
+                raise HTTPException(status_code=422, detail="operation_id is required")
+            if operation.device_id and operation.device_id != authorized_device_id:
+                raise HTTPException(status_code=403, detail="operation device ID does not match credentials")
+            operation.device_id = authorized_device_id
+            request_hash = android_operation_request_hash(
+                authorized_device_id,
+                android_operation_dict(operation),
+            )
+            previous_hash = batch_hashes.get(operation.operation_id)
+            if previous_hash and previous_hash != request_hash:
+                raise HTTPException(status_code=409, detail=f"operation_id reused with different payload: {operation.operation_id}")
+            batch_hashes[operation.operation_id] = request_hash
+            receipt = android_operation_receipt(conn, operation.operation_id)
+            if receipt and receipt["request_hash"] != request_hash:
+                raise HTTPException(status_code=409, detail=f"operation_id reused with different payload: {operation.operation_id}")
+            prepared.append((operation, request_hash, receipt))
+
+    results: list[dict[str, Any]] = []
+    annotation_write_applied = False
+    for operation, request_hash, prefetched_receipt in prepared:
+        if prefetched_receipt:
+            cached = dict(prefetched_receipt.get("result") or {})
+            cached["duplicate"] = True
+            cached["receipt_status"] = prefetched_receipt["status"]
+            cached["receipt_http_status"] = prefetched_receipt["http_status"]
+            results.append(cached)
+            continue
+        try:
+            with db.connect() as conn:
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s)::bigint)",
+                    (f"reader.android.operation:{operation.operation_id}",),
+                )
+                receipt = android_operation_receipt(conn, operation.operation_id)
+                if receipt:
+                    if receipt["request_hash"] != request_hash:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"operation_id reused with different payload: {operation.operation_id}",
+                        )
+                    result = dict(receipt.get("result") or {})
+                    result["duplicate"] = True
+                    result["receipt_status"] = receipt["status"]
+                    result["receipt_http_status"] = receipt["http_status"]
+                else:
+                    result, receipt_status, receipt_http_status = apply_android_sync_operation_v2(
+                        conn,
+                        operation,
+                        authorized_device_id,
+                    )
+                    store_android_operation_receipt(
+                        conn,
+                        operation_id=operation.operation_id,
+                        device_id=authorized_device_id,
+                        request_hash=request_hash,
+                        status=receipt_status,
+                        http_status=receipt_http_status,
+                        result=result,
+                    )
+                    result["receipt_status"] = receipt_status
+                    result["receipt_http_status"] = receipt_http_status
+                    annotation_write_applied = annotation_write_applied or (
+                        bool(result.get("ok")) and operation.operation_type.strip().lower().startswith("annotation")
+                    )
+                results.append(result)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - operation-level conflicts/errors must be reported per item.
+            results.append(
+                {
+                    "ok": False,
+                    "operation_id": operation.operation_id,
+                    "operation_type": operation.operation_type,
+                    "retryable": True,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+    if annotation_write_applied:
+        start_living_book_evidence_sync_worker()
+    with db.connect() as conn:
+        next_sequence = android_current_sequence(conn)
+    return {
+        "ok": all(item.get("ok") for item in results),
+        "schema": f"{ANDROID_SYNC_SCHEMA}.operations_result",
+        "device_id": authorized_device_id,
+        "received": len(payload.operations),
+        "applied": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+        "next_sequence": next_sequence,
+        "cursor": str(next_sequence),
+    }
+
+
+@app.get("/v1/android/books/{book_id}/epub")
+def android_book_epub(request: FastAPIRequest, book_id: str) -> FileResponse:
+    require_android_access(request)
+    book = resolve_android_book_source(book_id)
+    compatibility = ensure_book_epub_assets(book)
+    epub_path = android_epub_path_for_book(book, compatibility)
+    if not epub_path.exists():
+        raise HTTPException(status_code=404, detail="EPUB file missing")
+    filename = f"{safe_slug(str(book.get('title') or book_id))}.epub"
+    return FileResponse(
+        epub_path,
+        media_type="application/epub+zip",
+        filename=filename,
+    )
+
+
+def stream_android_book_source(handle: Any) -> Any:
+    try:
+        while True:
+            chunk = handle.read(ANDROID_BOOK_UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        handle.close()
+
+
+@app.get("/v1/android/books/{book_id}/source")
+def android_book_source(request: FastAPIRequest, book_id: str) -> StreamingResponse:
+    require_android_access(request)
+    book = resolve_android_book_source(book_id, keep_open=True)
+    snapshot = dict(book["_android_source_snapshot"])
+    source_kind = str(snapshot["file_kind"])
+    source_hash = str(snapshot["file_hash"])
+    byte_size = int(snapshot["byte_size"])
+    handle = book.pop("_android_source_handle")
+    filename = f"{safe_slug(str(book.get('title') or book_id))}.{source_kind}"
+    return StreamingResponse(
+        stream_android_book_source(handle),
+        media_type="application/epub+zip" if source_kind == "epub" else "application/pdf",
+        headers={
+            "Content-Length": str(byte_size),
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Click-Byte-Size": str(byte_size),
+            "X-Click-File-SHA256": source_hash,
+        },
+    )
+
+
+@app.get("/v1/android/books/{book_id}/display-variants")
+def android_book_display_variants(request: FastAPIRequest, book_id: str) -> FileResponse:
+    require_android_access(request)
+    book = resolve_android_book_source(book_id)
+    report = ensure_book_epub_assets(book)
+    path = Path(str(report.get("display_variants_path") or "")).expanduser()
+    if not path.exists() or not (report.get("display_variants") or {}).get("available"):
+        raise HTTPException(status_code=404, detail="display variants are unavailable")
+    return FileResponse(path, media_type="application/json", filename=f"{book_id}-display-variants.json")
+
+
+@app.get("/v1/android/books/{book_id}/compatibility")
+def android_book_compatibility(request: FastAPIRequest, book_id: str) -> dict[str, Any]:
+    require_android_access(request)
+    book = resolve_android_book_source(book_id)
+    report = dict(ensure_book_epub_assets(book))
+    for private_key in ("source_file", "runtime_epub_path", "display_variants_path"):
+        report.pop(private_key, None)
+    return {"ok": report.get("status") != "error", **report}
+
+
+@app.get("/v1/android/books/{book_id}/publication")
+def android_book_publication(request: FastAPIRequest, book_id: str, include_chapters: bool = False) -> dict[str, Any]:
+    require_android_access(request)
+    book = resolve_android_book_source(book_id)
+    return {
+        "ok": True,
+        "schema": "click.android.book.publication.v1",
+        **android_book_sync_payload(book, include_chapters=include_chapters),
+    }
+
+
+def mobile_tts_response(
+    request: FastAPIRequest,
+    payload: AndroidTTSCreate,
+    *,
+    audio_prefix: str,
+) -> dict[str, Any]:
+    require_android_access(request)
+    result = post_lookup_tts(LookupTTSCreate(text=payload.text, voice=payload.voice or EDGE_TTS_VOICE))
+    raw_audio_url = str(result.get("audio_url") or "")
+    audio_id = Path(raw_audio_url).stem if raw_audio_url else ""
+    audio_url = f"{audio_prefix}/{audio_id}/audio" if audio_id else ""
+    return {
+        "ok": bool(result.get("ok")),
+        "schema": "click.android.tts.v1",
+        "engine": result.get("engine") or "browser_speech_synthesis",
+        "voice": result.get("voice") or payload.voice or EDGE_TTS_VOICE,
+        "kind": payload.kind,
+        "book_id": payload.book_id,
+        "locator": payload.locator,
+        "audio_url": audio_url,
+        "android_offline_fallback": "TextToSpeech",
+        "azure_default": False,
+        "text": result.get("text") or payload.text,
+        "error": result.get("error") or "",
+    }
+
+
+@app.post("/v1/mobile/tts")
+def mobile_tts(request: FastAPIRequest, payload: AndroidTTSCreate) -> dict[str, Any]:
+    return mobile_tts_response(
+        request,
+        payload,
+        audio_prefix="/v1/mobile/tts",
+    )
+
+
+@app.post("/v1/android/tts")
+def android_tts(request: FastAPIRequest, payload: AndroidTTSCreate) -> dict[str, Any]:
+    return mobile_tts_response(
+        request,
+        payload,
+        audio_prefix="/v1/android/tts",
+    )
+
+
+@app.get("/v1/mobile/tts/{audio_id}/audio")
+def mobile_tts_audio(request: FastAPIRequest, audio_id: str) -> FileResponse:
+    require_android_access(request)
+    return get_lookup_tts(audio_id)
+
+
+@app.get("/v1/android/tts/{audio_id}/audio")
+def android_tts_audio(request: FastAPIRequest, audio_id: str) -> FileResponse:
+    require_android_access(request)
+    return get_lookup_tts(audio_id)
+
+
+@app.get("/v1/android/books/{book_id}/cover")
+def android_book_cover(request: FastAPIRequest, book_id: str) -> Response:
+    require_android_access(request)
+    return get_library_book_cover(book_id)
+
+
+@app.get("/v1/android/books/{book_id}/lookup")
+def android_book_lookup(
+    request: FastAPIRequest,
+    book_id: str,
+    word: str,
+    sentence_id: Optional[str] = None,
+    sentence: Optional[str] = None,
+) -> dict[str, Any]:
+    require_android_access(request)
+    return lookup_book_word(book_id, word, sentence_id, sentence)
+
+
+@app.get("/v1/android/books/{book_id}/annotations")
+def android_book_annotations(request: FastAPIRequest, book_id: str) -> list[dict[str, Any]]:
+    require_android_access(request)
+    return list_annotations(book_id)
+
+
+@app.get("/v1/android/audio-notes/{audio_note_id}/audio")
+def android_audio_note_audio(request: FastAPIRequest, audio_note_id: str) -> FileResponse:
+    require_android_access(request)
+    return get_audio_note_audio(audio_note_id)
+
+
+@app.post("/v1/android/audio-notes/transcribe")
+def android_audio_note_transcribe(
+    request: FastAPIRequest,
+    payload: LANAudioTranscribe,
+) -> dict[str, Any]:
+    require_android_access(request)
+    return lan_audio_note_transcribe(payload)
+
+
 @app.post("/lan/audio-notes/transcribe")
 def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
     book_with_latest_file(payload.book_id)
@@ -8257,7 +15445,7 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
     status_value = "pending"
 
     with db.connect() as conn:
-        conn.execute(
+        audio_row = conn.execute(
             """
             INSERT INTO reader.audio_notes (
                 id, annotation_id, book_id, audio_path, audio_hash, duration_seconds,
@@ -8268,7 +15456,7 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
             """,
             (
                 audio_note_id,
-                None,
+                payload.annotation_id,
                 payload.book_id,
                 str(audio_path),
                 audio_hash,
@@ -8280,12 +15468,26 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
                 None,
             ),
         ).fetchone()
+        if audio_row:
+            apply_audio_note_to_annotation(conn, dict(audio_row))
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="audio_note",
+                source_id=audio_note_id,
+                book_id=payload.book_id,
+                operation="audio_note_created",
+                details={"status": status_value, "capture_path": "lan_audio_note"},
+            )
+    if audio_row:
+        start_living_book_evidence_sync_worker()
+        sync_reader_audio_note_to_voice_inbox(audio_note_id)
     start_lan_audio_note_transcription(audio_note_id, audio_path, payload.mime_type, len(audio_data))
     return {
         "ok": True,
         "accepted": True,
         "schema": "sentence_reader.lan_audio_transcription.v1",
         "audio_note_id": audio_note_id,
+        "annotation_id": payload.annotation_id,
         "status": status_value,
         "provider": provider,
         "voice_pipeline": {
@@ -8304,7 +15506,38 @@ def lan_audio_note_transcribe(payload: LANAudioTranscribe) -> dict[str, Any]:
 
 
 @app.post("/books")
-def create_book(payload: BookCreate) -> dict[str, Any]:
+def create_book(request: FastAPIRequest, payload: BookCreate) -> dict[str, Any]:
+    require_mobile_admin_access(request)
+    source_kind = str(payload.source_kind or "").strip().lower()
+    source_path: Optional[Path] = None
+    stored_source_path: Optional[str] = None
+    source_hash = payload.file_hash
+    source_byte_size = payload.byte_size
+    if payload.file_path:
+        stored_source_path = str(Path(payload.file_path).expanduser())
+        source_path = click_owned_internal_book_source_path(payload.file_path)
+        if source_path is None:
+            raise HTTPException(status_code=422, detail="book file must be a Click-owned internal copy")
+        if source_kind in {"epub", "pdf"} and source_path.suffix.lower() != f".{source_kind}":
+            raise HTTPException(status_code=422, detail="book file extension does not match source kind")
+        actual_hash = file_sha256(source_path)
+        actual_byte_size = source_path.stat().st_size
+        declared_hash = str(payload.file_hash or "").strip().lower()
+        if declared_hash and (
+            not re.fullmatch(r"[0-9a-f]{64}", declared_hash)
+            or declared_hash != actual_hash
+        ):
+            raise HTTPException(status_code=422, detail="book file sha256 does not match its source")
+        declared_book_hash = str(payload.book_hash or "").strip().lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", declared_book_hash)
+            and declared_book_hash != actual_hash
+        ):
+            raise HTTPException(status_code=422, detail="book hash does not match its source")
+        if payload.byte_size is not None and int(payload.byte_size) != actual_byte_size:
+            raise HTTPException(status_code=422, detail="book byte size does not match its source")
+        source_hash = actual_hash
+        source_byte_size = actual_byte_size
     book_id = new_id("book")
     with db.connect() as conn:
         row = conn.execute(
@@ -8318,20 +15551,31 @@ def create_book(payload: BookCreate) -> dict[str, Any]:
                 last_opened_at = now()
             RETURNING *
             """,
-            (book_id, payload.title, payload.author, payload.source_kind, payload.book_hash),
+            (book_id, payload.title, payload.author, source_kind, payload.book_hash),
         ).fetchone()
-        if payload.file_path:
+        if source_path is not None:
             conn.execute(
                 """
                 INSERT INTO reader.book_files (id, book_id, file_path, file_kind, file_hash, byte_size)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (book_id, file_path) DO UPDATE
-                SET file_hash = EXCLUDED.file_hash,
+                SET file_kind = EXCLUDED.file_kind,
+                    file_hash = EXCLUDED.file_hash,
                     byte_size = EXCLUDED.byte_size
                 """,
-                (new_id("file"), row["id"], payload.file_path, payload.source_kind, payload.file_hash, payload.byte_size),
+                (
+                    new_id("file"),
+                    row["id"],
+                    stored_source_path,
+                    source_kind,
+                    source_hash,
+                    source_byte_size,
+                ),
             )
-    return dict(row)
+    result = dict(row)
+    if source_path is not None and source_kind in {"epub", "pdf"}:
+        result["living_book"] = generate_living_book_bundle(str(row["id"]))
+    return result
 
 
 @app.get("/books")
@@ -8465,6 +15709,15 @@ def create_annotation(payload: AnnotationCreate) -> dict[str, Any]:
                 db.jsonb(payload.metadata),
             ),
         ).fetchone()
+        enqueue_living_book_evidence_sync(
+            conn,
+            source_kind="annotation",
+            source_id=annotation_id,
+            book_id=payload.book_id,
+            operation="annotation_created",
+            details={"kind": payload.kind},
+        )
+    start_living_book_evidence_sync_worker()
     return dict(row)
 
 
@@ -8799,24 +16052,16 @@ def post_lookup_tts(payload: LookupTTSCreate) -> dict[str, Any]:
         }
     audio_id = stable_id("lookup_tts", voice, text)
     audio_path = lookup_tts_dir() / f"{audio_id}.mp3"
-    if not audio_path.exists():
-        proc = subprocess.run(
-            [command, "--voice", voice, "--text", text, "--write-media", str(audio_path)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=45,
-        )
-        if proc.returncode != 0 or not audio_path.exists():
-            detail = (proc.stderr or proc.stdout or "edge-tts failed").strip()
-            return {
-                "ok": False,
-                "engine": "browser_speech_synthesis",
-                "voice": voice,
-                "audio_url": "",
-                "text": text,
-                "error": detail[:240],
-            }
+    generated, detail = synthesize_lookup_tts_low_priority(command, text, voice, audio_path)
+    if not generated:
+        return {
+            "ok": False,
+            "engine": "browser_speech_synthesis",
+            "voice": voice,
+            "audio_url": "",
+            "text": text,
+            "error": detail,
+        }
     return {
         "ok": True,
         "engine": "edge-tts",
@@ -8905,6 +16150,185 @@ def export_book(book_id: str, payload: ExportGenerate = Body(default_factory=Exp
         "json_path": str(json_path) if json_path else None,
         "exports": exports,
     }
+
+
+@app.post("/books/{book_id}/living-book/sync")
+def sync_living_book(book_id: str, payload: LivingBookSyncRequest = Body(default_factory=LivingBookSyncRequest)) -> dict[str, Any]:
+    return generate_living_book_bundle(book_id, knowledge_base_root=payload.knowledge_base_root)
+
+
+@app.post("/books/{book_id}/living-book/reconcile-write-owner")
+def reconcile_living_book_write_owner_api(
+    book_id: str,
+    payload: LivingBookWriteOwnerReconcileRequest,
+) -> dict[str, Any]:
+    return reconcile_living_book_write_owner(book_id, payload)
+
+
+@app.get("/living-books/evidence-sync/status")
+def get_living_book_evidence_sync_status() -> dict[str, Any]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT status, count(*) AS count
+            FROM reader.sync_events
+            WHERE target_system = %s
+            GROUP BY status
+            """,
+            (LIVING_BOOK_EVIDENCE_SYNC_TARGET,),
+        ).fetchall()
+    counts = {str(row["status"]): int(row["count"]) for row in rows}
+    return {
+        "ok": True,
+        "schema": "click.living_book.evidence_sync_status_response.v1",
+        "target_system": LIVING_BOOK_EVIDENCE_SYNC_TARGET,
+        "counts": {
+            "pending": counts.get("pending", 0),
+            "synced": counts.get("synced", 0),
+            "failed": counts.get("failed", 0),
+        },
+        "worker_running": bool(
+            LIVING_BOOK_EVIDENCE_SYNC_THREAD is not None and LIVING_BOOK_EVIDENCE_SYNC_THREAD.is_alive()
+        ),
+        "knowledge_base_root": str(default_knowledge_base_root()),
+    }
+
+
+@app.post("/living-books/evidence-sync/run")
+def run_living_book_evidence_sync(limit: int = 100, retry_failed: bool = False) -> dict[str, Any]:
+    if retry_failed:
+        with db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE reader.sync_events
+                SET status = 'pending', last_error = NULL, updated_at = now()
+                WHERE target_system = %s AND status = 'failed'
+                """,
+                (LIVING_BOOK_EVIDENCE_SYNC_TARGET,),
+            )
+    result = process_living_book_evidence_sync_events(limit=limit)
+    result["pending_count"] = pending_living_book_evidence_sync_count()
+    result["retry_failed"] = retry_failed
+    if result["pending_count"]:
+        start_living_book_evidence_sync_worker()
+    return result
+
+
+@app.get("/books/{book_id}/living-book/status")
+def get_living_book_status(book_id: str, knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    lb_root = living_books_root(knowledge_base_root)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    return living_book_status_payload(book, bundle_dir, lb_root)
+
+
+@app.get("/living-books/taxonomy")
+def get_living_book_taxonomy(knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    lb_root = living_books_root(knowledge_base_root)
+    ensure_living_book_control_files(lb_root)
+    taxonomy_path = living_book_index_dir(lb_root) / "taxonomy.json"
+    taxonomy = read_living_book_json(taxonomy_path, initial_living_book_taxonomy())
+    validation = validate_living_book_taxonomy_categories(list(taxonomy.get("categories") or []))
+    return {
+        "ok": True,
+        "schema": "click.living_books.taxonomy_response.v1",
+        "taxonomy_path": str(taxonomy_path),
+        "validation": validation,
+        "taxonomy": taxonomy,
+    }
+
+
+@app.post("/living-books/taxonomy/apply-default")
+def apply_default_living_book_taxonomy_api(
+    payload: LivingBookTaxonomyApplyDefaultRequest,
+) -> dict[str, Any]:
+    return apply_default_living_book_taxonomy(payload)
+
+
+@app.get("/books/{book_id}/living-book/analysis-status")
+def get_living_book_analysis_status(book_id: str, knowledge_base_root: Optional[str] = None) -> dict[str, Any]:
+    book = living_book_book_row(book_id)
+    bundle_dir = living_book_bundle_dir(book, knowledge_base_root)
+    if not (bundle_dir / "book_manifest.json").exists():
+        generate_living_book_bundle(book_id, knowledge_base_root=knowledge_base_root)
+    analysis = living_book_analysis_state_for_book(
+        book_id,
+        knowledge_base_root=knowledge_base_root,
+        create=True,
+    )
+    return {
+        "ok": True,
+        "schema": "click.living_book.analysis_status_response.v1",
+        "book_id": book_id,
+        "analysis": analysis,
+        "manual_only": True,
+        "auto_analysis_enabled": False,
+    }
+
+
+@app.post("/books/{book_id}/living-book/analyze")
+def analyze_living_book(
+    book_id: str,
+    payload: LivingBookAnalyzeRequest = Body(default_factory=LivingBookAnalyzeRequest),
+) -> dict[str, Any]:
+    return queue_living_book_analysis(
+        book_id,
+        knowledge_base_root=payload.knowledge_base_root,
+        requested_by=payload.requested_by,
+        force=payload.force,
+        start_async=True,
+    )
+
+
+@app.post("/books/{book_id}/living-book/reanalyze")
+def reanalyze_living_book(
+    book_id: str,
+    payload: LivingBookAnalyzeRequest = Body(default_factory=LivingBookAnalyzeRequest),
+) -> dict[str, Any]:
+    return queue_living_book_analysis(
+        book_id,
+        knowledge_base_root=payload.knowledge_base_root,
+        requested_by=payload.requested_by,
+        force=True,
+        start_async=True,
+    )
+
+
+@app.post("/books/{book_id}/living-book/classify")
+def classify_living_book(
+    book_id: str,
+    payload: LivingBookClassifyRequest = Body(default_factory=LivingBookClassifyRequest),
+) -> dict[str, Any]:
+    return run_living_book_classification(book_id, knowledge_base_root=payload.knowledge_base_root)
+
+
+@app.patch("/books/{book_id}/living-book/classification")
+def confirm_living_book_classification_api(
+    book_id: str,
+    payload: LivingBookClassificationConfirmRequest,
+) -> dict[str, Any]:
+    return confirm_living_book_classification(book_id, payload)
+
+
+@app.post("/books/{book_id}/living-book/generate-drafts")
+def generate_living_book_drafts(
+    book_id: str,
+    payload: LivingBookGenerateDraftsRequest = Body(default_factory=LivingBookGenerateDraftsRequest),
+) -> dict[str, Any]:
+    return run_living_book_draft_generation(
+        book_id,
+        knowledge_base_root=payload.knowledge_base_root,
+        use_hermes_runtime=payload.use_hermes_runtime,
+    )
+
+
+@app.post("/living-books/jobs/run-due")
+def run_living_books_due_jobs(payload: LivingBookJobsRunRequest = Body(default_factory=LivingBookJobsRunRequest)) -> dict[str, Any]:
+    return run_due_living_book_jobs(
+        knowledge_base_root=payload.knowledge_base_root,
+        limit=payload.limit,
+        force=payload.force,
+    )
 
 
 @app.get("/books/{book_id}/exports")
@@ -9138,8 +16562,16 @@ def patch_annotation(annotation_id: str, payload: AnnotationPatch) -> dict[str, 
             """,
             (payload.note_text, payload.color, db.jsonb(payload.metadata) if payload.metadata is not None else None, annotation_id),
         ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="annotation not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="annotation not found")
+        enqueue_living_book_evidence_sync(
+            conn,
+            source_kind="annotation",
+            source_id=annotation_id,
+            book_id=str(row["book_id"]),
+            operation="annotation_updated",
+        )
+    start_living_book_evidence_sync_worker()
     return dict(row)
 
 
@@ -9197,15 +16629,40 @@ def clean_annotation_note(annotation_id: str, payload: Optional[AnnotationCleanR
             """,
             (bool(payload.apply), cleaned_text, db.jsonb(metadata), annotation_id),
         ).fetchone()
+        enqueue_living_book_evidence_sync(
+            conn,
+            source_kind="annotation",
+            source_id=annotation_id,
+            book_id=str(updated["book_id"]),
+            operation="annotation_ai_cleanup_updated",
+            details={"applied": bool(payload.apply)},
+        )
+    start_living_book_evidence_sync_worker()
     return {"ok": True, "cleaned_text": cleaned_text, "annotation": dict(updated)}
 
 
 @app.delete("/annotations/{annotation_id}")
 def delete_annotation(annotation_id: str) -> dict[str, Any]:
     with db.connect() as conn:
-        row = conn.execute("DELETE FROM reader.annotations WHERE id = %s RETURNING id", (annotation_id,)).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="annotation not found")
+        row = conn.execute(
+            "DELETE FROM reader.annotations WHERE id = %s RETURNING id, book_id, kind, chapter_locator",
+            (annotation_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="annotation not found")
+        enqueue_living_book_evidence_sync(
+            conn,
+            source_kind="annotation",
+            source_id=annotation_id,
+            book_id=str(row["book_id"]),
+            operation="annotation_deleted",
+            details={
+                "kind": row.get("kind"),
+                "chapter_locator": row.get("chapter_locator"),
+                "tombstone": True,
+            },
+        )
+    start_living_book_evidence_sync_worker()
     return {"ok": True, "id": row["id"]}
 
 
@@ -9239,6 +16696,17 @@ def create_audio_note(payload: AudioNoteCreate) -> dict[str, Any]:
         ).fetchone()
         if row:
             apply_audio_note_to_annotation(conn, dict(row))
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="audio_note",
+                source_id=audio_note_id,
+                book_id=payload.book_id,
+                operation="audio_note_created",
+                details={"status": payload.status},
+            )
+    if row:
+        start_living_book_evidence_sync_worker()
+        sync_reader_audio_note_to_voice_inbox(audio_note_id)
     return dict(row)
 
 
@@ -9249,6 +16717,29 @@ def get_audio_note(audio_note_id: str) -> dict[str, Any]:
     if not row:
         raise HTTPException(status_code=404, detail="audio note not found")
     return dict(row)
+
+
+@app.get("/audio-notes/{audio_note_id}/audio")
+def get_audio_note_audio(audio_note_id: str) -> FileResponse:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT audio_path FROM reader.audio_notes WHERE id = %s",
+            (audio_note_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="audio note not found")
+    audio_path = Path(str(row.get("audio_path") or "")).expanduser()
+    if not audio_path.is_file():
+        raise HTTPException(status_code=404, detail="audio note file missing")
+    media_type = {
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".ogg": "audio/ogg",
+    }.get(audio_path.suffix.lower(), "application/octet-stream")
+    return FileResponse(audio_path, media_type=media_type, filename=audio_path.name)
 
 
 @app.patch("/audio-notes/{audio_note_id}")
@@ -9285,8 +16776,18 @@ def patch_audio_note(audio_note_id: str, payload: AudioNotePatch) -> dict[str, A
         ).fetchone()
         if row:
             apply_audio_note_to_annotation(conn, dict(row))
-    if not row:
-        raise HTTPException(status_code=404, detail="audio note not found")
+            enqueue_living_book_evidence_sync(
+                conn,
+                source_kind="audio_note",
+                source_id=audio_note_id,
+                book_id=str(row["book_id"]),
+                operation="audio_note_updated",
+                details={"status": row.get("status")},
+            )
+        else:
+            raise HTTPException(status_code=404, detail="audio note not found")
+    start_living_book_evidence_sync_worker()
+    sync_reader_audio_note_to_voice_inbox(audio_note_id)
     return dict(row)
 
 

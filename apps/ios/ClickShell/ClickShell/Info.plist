@@ -15,9 +15,13 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.3.19</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>23</string>
+	<key>ClickRemoteTTSOrigin</key>
+	<string>$(CLICK_REMOTE_TTS_ORIGIN)</string>
+	<key>ClickUpdateManifestURL</key>
+	<string>$(CLICK_UPDATE_MANIFEST_URL)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSAppTransportSecurity</key>
@@ -28,9 +32,23 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Click needs local network access to connect to your Mac reading service.</string>
+	<string>用于在当前 Wi-Fi 中发现并同步你已配对的 Mac Click。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_click-reader._tcp</string>
+	</array>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Click uses the microphone when you add a voice note from the reader.</string>
+	<string>用于录制 Tingle 和阅读语音备注，原音会先保存在本机。</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>用于把语音备注转成文字；不支持设备端识别时仍会保留原音。</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations~ipad</key>

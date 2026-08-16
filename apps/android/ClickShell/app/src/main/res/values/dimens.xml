@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="click_space_1">4dp</dimen>
+    <dimen name="click_space_2">8dp</dimen>
+    <dimen name="click_space_3">12dp</dimen>
+    <dimen name="click_space_4">16dp</dimen>
+    <dimen name="click_space_6">24dp</dimen>
+    <dimen name="click_space_8">32dp</dimen>
+    <dimen name="click_corner_small">12dp</dimen>
+    <dimen name="click_corner_card">16dp</dimen>
+    <dimen name="click_corner_sheet">24dp</dimen>
+    <dimen name="click_touch_target">48dp</dimen>
+</resources>

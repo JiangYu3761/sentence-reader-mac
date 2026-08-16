@@ -5,8 +5,33 @@
         <item name="android:windowActionBar">false</item>
         <item name="android:windowFullscreen">true</item>
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#f7f2e7</item>
-        <item name="android:navigationBarColor">#050505</item>
-        <item name="android:statusBarColor">#050505</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowBackground">@color/click_canvas_dark</item>
+        <item name="android:colorAccent">@color/click_accent_dark</item>
+        <item name="android:alertDialogTheme">@style/ClickDialogTheme</item>
+        <item name="android:navigationBarColor">@color/click_canvas_dark</item>
+        <item name="android:statusBarColor">@color/click_canvas_dark</item>
+        <item name="android:windowDisablePreview">false</item>
+    </style>
+    <style name="ClickDialogTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:windowBackground">@color/click_surface_dark</item>
+        <item name="android:colorBackground">@color/click_surface_dark</item>
+        <item name="android:panelColorBackground">@color/click_surface_dark</item>
+        <item name="android:textColorPrimary">@color/click_label_primary_dark</item>
+        <item name="android:textColorSecondary">@color/click_label_secondary_dark</item>
+        <item name="android:colorAccent">@color/click_accent_dark</item>
+        <item name="android:windowMinWidthMajor">88%</item>
+        <item name="android:windowMinWidthMinor">88%</item>
+    </style>
+    <style name="ClickDialogLightTheme" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowBackground">@color/click_surface_light</item>
+        <item name="android:colorBackground">@color/click_surface_light</item>
+        <item name="android:panelColorBackground">@color/click_surface_light</item>
+        <item name="android:textColorPrimary">@color/click_label_primary_light</item>
+        <item name="android:textColorSecondary">@color/click_label_secondary_light</item>
+        <item name="android:colorAccent">@color/click_accent_light</item>
+        <item name="android:windowMinWidthMajor">88%</item>
+        <item name="android:windowMinWidthMinor">88%</item>
     </style>
 </resources>

@@ -43,10 +43,30 @@ class FakeConn:
             "created_at": "2026-06-26T00:00:00Z",
             "updated_at": "2026-06-26T00:00:00Z",
             "last_opened_at": "2026-06-26T00:00:00Z",
-            "file_path": str(ROOT / "fixtures" / "library-smoke.epub"),
+            "file_path": "/tmp/click-library-smoke-stale/book.epub",
             "file_kind": "epub",
-            "file_hash": "hash",
-            "byte_size": 1024,
+            "file_hash": None,
+            "byte_size": None,
+            "file_candidates": [
+                {
+                    "file_path": "/tmp/click-library-smoke-stale/book.epub",
+                    "file_kind": "epub",
+                    "file_hash": None,
+                    "byte_size": None,
+                },
+                {
+                    "file_path": str(APP),
+                    "file_kind": "epub",
+                    "file_hash": "wrong-type",
+                    "byte_size": APP.stat().st_size,
+                },
+                {
+                    "file_path": str(ROOT / "fixtures" / "sentence-reader-smoke.epub"),
+                    "file_kind": "epub",
+                    "file_hash": "hash",
+                    "byte_size": 1024,
+                },
+            ],
             "chapter_locator": "OEBPS/chapter.xhtml",
             "page_index": 2,
             "total_pages": 10,
@@ -169,12 +189,14 @@ def main() -> int:
             "data-library-v2",
             "continue-hero",
             "data-open-book-card",
-            "data-card-secondary",
+            'aria-label="更多"',
             "manageMode",
             "manageToggle",
             "selectAllCurrent",
             "drawerManage",
-            "recentAssets",
+            "homeFolderGrid",
+            "data-library-scope",
+            "normalizedFolderPath",
             "notesView",
             "redView",
             "batchHide",
@@ -184,6 +206,9 @@ def main() -> int:
             "epub_cover_asset",
             "generated_cover_svg",
             "sync_owned_epub_library",
+            "SENTENCE_READER_SCAN_OWNED_EPUB_ON_DASHBOARD",
+            "dashboard_read_path_is_side_effect_free",
+            "preferred_existing_book_file",
             "owned_epub_scan",
             "native_reader_url",
             "get('surface') === 'mac-app'",
@@ -198,16 +223,17 @@ def main() -> int:
             "openNativeReaderFromLibraryBookID",
             "url.scheme == \"sentence-reader\"",
             "url.host == \"open-native\"",
-            "surface=mac-app",
+            'URLQueryItem(name: "surface", value: "mac-app")',
             "nativeBookEntry(fromLibraryBook",
             "func libraryDashboard()",
-            "http://127.0.0.1:18180/library",
+            "SENTENCE_READER_API_BASE_URL",
+            "ReaderAPIClient.configuredBaseURL().appendingPathComponent(\"library\")",
             "preferredIPadLibraryURL",
             "readerMoreButton",
             "showReaderMoreMenu",
             "WKUIDelegate",
             "runOpenPanelWith",
-            "allowedContentTypes = [.epub]",
+            "allowedContentTypes = [.epub, .pdf]",
             "旧书库表格仅作降级入口",
         ],
         MIGRATION: [
@@ -232,9 +258,11 @@ def main() -> int:
                 "<title>Sentence Reader Library</title>",
                 "data-library-v2",
                 "Click",
-                "Continue Reading",
-                "最近阅读",
-                "点击封面直接进入正文",
+                "Click",
+                "打开封面继续阅读",
+                "文件夹",
+                "未整理",
+                "data-library-scope",
                 "收藏",
                 "作者",
                 "分类",
@@ -248,11 +276,11 @@ def main() -> int:
                 "管理模式",
                 "退出管理",
                 "选择管理",
-                "搜索书名、作者、分类、标签、笔记、红标",
+                "搜索书名或作者",
             ]:
                 if marker not in page.text:
                     missing_markers.setdefault("/library", []).append(marker)
-            for forbidden in ["Reader API + PostgreSQL", "Tabler 只做", "Komga 只做"]:
+            for forbidden in ["Reader API + PostgreSQL", "Tabler 只做", "Komga 只做", "iPad 访问", "状态与设置", "hero-manifest"]:
                 if forbidden in page.text:
                     missing_markers.setdefault("/library", []).append(f"forbidden_visible:{forbidden}")
             for forbidden in ["card-actions", "drawerHide"]:
@@ -286,6 +314,17 @@ def main() -> int:
                 missing_markers.setdefault("/api/library/dashboard", []).append("cover")
             if first_book.get("reading_state") != "在读":
                 missing_markers.setdefault("/api/library/dashboard", []).append("reading_state")
+            if (
+                first_book.get("file", {}).get("file_path")
+                != str(ROOT / "fixtures" / "sentence-reader-smoke.epub")
+                or first_book.get("file", {}).get("exists") is not True
+                or first_book.get("file", {}).get("file_hash") != "hash"
+                or first_book.get("file", {}).get("byte_size") != 1024
+                or first_book.get("reader_capabilities", {}).get("mac_native") is not True
+            ):
+                missing_markers.setdefault("/api/library/dashboard", []).append(
+                    "preferred_existing_book_file"
+                )
             if not payload.get("recent_annotations"):
                 missing_markers.setdefault("/api/library/dashboard", []).append("recent_annotations")
             if not payload.get("favorite_books") or not payload.get("author_groups") or not payload.get("category_groups"):

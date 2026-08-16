@@ -1,10 +1,41 @@
 plugins {
     id "com.android.application"
+    id "org.jetbrains.kotlin.android"
 }
+
+def releaseSigningEnvironment = [
+    keystorePath: "CLICK_ANDROID_RELEASE_KEYSTORE",
+    keyAlias: "CLICK_ANDROID_RELEASE_KEY_ALIAS",
+    storePassword: "CLICK_ANDROID_RELEASE_STORE_PASSWORD",
+    keyPassword: "CLICK_ANDROID_RELEASE_KEY_PASSWORD",
+]
+def releaseSigningValues = releaseSigningEnvironment.collectEntries { key, environmentName ->
+    [(key): System.getenv(environmentName)]
+}
+def missingReleaseSigningEnvironment = releaseSigningEnvironment.findAll { key, environmentName ->
+    def value = releaseSigningValues[key]
+    value == null || value.trim().isEmpty()
+}.values().toList()
+def releaseKeystoreFile = null
+def releaseSigningProblem = null
+if (!missingReleaseSigningEnvironment.isEmpty()) {
+    releaseSigningProblem = "missing environment: ${missingReleaseSigningEnvironment.join(', ')}"
+} else {
+    releaseKeystoreFile = new File(releaseSigningValues.keystorePath)
+    if (!releaseKeystoreFile.isAbsolute()) {
+        releaseSigningProblem = "CLICK_ANDROID_RELEASE_KEYSTORE must be an absolute path"
+    } else if (!releaseKeystoreFile.isFile()) {
+        releaseSigningProblem = "CLICK_ANDROID_RELEASE_KEYSTORE does not name a file"
+    }
+}
+def releaseSigningConfigured = releaseSigningProblem == null
+def clickVersionCodeValue = (findProperty("clickVersionCode") ?: "8").toString().toInteger()
+def clickVersionNameValue = (findProperty("clickVersionName") ?: "0.1.7").toString()
 
 android {
     namespace "com.click.shell"
-    compileSdk 35
+    compileSdk 36
+    compileSdkExtension 19
 
     buildFeatures {
         buildConfig true
@@ -12,10 +43,85 @@ android {
 
     defaultConfig {
         applicationId "com.click.shell"
-        minSdk 23
+        minSdk 28
         targetSdk 35
-        versionCode 3
-        versionName "0.1.2"
+        versionCode clickVersionCodeValue
+        versionName clickVersionNameValue
         buildConfigField "String", "CLICK_DEFAULT_HOST", "\"${System.getenv("CLICK_DEFAULT_HOST") ?: ""}\""
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            release {
+                storeFile releaseKeystoreFile
+                keyAlias releaseSigningValues.keyAlias
+                storePassword releaseSigningValues.storePassword
+                keyPassword releaseSigningValues.keyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            if (releaseSigningConfigured) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring "com.android.tools:desugar_jdk_libs:2.1.5"
+
+    // Readium Kotlin Toolkit is the primary EPUB navigator. The Java activity owns the
+    // offline shelf and the compatibility HTML path; it does not replace Readium rendering.
+    implementation "org.readium.kotlin-toolkit:readium-shared:3.0.0"
+    implementation "org.readium.kotlin-toolkit:readium-streamer:3.0.0"
+    implementation "org.readium.kotlin-toolkit:readium-navigator:3.0.0"
+    implementation "androidx.fragment:fragment-ktx:1.7.1"
+    implementation "androidx.appcompat:appcompat:1.7.1"
+    implementation "androidx.pdf:pdf-viewer-fragment:1.0.0-alpha19"
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0") {
+        // Click reads only unencrypted document outlines. Pulling three crypto providers
+        // for that narrow path would add far more weight than the outline parser itself.
+        exclude group: "org.bouncycastle", module: "bcprov-jdk15to18"
+        exclude group: "org.bouncycastle", module: "bcpkix-jdk15to18"
+        exclude group: "org.bouncycastle", module: "bcutil-jdk15to18"
+    }
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+    implementation "androidx.work:work-runtime:2.11.2"
+    // Coil owns cover decoding, memory caching and lifecycle cancellation. Click keeps
+    // the downloaded cover files as the offline source of truth.
+    implementation "io.coil-kt:coil:2.7.0"
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.json:json:20250517"
+    testImplementation "androidx.work:work-testing:2.11.2"
+}
+
+gradle.taskGraph.whenReady { graph ->
+    def includesAppReleaseTask = graph.allTasks.any { task ->
+        task.path.startsWith(":app:") && task.name.toLowerCase(Locale.ROOT).contains("release")
+    }
+    if (includesAppReleaseTask && !releaseSigningConfigured) {
+        throw new GradleException(
+            "Private release signing is not configured (${releaseSigningProblem}). " +
+            "Signing values must come from the CLICK_ANDROID_RELEASE_* environment variables."
+        )
     }
 }

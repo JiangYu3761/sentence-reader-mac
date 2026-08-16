@@ -1,0 +1,60 @@
+{
+  "chapters": [
+    {
+      "locator": "EPUB/text/z-first.xhtml",
+      "sentences": [
+        "序",
+        "这是跨标签的第一句。",
+        "下一句含汉字。",
+        "引用很短。",
+        "列表项。",
+        "脚注前继续正文。",
+        "图一说明",
+        "保留页码后的正文。",
+        "链接正文后半句。",
+        "按钮后的正文。",
+        "换行一",
+        "换行二",
+        "Dr. Smith has 3.14.",
+        "Done.",
+        "甲；乙。",
+        "控制字符。",
+        "含 emoji 😀 的末句。"
+      ]
+    },
+    {
+      "locator": "EPUB/text/a-second.xhtml",
+      "sentences": [
+        "二",
+        "Go now.",
+        "Next line.",
+        "第二章首句。"
+      ]
+    }
+  ],
+  "excluded_sentinels": [
+    "hàn",
+    "ALT_SHOULD_NOT_READ",
+    "HIDDEN_ATTRIBUTE_SHOULD_NOT_READ",
+    "ARIA_HIDDEN_SHOULD_NOT_READ",
+    "INLINE_DISPLAY_SHOULD_NOT_READ",
+    "EXTERNAL_DISPLAY_SHOULD_NOT_READ",
+    "EXTERNAL_VISIBILITY_SHOULD_NOT_READ",
+    "EXTERNAL_OPACITY_SHOULD_NOT_READ",
+    "NAV_SHOULD_NOT_READ",
+    "PAGEBREAK_SHOULD_NOT_READ",
+    "CLASS_PAGE_NUMBER_SHOULD_NOT_READ",
+    "FOOTNOTE_SHOULD_NOT_READ",
+    "CLASS_FOOTNOTE_SHOULD_NOT_READ",
+    "DETAIL_SHOULD_NOT_READ",
+    "CLOSED_DETAIL_SHOULD_NOT_READ",
+    "BUTTON_SHOULD_NOT_READ",
+    "LINEAR_NO_SHOULD_NOT_READ"
+  ],
+  "normalizer_revision": "click-reading-document-v2",
+  "reading_order": [
+    "EPUB/text/z-first.xhtml",
+    "EPUB/text/a-second.xhtml"
+  ],
+  "schema": "click.gate1.fixture.expected.v1"
+}

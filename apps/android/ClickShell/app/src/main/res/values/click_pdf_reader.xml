@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="ClickPdfReaderTheme" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@color/click_canvas_dark</item>
+        <item name="android:navigationBarColor">@color/click_canvas_dark</item>
+        <item name="android:statusBarColor">@color/click_canvas_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="colorSurface">@color/click_surface_dark</item>
+        <item name="colorOnSurface">@color/click_label_primary_dark</item>
+        <item name="colorOnSurfaceVariant">@color/click_label_secondary_dark</item>
+        <item name="colorAccent">@color/click_accent_dark</item>
+        <item name="colorPrimary">@color/click_accent_dark</item>
+        <item name="colorPrimaryDark">@color/click_canvas_dark</item>
+    </style>
+    <style name="ClickPdfReaderLightTheme" parent="Theme.Material3.Light.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowBackground">@color/click_canvas_light</item>
+        <item name="android:navigationBarColor">@color/click_canvas_light</item>
+        <item name="android:statusBarColor">@color/click_canvas_light</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="colorSurface">@color/click_surface_light</item>
+        <item name="colorOnSurface">@color/click_label_primary_light</item>
+        <item name="colorOnSurfaceVariant">@color/click_label_secondary_light</item>
+        <item name="colorAccent">@color/click_accent_light</item>
+        <item name="colorPrimary">@color/click_accent_light</item>
+        <item name="colorPrimaryDark">@color/click_canvas_light</item>
+    </style>
+
+    <string name="click_pdf_back">返回</string>
+    <string name="click_pdf_outline">目录</string>
+    <string name="click_pdf_outline_title">PDF 目录</string>
+    <string name="click_pdf_outline_title_truncated">PDF 目录（前 %1$d 项）</string>
+    <string name="click_pdf_outline_loading">正在读取 PDF 文档目录…</string>
+    <string name="click_pdf_outline_empty">这份 PDF 没有可导航的文档目录，可按页码跳转</string>
+    <string name="click_pdf_page_jump_title">跳到指定页</string>
+    <string name="click_pdf_page_jump_hint">输入 1–%1$d</string>
+    <string name="click_pdf_page_jump_action">跳转</string>
+    <string name="click_pdf_page_jump_invalid">请输入 1–%1$d 之间的页码</string>
+    <string name="click_pdf_page_jump_boundary">当前 AndroidX PDF alpha19 公共 API 不提供文档书签或目录；这里提供真实页码导航，不把页码列表伪装成目录。</string>
+    <string name="click_pdf_search">搜索</string>
+    <string name="click_pdf_search_close">关闭搜索</string>
+    <string name="click_pdf_page_initial">第 1 / 1 页</string>
+    <string name="click_pdf_page_count">第 %1$d / %2$d 页</string>
+    <string name="click_pdf_loading">正在载入 PDF…</string>
+    <string name="click_pdf_load_failed">PDF 载入失败</string>
+    <string name="click_pdf_wait_for_load">请等 PDF 载入完成</string>
+    <string name="click_pdf_scanned_boundary">扫描版只读边界：可查看、缩放和恢复页码；本版不做 OCR、手写、表单、签名或写回 PDF。</string>
+    <string name="click_pdf_selection_hint">长按可选择文字；扫描 PDF 支持查看、缩放和页码恢复</string>
+    <string name="click_pdf_selection_too_long">选区过长，请缩小范围后再保存或朗读</string>
+    <string name="click_pdf_select_text_first">请先选中一段 PDF 文字</string>
+    <string name="click_pdf_note_title">文字备注</string>
+    <string name="click_pdf_note_hint">写下这段文字带给你的想法</string>
+    <string name="click_pdf_save">保存</string>
+    <string name="click_pdf_saved_pending">已保存在手机 · %1$d 条待同步</string>
+    <string name="click_pdf_annotation_failed">保存 PDF 侧车记录失败</string>
+    <string name="click_pdf_position_failed">PDF 页码暂未保存</string>
+</resources>

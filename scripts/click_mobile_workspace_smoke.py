@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import base64
+import atexit
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -16,6 +18,8 @@ if str(ROOT) not in sys.path:
 
 try:
     from fastapi.testclient import TestClient
+    import psycopg
+    from psycopg import sql
 except ModuleNotFoundError:
     if VENV_PYTHON.exists() and os.environ.get("CLICK_MOBILE_SMOKE_REEXEC") != "1":
         os.environ["CLICK_MOBILE_SMOKE_REEXEC"] = "1"
@@ -24,21 +28,54 @@ except ModuleNotFoundError:
     raise
 
 
+DATABASE_NAME = "sentence_reader_click_mobile_workspace_test"
+MAINTENANCE_URL = "postgresql://localhost/postgres"
+DATABASE_URL = f"postgresql://localhost/{DATABASE_NAME}"
+
+
+def recreate_database() -> None:
+    with psycopg.connect(MAINTENANCE_URL, autocommit=True) as conn:
+        conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(DATABASE_NAME)))
+        conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(DATABASE_NAME)))
+
+
+def drop_database() -> None:
+    with psycopg.connect(MAINTENANCE_URL, autocommit=True) as conn:
+        conn.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(DATABASE_NAME)))
+
+
+def apply_migrations() -> None:
+    completed = subprocess.run(
+        [str(VENV_PYTHON), str(ROOT / "scripts" / "reader_pg_migrate.py"), "--database-url", DATABASE_URL],
+        cwd=ROOT,
+        env={**os.environ, "READER_DATABASE_URL": DATABASE_URL},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    require(completed.returncode == 0, completed.stdout)
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
 
 
 def main() -> int:
+    recreate_database()
+    apply_migrations()
+    atexit.register(drop_database)
     with tempfile.TemporaryDirectory(prefix="click-mobile-workspace-") as tmp:
         os.environ["CLICK_APP_SUPPORT_DIR"] = str(Path(tmp) / "Click")
         os.environ["CLICK_RECORDINGS_ROOT"] = str(Path(tmp) / "Recordings")
+        os.environ["READER_DATABASE_URL"] = DATABASE_URL
         from reader_api.app import app  # noqa: PLC0415 - env must be set first.
 
         client = TestClient(app)
 
         for path, markers in {
-            "/home": ["本地工作台", "Click 阅读", "录音", "Hermes", "/library", "/recordings", "/hermes", "entry-caption", "font-size:17px"],
+            "/home": ["本地工作台", "Click 阅读", "Tingle", "Hermes", "/library", "/tingle", "/hermes", "entry-caption", "font-size:17px"],
             "/recordings": [
                 "/v1/recordings",
                 "MediaRecorder",
@@ -78,8 +115,17 @@ def main() -> int:
                 "enterkeyhint=\"send\"",
                 "visualViewport",
                 "--keyboard-inset",
-                "requestSubmit",
+                "nativeImeResizeAvailable",
+                "usesNativeImeResize",
+                "submitText",
+                "chatPending",
                 "uploadVoiceBlob",
+                "nativeHermesVoiceAvailable",
+                "ClickNativeAudio.startHermesVoice",
+                "__clickNativeHermesVoiceDidStart",
+                "__clickNativeHermesVoiceDidStop",
+                "__clickNativeHermesVoiceDidUpload",
+                "__clickNativeHermesVoiceDidError",
                 "voiceApiAvailable",
                 "isAppleMobileVoiceCapture",
                 "prefersSystemVoiceCapture",
@@ -110,11 +156,12 @@ def main() -> int:
         require(access_status.status_code == 200, "access status route")
         require(access_status.json()["status"] == "local_debug", "local debug access status")
         local_lan_status = client.get("/v1/mobile/access/status", params={"device_id": "android-smoke-device"})
-        require(local_lan_status.json()["status"] == "local_lan_allowed", "default mobile access should allow local LAN shell")
-        require(local_lan_status.json()["authorized"] is True, "default local LAN device should be authorized")
+        require(local_lan_status.json()["status"] == "unknown", "default mobile access must fail closed")
+        require(local_lan_status.json()["authorized"] is False, "unknown LAN device must not be authorized")
 
-        os.environ["CLICK_MOBILE_REQUIRE_APPROVAL"] = "1"
-        unauthorized = client.post(
+        synthetic_remote_host = ".".join(("100", "64", "0", "88"))
+        remote_client = TestClient(app, client=(synthetic_remote_host, 12345))
+        unauthorized = remote_client.post(
             "/v1/recordings",
             json={
                 "audio_base64": base64.b64encode(b"blocked-audio").decode("ascii"),
@@ -130,6 +177,57 @@ def main() -> int:
         token = approval.json()["access_token"]
         status = client.get("/v1/mobile/access/status", params={"device_id": "android-smoke-device", "access_token": token})
         require(status.json()["authorized"] is True, "approved device must be authorized")
+        remote_health = remote_client.get(
+            "/v1/recordings/health",
+            headers={
+                "X-Click-Device-Id": "android-smoke-device",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        require(remote_health.status_code == 200, "authenticated remote health")
+        require("canonical_root" not in remote_health.json(), "remote health leaked canonical root")
+        require("index" not in remote_health.json(), "remote health leaked index path")
+        from fastapi import HTTPException  # noqa: PLC0415
+        from starlette.requests import Request  # noqa: PLC0415
+        from reader_api.mobile_workspace import require_mobile_access  # noqa: PLC0415
+
+        remote_request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/tingle/inspirations",
+                "headers": [],
+                "query_string": b"",
+                "client": (synthetic_remote_host, 12345),
+                "server": ("click.test", 80),
+                "scheme": "http",
+            }
+        )
+        try:
+            require_mobile_access(remote_request)
+            raise AssertionError("strict remote request without identity was accepted")
+        except HTTPException as error:
+            require(error.status_code == 401, "strict remote missing identity must return 401")
+
+        tingle_browser = TestClient(app)
+        tingle_page = tingle_browser.get(
+            "/tingle",
+            headers={
+                "X-Click-Device-Id": "android-smoke-device",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        require(tingle_page.status_code == 200, "Tingle authenticated HTML bootstrap")
+        require(
+            tingle_browser.cookies.get("click_device_id") == "android-smoke-device",
+            "Tingle bootstrap device cookie",
+        )
+        require(
+            tingle_browser.cookies.get("click_access_token") == token,
+            "Tingle bootstrap access cookie",
+        )
+        tingle_history = tingle_browser.get("/tingle/inspirations")
+        require(tingle_history.status_code == 200, "Tingle fetch must authenticate through HttpOnly cookies")
 
         fake_audio = base64.b64encode(b"not-a-real-audio-but-valid-base64").decode("ascii")
         created = client.post(
@@ -146,8 +244,12 @@ def main() -> int:
         recording = created.json()["recording"]
         require(recording["schema"] == "local.recordings.audio_asset.v1", "recording schema")
         require(recording["status"] in {"saved", "needs_processing", "transcribed", "transcribed_needs_naming", "named"}, "recording status")
+        require("audio_path" in recording, "loopback recording response lost local path")
+        require("metadata_path" in recording, "loopback recording response lost local path")
 
-        rec_dir = Path(recording["metadata_path"]).parent
+        from reader_api.mobile_workspace import recording_row  # noqa: PLC0415
+
+        rec_dir = Path(recording_row(recording["recording_id"])["metadata_path"]).parent
         require(str(rec_dir).startswith(str(Path(tmp) / "Recordings")), "recording must live under canonical root")
         require("Click/Standalone" in str(rec_dir), "default recording bucket")
         require("2026/" not in str(rec_dir) and "/07/" not in str(rec_dir), "recording path must not be month-based")
@@ -195,6 +297,94 @@ def main() -> int:
         hidden_listing = client.get("/v1/recordings", params={"include_hidden": "true"}).json()
         require(len(hidden_listing["recordings"]) == 1, "include_hidden listing")
 
+        tingle_audio = base64.b64encode(b"tingle-same-original-audio").decode("ascii")
+        tingle_context = {
+            "schema": "click.tingle.local_metadata.v1",
+            "title": "离线灵感",
+            "note": "手机初始备注",
+        }
+        tingle_created = client.post(
+            "/v1/recordings",
+            json={
+                "audio_base64": tingle_audio,
+                "mime_type": "audio/wav",
+                "duration_seconds": 1.0,
+                "device_id": "android-smoke-device",
+                "access_token": token,
+                "client_capture_id": "android-tingle-metadata-smoke",
+                "source": "click_android_native_tingle",
+                "source_app": "Click",
+                "source_feature": "Tingle",
+                "contexts": [tingle_context],
+            },
+        )
+        require(tingle_created.status_code == 200, tingle_created.text)
+        tingle_recording = tingle_created.json()["recording"]
+        require("audio_path" in tingle_recording, "loopback Tingle response lost local path")
+        tingle_audio_path = Path(recording_row(tingle_recording["recording_id"])["audio_path"])
+        original_audio = tingle_audio_path.read_bytes()
+        original_stat = tingle_audio_path.stat()
+
+        duplicate_context = {
+            **tingle_context,
+            "title": "离线灵感二次标题",
+            "note": "同哈希重复请求安全更新",
+        }
+        tingle_duplicate = client.post(
+            "/v1/recordings",
+            json={
+                "audio_base64": tingle_audio,
+                "mime_type": "audio/wav",
+                "duration_seconds": 1.0,
+                "device_id": "android-smoke-device",
+                "access_token": token,
+                "client_capture_id": "android-tingle-metadata-smoke",
+                "source": "click_android_native_tingle",
+                "source_app": "Click",
+                "source_feature": "Tingle",
+                "contexts": [duplicate_context],
+            },
+        )
+        require(tingle_duplicate.status_code == 200, tingle_duplicate.text)
+        require(tingle_duplicate.json()["duplicate"] is True, "Tingle retry must be idempotent")
+        require(
+            tingle_duplicate.json()["recording"]["title"] == "离线灵感二次标题",
+            "duplicate Tingle request must safely merge local title",
+        )
+        require(tingle_audio_path.read_bytes() == original_audio, "duplicate request changed original audio")
+
+        metadata_only = client.patch(
+            f"/v1/recordings/{tingle_recording['recording_id']}",
+            json={
+                "title": "只补元数据",
+                "note": "PATCH 不重传音频",
+                "expected_audio_hash": tingle_recording["audio_hash"],
+                "client_capture_id": "android-tingle-metadata-smoke",
+            },
+        )
+        require(metadata_only.status_code == 200, metadata_only.text)
+        require(metadata_only.json()["recording"]["title"] == "只补元数据", "metadata-only title")
+        local_contexts = metadata_only.json()["recording"]["contexts"]
+        require(
+            any(
+                item.get("schema") == "click.tingle.local_metadata.v1"
+                and item.get("note") == "PATCH 不重传音频"
+                for item in local_contexts
+            ),
+            "metadata-only note",
+        )
+        require(tingle_audio_path.read_bytes() == original_audio, "metadata PATCH changed original audio")
+        require(tingle_audio_path.stat().st_ino == original_stat.st_ino, "metadata PATCH replaced original audio")
+        wrong_hash = client.patch(
+            f"/v1/recordings/{tingle_recording['recording_id']}",
+            json={
+                "note": "不应保存",
+                "expected_audio_hash": "0" * 64,
+                "client_capture_id": "android-tingle-metadata-smoke",
+            },
+        )
+        require(wrong_hash.status_code == 409, "mismatched Tingle metadata receipt must fail closed")
+
         diagnostics = client.get("/v1/mobile/diagnostics")
         require(diagnostics.status_code == 200, "diagnostics status")
         diag = diagnostics.json()
@@ -239,6 +429,8 @@ def main() -> int:
         require(not forbidden.exists(), "must not create HermesGateway/Recordings inside Click app support")
         require(not (Path(tmp) / "Click" / "KnowledgeInbox" / "Recordings").exists(), "must not write new recordings to legacy Click path")
 
+    drop_database()
+    atexit.unregister(drop_database)
     print("click mobile workspace smoke passed")
     return 0
 

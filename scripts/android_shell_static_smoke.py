@@ -32,9 +32,18 @@ def main() -> int:
     settings = read("apps/android/ClickShell/settings.gradle")
     root_gradle = read("apps/android/ClickShell/build.gradle")
     app_gradle = read("apps/android/ClickShell/app/build.gradle")
+    gradle_properties = read("apps/android/ClickShell/gradle.properties")
     build_script = read("scripts/build_android_click_shell.sh")
     manifest = read("apps/android/ClickShell/app/src/main/AndroidManifest.xml")
     activity = read("apps/android/ClickShell/app/src/main/java/com/click/shell/MainActivity.java")
+    wav_recorder = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickWavRecorder.java")
+    native_activity = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickNativeReaderActivity.java")
+    readium_activity = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickReadiumNavigatorActivity.kt")
+    tts_session = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ReaderTtsSession.kt")
+    native_store = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickNativeStore.java")
+    sync_config = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickSyncConfig.java")
+    sync_engine = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickSyncEngine.java")
+    sync_scheduler = read("apps/android/ClickShell/app/src/main/java/com/click/shell/ClickSyncScheduler.java")
     strings = read("apps/android/ClickShell/app/src/main/res/values/strings.xml")
     security = read("apps/android/ClickShell/app/src/main/res/xml/network_security_config.xml")
     icon = read("apps/android/ClickShell/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml")
@@ -49,9 +58,18 @@ def main() -> int:
         settings,
         root_gradle,
         app_gradle,
+        gradle_properties,
         build_script,
         manifest,
         activity,
+        wav_recorder,
+        native_activity,
+        readium_activity,
+        tts_session,
+        native_store,
+        sync_config,
+        sync_engine,
+        sync_scheduler,
         strings,
         security,
         icon,
@@ -70,6 +88,7 @@ def main() -> int:
         "/library",
         "/lan/reader",
         "/recordings",
+        "/tingle",
         "/hermes",
         "18180",
         "8765",
@@ -80,16 +99,16 @@ def main() -> int:
         "networkSecurityConfig",
         "enableOnBackInvokedCallback=\"true\"",
         "windowSoftInputMode=\"adjustResize\"",
-        "android:icon=\"@drawable/ic_launcher_foreground\"",
+        "android:icon=\"@mipmap/ic_launcher\"",
         "<adaptive-icon",
-        "Local Workspace",
+        "Click Workspace",
         "ic_entry_recording_local",
         "Voice Memos-style",
         "JavaScriptEnabled",
         "setDomStorageEnabled",
         "BuildConfig.CLICK_DEFAULT_HOST",
         "buildConfigField \"String\", \"CLICK_DEFAULT_HOST\"",
-        "LocalWorkspace-Android-debug-",
+        "app-debug.apk",
         "shasum -a 256",
         "KEY_DEVICE_ID",
         "KEY_ACCESS_TOKEN",
@@ -100,20 +119,29 @@ def main() -> int:
         "pendingAudioPermissionRequest",
         "NativeAudioBridge",
         "ClickNativeAudio",
+        "usesNativeImeResize",
+        "WindowInsetsCompat.Type.ime()",
         "addJavascriptInterface",
         "MediaRecorder",
         "AudioRecord",
         "audio/wav",
-        "writeNativeWavRecording",
+        "writeRecording",
         "writeWavHeader",
         "startReaderNote",
+        "startHermesVoice",
         "reader_note",
+        "hermes_voice",
         "startNativeAudioRecorder",
         "stopNativeAudioRecording",
         "uploadNativeAudio",
         "__clickNativeAudioDidUpload",
+        'payload.put("source_feature", "Tingle")',
+        'menuButton("Tingle", this::openLocalTingle)',
+        "TingleLocalActivity.class",
         "__clickNativeReaderAudioDidUpload",
-        "/lan/audio-notes/transcribe",
+        "__clickNativeHermesVoiceDidUpload",
+        "/v1/android/audio-notes/transcribe",
+        "/v1/voice/message",
         "onRequestPermissionsResult",
         "pendingFilePathCallback",
         "onShowFileChooser",
@@ -121,42 +149,78 @@ def main() -> int:
         "FileChooserParams.parseResult",
         "rememberRecentHost",
         "recentHostOptions",
-        "withAccessParams",
+        "loadAuthenticatedWebUrl",
+        "ClickNativeReaderActivity",
+        "ClickReadiumNavigatorActivity",
+        "ClickNativeStore",
+        "EpubNavigatorFragment",
+        "EpubNavigatorFactory",
+        "PublicationOpener",
+        "DefaultPublicationParser",
+        "openReadiumNavigator",
+        "Readium 已打开",
+        "org.readium.kotlin-toolkit",
+        "org.jetbrains.kotlin.android",
+        "android.useAndroidX=true",
+        "org.gradle.jvmargs=-Xmx4096m",
+        "/v1/android/sync/full",
+        "/v1/android/sync/changes",
+        "/v1/android/sync/operations",
+        "/v1/android/tts",
+        "TextToSpeech",
+        "operation_queue",
+        "click-epub-cache",
+        "click-cover-cache",
+        "cover_local_path",
+        "asset_refresh_queue",
+        "ASSET_COVER",
     ]:
         require(combined, needle, "Android shell")
 
     for needle in [
         "首页",
-        "Click 阅读",
+        "阅读",
         "录音",
         "Hermes",
         "刷新",
-        "更换地址",
+        "连接与同步",
         "Hermes 端口",
         "本地服务端口",
         "设备 ID",
-        "连接你的 Mac",
+        "首次连接你的 Mac",
         "最近访问过的 Mac 地址",
         "选择最近访问过的地址",
-        "<mac-lan-ip>",
+        "192.168.x.x（首次配对）",
         "handleBackNavigation",
         "onBackPressed",
         "OnBackInvokedCallback",
         "registerOnBackInvokedCallback",
         "edgeSwipeCandidate",
         "setOnTouchListener",
-        "本地工作台",
+        "高级连接设置",
     ]:
         require(activity, needle, "Android Activity")
     forbid(activity, r"root\.addView\(back,\s*backParams\)", "Android Activity")
     forbid(activity, r"root\.addView\(menu,\s*menuParams\)", "Android Activity")
-    require(strings, "<string name=\"app_name\">本地工作台</string>", "Android app name")
+    for sync_url in [
+        "/v1/android/sync/full",
+        "/v1/android/sync/changes",
+        "/v1/android/sync/operations",
+    ]:
+        require(sync_engine, sync_url, "shared Android sync engine")
+        forbid(activity, re.escape(sync_url), "Android Activity direct sync path")
+        forbid(native_activity, re.escape(sync_url), "native reader direct sync path")
+        forbid(readium_activity, re.escape(sync_url), "Readium direct sync path")
+    require(sync_scheduler, "WorkManager.getInstance", "shared Android sync scheduler")
+    require(strings, "<string name=\"app_name\">Click</string>", "Android app name")
 
-    require(readme, "Debug APK is a local build target", "Android README")
-    require(readme, "no signed release APK is published yet", "Android README")
+    require(readme, "source-complete ARM64 candidate", "Android README")
+    require(readme, "baseline is `0.1.7`", "Android README")
+    require(readme, "No public APK is published", "Android README")
+    require(readme, "physical-device acceptance remains required", "Android README")
     require(readme, "阅读 / 录音 / Hermes", "Android README")
     require(icon_background, "#141821", "local workspace icon background")
-    require(icon_foreground, "Local Workspace", "local workspace icon foreground")
+    require(icon_foreground, "Click Workspace", "local workspace icon foreground")
     require(icon_recording, "Voice Memos-style", "recording entry icon")
     forbid(readme, r"APK\s+(is\s+)?(complete|done|ready|finished)", "Android README")
     forbid(readme, r"(signed|release)\s+APK\s+(is\s+)?(ready|complete|done|finished)", "Android README")

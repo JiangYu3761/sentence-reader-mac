@@ -29,6 +29,14 @@ def swift_selection_context_does_not_route_to_secondary_red(text: str) -> bool:
     return selection_index >= 0 and sentence_index >= 0 and selection_index < sentence_index
 
 
+def swift_without_pdf_view(text: str) -> str:
+    start = text.find("private final class ClickPDFView: PDFView")
+    end = text.find("private final class MacPDFReaderController", start)
+    if start < 0 or end < 0:
+        return text
+    return text[:start] + text[end:]
+
+
 def main() -> int:
     paths = [SWIFT, APP, DOC, STATUS, ACCEPTANCE]
     missing_files = [str(path) for path in paths if not path.exists()]
@@ -63,7 +71,7 @@ def main() -> int:
             "selectionMode: \"text_selection_note\"",
             "NSPasteboard.general.setString(rawText, forType: .string)",
             "document.addEventListener('dblclick', function (event)",
-            "post({ type: 'note'",
+            "type: 'note'",
             "function toggleRedFromSecondaryEvent(event)",
             "function sentenceFromPoint(x, y)",
             "function sentenceFromEvent(event)",
@@ -73,12 +81,12 @@ def main() -> int:
             "now - lastSecondaryRedClaimedAt < 650",
             "claimSentenceEvent(event);",
             "return toggleRed(sentence, event);",
-            "post({ type: 'lookup'",
+            "type: 'lookup'",
             "isEditableTarget",
             "function beginSelectionActionDrag(event)",
             "function finishSelectionActionDrag(event)",
             "selectionDragAllowedUntil",
-            "document.addEventListener('selectionchange', hideSelectionActionBarWhenSelectionGone, true);",
+            "document.addEventListener('selectionchange', handleReaderSelectionChange, true);",
         ],
         missing_markers,
     )
@@ -130,7 +138,6 @@ def main() -> int:
 
     swift_text = SWIFT.read_text(encoding="utf-8")
     forbidden_swift_markers = [
-        ".rightMouseDown",
         "__sentenceReaderToggleRedAtPoint",
         "key == \"c\"",
         "key === 'c'",
@@ -140,6 +147,8 @@ def main() -> int:
         "lastObservedSelectionText",
     ]
     present_forbidden = [marker for marker in forbidden_swift_markers if marker in swift_text]
+    if ".rightMouseDown" in swift_without_pdf_view(swift_text):
+        present_forbidden.append(".rightMouseDown outside ClickPDFView")
     if present_forbidden:
         missing_markers.setdefault(str(SWIFT), []).extend(
             [f"forbidden reading command or native secondary route: {marker}" for marker in present_forbidden]

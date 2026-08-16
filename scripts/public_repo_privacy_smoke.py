@@ -37,6 +37,12 @@ SKIP_SUFFIXES = {
 _MAC_HOME_PREFIX = "/" + "".join(chr(code) for code in (85, 115, 101, 114, 115))
 _PRIVATE_DB_PREFIX = "".join(chr(code) for code in (106, 105, 97, 110, 103, 121, 117))
 _DOC_IMAGE_PREFIX = "docs" + "/" + "images" + "/"
+_PUBLIC_DOC_IMAGE_PREFIX = _DOC_IMAGE_PREFIX + "public/"
+PUBLIC_DOC_IMAGES = {
+    "docs/images/public/click-library-sanitized.jpg",
+    "docs/images/public/click-note-double-click-sanitized.jpg",
+    "docs/images/public/click-red-mark-two-finger-sanitized.jpg",
+}
 
 DISALLOWED_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("absolute macOS user path", re.compile(re.escape(_MAC_HOME_PREFIX) + r"/[A-Za-z0-9._-]+")),
@@ -47,7 +53,10 @@ DISALLOWED_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("personal FunASR project folder", re.compile("New" + r"\s+project")),
     ("desktop source fixture", re.compile("Desktop" + r"/")),
     ("raw SSH key fingerprint", re.compile("SHA" + r"256:[A-Za-z0-9+/=]{20,}")),
-    ("public documentation image reference", re.compile(re.escape(_DOC_IMAGE_PREFIX))),
+    (
+        "non-public documentation image reference",
+        re.compile(re.escape(_DOC_IMAGE_PREFIX) + r"(?!public/)"),
+    ),
 ]
 
 
@@ -84,15 +93,17 @@ def main() -> int:
     failures: list[str] = []
     for path in iter_tracked_files():
         rel = path.relative_to(ROOT)
+        rel_text = rel.as_posix()
         if len(rel.parts) >= 2 and rel.parts[0] == "docs" and rel.parts[1] == "images":
-            failures.append(f"{rel}: tracked public documentation image is not allowed")
+            if rel_text not in PUBLIC_DOC_IMAGES:
+                failures.append(f"{rel}: documentation image is not on the audited public allowlist")
     for path in iter_text_files():
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
         for label, pattern in DISALLOWED_PATTERNS:
-            if label == "public documentation image reference" and path.name in {".gitignore", "public_repo_privacy_smoke.py"}:
+            if label == "non-public documentation image reference" and path.name in {".gitignore", "public_repo_privacy_smoke.py"}:
                 continue
             for match in pattern.finditer(text):
                 line_no = text.count("\n", 0, match.start()) + 1

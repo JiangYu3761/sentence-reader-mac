@@ -2,89 +2,62 @@ import SwiftUI
 
 struct ConnectionView: View {
     @ObservedObject var store: ConnectionStore
+    @State private var advanced = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Spacer(minLength: 24)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Click")
-                    .font(.system(size: 42, weight: .bold))
-                    .foregroundStyle(.white)
-                Text("连接你的 Mac")
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.72))
+        Section("同步") {
+            HStack {
+                Label(
+                    store.connectedBaseURL == nil ? "当前离线" : "已连接",
+                    systemImage: store.connectedBaseURL == nil ? "wifi.slash" : "checkmark.circle.fill"
+                )
+                .foregroundStyle(store.connectedBaseURL == nil ? Color.secondary : Color.green)
+                Spacer()
+                if store.isChecking {
+                    ProgressView()
+                }
             }
 
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Mac 地址")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                TextField("<mac-lan-ip>", text: $store.hostInput)
+            Text(
+                store.connectedBaseURL == nil
+                    ? "阅读和录音仍可离线使用；Mac 可达后再同步。"
+                    : "已配对 · 当前同一 Wi-Fi 可同步"
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+
+            Button(store.isChecking ? "正在检查…" : "检查连接") {
+                Task { await store.connect() }
+            }
+            .disabled(store.isChecking || !store.hasSavedAddress)
+
+            DisclosureGroup("高级连接设置", isExpanded: $advanced) {
+                TextField("Mac 局域网地址", text: $store.hostInput)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .textFieldStyle(.plain)
-                    .padding(14)
-                    .foregroundStyle(.white)
-                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
-                Text("端口")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                TextField("18180", text: $store.portInput)
+                TextField("端口", text: $store.portInput)
                     .keyboardType(.numberPad)
-                    .textFieldStyle(.plain)
-                    .padding(14)
-                    .foregroundStyle(.white)
-                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-                    .frame(maxWidth: 180)
-
-                Text("设备 token")
-                    .font(.callout.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-                TextField("approve 后的一次性 token", text: $store.accessTokenInput)
+                SecureField("设备令牌", text: $store.accessTokenInput)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .textFieldStyle(.plain)
-                    .padding(14)
-                    .foregroundStyle(.white)
-                    .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
 
                 Text("设备 ID：\(store.deviceID)")
                     .font(.caption)
-                    .foregroundStyle(.white.opacity(0.45))
-            }
+                    .foregroundStyle(.secondary)
 
-            Button {
-                Task { await store.connect() }
-            } label: {
-                HStack {
-                    if store.isChecking {
-                        ProgressView()
-                            .tint(.black)
-                    }
-                    Text(store.isChecking ? "连接中" : "连接")
-                        .font(.headline)
+                Button("保存并连接") {
+                    Task { await store.connect() }
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
+                .disabled(store.isChecking)
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.black)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 8))
-            .disabled(store.isChecking)
 
             if !store.statusMessage.isEmpty {
                 Text(store.statusMessage)
-                    .font(.callout)
-                    .foregroundStyle(.white.opacity(0.72))
-                    .fixedSize(horizontal: false, vertical: true)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
-
-            Spacer(minLength: 24)
         }
-        .padding(.horizontal, 30)
-        .frame(maxWidth: 520)
     }
 }

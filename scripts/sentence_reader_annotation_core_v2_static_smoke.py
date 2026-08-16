@@ -37,7 +37,7 @@ SWIFT_MARKERS = {
     "batch red toggle": "toggleRedSentences",
     "batch undo": "redBatch",
     "non sentence boundary marker": "nonSentenceBoundaryCharacters = '：:；;'",
-    "sentence boundary regex": "sentenceBoundaryRegex",
+    "versioned reading sentence ranges": "function readingSentenceRanges(text)",
 }
 
 PLAN_MARKERS = [
@@ -58,15 +58,22 @@ def main() -> int:
         if missing:
             missing_markers[str(SOURCE)] = missing
 
-        if "；;" in text[text.find("sentenceBoundaryRegex") : text.find("sentenceBoundaryRegex") + 180]:
-            missing_markers.setdefault(str(SOURCE), []).append("semicolon must not be in sentenceBoundaryRegex")
-        if "：" in text[text.find("sentenceBoundaryRegex") : text.find("sentenceBoundaryRegex") + 180]:
-            missing_markers.setdefault(str(SOURCE), []).append("colon must not be in sentenceBoundaryRegex")
+        boundary_start = text.find("function readingSentenceRanges(text)")
+        boundary_window = text[boundary_start : boundary_start + 1_600]
+        if "；;" in boundary_window:
+            missing_markers.setdefault(str(SOURCE), []).append("semicolon must not be a reading sentence boundary")
+        if "boundary = /[。！？!?" not in boundary_window or "isReadingPeriodBoundary" not in boundary_window:
+            missing_markers.setdefault(str(SOURCE), []).append("expected explicit reading sentence punctuation")
+        pdf_start = text.find("private final class ClickPDFView: PDFView")
+        pdf_end = text.find("private final class MacPDFReaderController", pdf_start)
+        non_pdf_text = text
+        if pdf_start >= 0 and pdf_end > pdf_start:
+            non_pdf_text = text[:pdf_start] + text[pdf_end:]
         forbidden_markers = [
             ".rightMouseDown",
             "__sentenceReaderToggleRedAtPoint",
         ]
-        present_forbidden = [marker for marker in forbidden_markers if marker in text]
+        present_forbidden = [marker for marker in forbidden_markers if marker in non_pdf_text]
         if present_forbidden:
             missing_markers.setdefault(str(SOURCE), []).extend(
                 [f"forbidden secondary red route: {marker}" for marker in present_forbidden]

@@ -17,6 +17,14 @@ def window_after(text: str, marker: str, length: int = 900) -> str:
     return text[start : start + length]
 
 
+def swift_without_pdf_view(text: str) -> str:
+    start = text.find("private final class ClickPDFView: PDFView")
+    end = text.find("private final class MacPDFReaderController", start)
+    if start < 0 or end < 0:
+        return text
+    return text[:start] + text[end:]
+
+
 def main() -> int:
     missing: dict[str, list[str]] = {}
     for path in [SWIFT, PLAN, DOC]:
@@ -58,16 +66,20 @@ def main() -> int:
         "function beginSelectionActionDrag(event)",
         "function updateSelectionActionDrag(event)",
         "function finishSelectionActionDrag(event)",
-        "function hideSelectionActionBarWhenSelectionGone()",
+        "function handleReaderSelectionChange()",
         "selectionActionBarVisible()",
         "data-sr-selection-action=\"copy\"",
         "data-sr-selection-action=\"red\"",
         "data-sr-selection-action=\"note\"",
+        "data-sr-selection-action=\"read\"",
         "event.preventDefault();",
         "type: 'selectionCopy'",
         "type: 'selectionRed'",
         "type: 'selectionRedUndo'",
         "type: 'selectionNote'",
+        "type: 'selectionReadSentence'",
+        "case \"selectionReadSentence\":",
+        "readSelectionSentence(from: payload)",
         "NSPasteboard.general.setString(rawText, forType: .string)",
         "persistSelectionRed(",
         "deleteSelectionRed(",
@@ -84,12 +96,12 @@ def main() -> int:
         "document.addEventListener('mousemove', updateSelectionActionDrag, true);",
         "document.addEventListener('mouseup', finishSelectionActionDrag, true);",
         "document.addEventListener('dragend', finishSelectionActionDrag, true);",
-        "document.addEventListener('selectionchange', hideSelectionActionBarWhenSelectionGone, true);",
+        "document.addEventListener('selectionchange', handleReaderSelectionChange, true);",
         "document.addEventListener('dblclick', function (event)",
         "suppressSelectionActionBar(520)",
-        "post({ type: 'note'",
+        "type: 'note'",
         "function toggleRedFromSecondaryEvent(event)",
-        "post({ type: 'lookup'",
+        "type: 'lookup'",
     ]
     absent = [marker for marker in swift_markers if marker not in swift]
     if absent:
@@ -104,9 +116,8 @@ def main() -> int:
         )
 
     keydown_window = window_after(swift, "document.addEventListener('keydown'")
-    forbidden = [
-        marker
-        for marker in [
+    forbidden = []
+    for marker in [
             "key == \"c\"",
             "key === 'c'",
             "__sentenceReaderToggleRedAtPoint",
@@ -120,16 +131,17 @@ def main() -> int:
             "function observeReaderSelection()",
             "function delayedSelectionActionBarUpdate()",
             "lastObservedSelectionText",
-        ]
-        if marker in swift
-    ]
+        ]:
+        search_text = swift_without_pdf_view(swift) if marker == ".rightMouseDown" else swift
+        if marker in search_text:
+            forbidden.append(marker)
     if forbidden:
         missing.setdefault(str(SWIFT), []).extend([f"forbidden marker: {marker}" for marker in forbidden])
     if "Command+C" in keydown_window:
         missing.setdefault(str(SWIFT), []).append("keydown handler must not document or own Command+C")
 
     action_bar_html = window_after(swift, "selectionActionBar.innerHTML", 500)
-    for label in ["复制", "标红", "备注"]:
+    for label in ["复制", "标红", "备注", "朗读本句"]:
         if label not in action_bar_html:
             missing.setdefault(str(SWIFT), []).append(f"missing action label: {label}")
 

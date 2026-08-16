@@ -1,0 +1,32 @@
+{
+  "schema": "click.android.release-toolchain-config.v2",
+  "toolchain": {
+    "buildToolsVersion": "35.0.0",
+    "compileSdk": "android-36-ext19",
+    "dependencyVerification": "strict",
+    "gradleVersion": "8.11.1",
+    "javaVersion": "17.0.19"
+  },
+  "trees": {
+    "androidBuildTools": {
+      "fileCount": 170,
+      "totalBytes": 194730855,
+      "treeSha256": "09695966725338bf46007eb1de52c7c6c3952768921d526ac0dcda171d2091e8"
+    },
+    "androidPlatform": {
+      "fileCount": 11343,
+      "totalBytes": 106263269,
+      "treeSha256": "104250b650b46f597e0687ec87853dbf83232c3cc2b8e53dfda43a165cf2dad3"
+    },
+    "gradleHome": {
+      "fileCount": 314,
+      "totalBytes": 151472599,
+      "treeSha256": "fbed1287e17ece482ba13e54b3b0c3e767b5284aa45384849538acb4ac7a0c86"
+    },
+    "jdkHome": {
+      "fileCount": 456,
+      "totalBytes": 322873380,
+      "treeSha256": "701ec3781679237a2c70d0431fe6303db1a27d3fee47425f4b50544321ad8712"
+    }
+  }
+}

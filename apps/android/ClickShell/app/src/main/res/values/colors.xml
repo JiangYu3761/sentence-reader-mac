@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="click_canvas_dark">#000000</color>
+    <color name="click_surface_dark">#1C1C1E</color>
+    <color name="click_surface_elevated_dark">#2C2C2E</color>
+    <color name="click_label_primary_dark">#F2F2F7</color>
+    <color name="click_label_secondary_dark">#A1A1A6</color>
+    <color name="click_separator_dark">#38383A</color>
+    <color name="click_accent_dark">#0A84FF</color>
+    <color name="click_warning_dark">#FFD60A</color>
+    <color name="click_destructive_dark">#FF453A</color>
+
+    <color name="click_canvas_light">#F2F2F7</color>
+    <color name="click_surface_light">#FFFFFF</color>
+    <color name="click_surface_elevated_light">#F8F8FA</color>
+    <color name="click_label_primary_light">#1C1C1E</color>
+    <color name="click_label_secondary_light">#6E6E73</color>
+    <color name="click_separator_light">#D1D1D6</color>
+    <color name="click_accent_light">#007AFF</color>
+    <color name="click_warning_light">#9A6700</color>
+    <color name="click_destructive_light">#FF3B30</color>
+</resources>

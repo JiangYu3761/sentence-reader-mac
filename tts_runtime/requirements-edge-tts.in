@@ -1,0 +1,3 @@
+# Click-owned Microsoft Edge online TTS provider.
+# Keep this direct dependency exact; transitive artifacts are locked separately.
+edge-tts==7.2.8

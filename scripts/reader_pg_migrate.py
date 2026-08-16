@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -25,7 +26,12 @@ def _load_psycopg():
 
 
 def database_url_from_args(args: argparse.Namespace) -> str:
-    return args.database_url or DEFAULT_DATABASE_URL
+    return (
+        args.database_url
+        or os.getenv("READER_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or DEFAULT_DATABASE_URL
+    )
 
 
 def maintenance_url(database_url: str) -> tuple[str, str]:

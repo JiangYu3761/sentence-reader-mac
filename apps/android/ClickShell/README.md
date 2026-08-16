@@ -1,52 +1,58 @@
-# Local Workspace Android Shell
+# Click Android
 
-Status: local P1 scaffold implemented and extended through the Mobile Workspace P1.1-P6 local acceptance route. Debug APK is a local build target; no signed release APK is published yet.
+Status: source-complete ARM64 candidate for controlled device testing. The current baseline is `0.1.7` (`versionCode 8`). No public APK is published from this repository, and physical-device acceptance remains required before daily use.
 
-This Android shell is the local mobile workspace, not the Click reader itself. It uses a native Android Activity plus WebView to connect to the Mac local service, check `/health`, open `/home`, and show the workspace with Click 阅读 / 录音 / Hermes.
+## Product surface
 
-The three entries route to:
+The first screen keeps three clear entries: 阅读 / 录音 / Hermes.
 
-- Click 阅读: `/library`, then the existing `/lan/reader` after a book is opened.
-- 录音: `/recordings`, saving durable recording assets into the Mac `~/Documents/Recordings` total recording store.
-- Hermes: `/hermes`, using the Mac-side Hermes runtime through the local workspace gateway.
+- 阅读 opens the native local shelf, then a Readium EPUB reader or the PDF reader.
+- 录音 stores a local capture first and uploads it only when an approved Reader API is reachable.
+- Hermes uses the bounded current-book evidence contract; no evidence means no model call.
 
-It does not implement a second reader, Android-local EPUB import, Android-local PostgreSQL, offline reading, cloud sync, or a separate database.
+The Android app keeps a local SQLite replica, verified EPUB and cover caches, reading positions, annotations, lookup results, and an offline operation queue. The Mac Reader API and PostgreSQL remain the source of truth. Android does not create a second cloud account or database.
 
-Current user flow:
+## Offline and sync behavior
 
-1. Open 本地工作台.
-2. Enter the Mac LAN address, local service port, and Hermes port. The default local service port is `18180`; the default Hermes port shown for diagnostics is `8765`.
-3. After a successful connection, the app stores the recent Mac address locally. The next connection screen shows a "最近访问过的 Mac 地址" dropdown so a changed Wi-Fi address can be selected without retyping from scratch.
-4. The app keeps a stable local `device_id`. Local same-LAN use is allowed by default; strict device approval can be enabled later with `CLICK_MOBILE_REQUIRE_APPROVAL=1`.
-5. The app checks `/health`.
-6. On success it opens `/home` in a full-screen WebView.
-7. A visible back button and Android Back handling return within the WebView before leaving the workspace home.
-8. The floating menu can return to 首页, Click 阅读, 录音, Hermes, refresh, or change the Mac address.
+1. Cold start opens the cached native shelf without waiting for the Mac.
+2. Verified EPUB and PDF files remain readable while the Mac is unavailable.
+3. The connection screen accepts a Mac address and service port without embedding a real device address in source.
+4. Pairing uses a stable device ID, a short comparison code, an approved token, and Android Keystore storage.
+5. Incremental sync uses a monotonic sequence, durable operation receipts, tombstones, and conflict preservation.
+6. Book imports are copied into app-controlled storage and indexed off the main thread.
+7. Android Back closes the active reader layer before returning to the shelf.
 
-Mobile Workspace boundary:
+## Reader interactions
 
-- Device access can use the local `/v1/mobile/access/*` routes when strict approval is enabled. This is local-only access control, not a public account system.
-- `/recordings` lists durable recordings from `~/Documents/Recordings`, can edit title/category/tags, can hide without deleting files, and can trigger reprocess dry-run.
-- `/hermes` supports text chat and temporary voice messages through VoiceInbox. These messages are not durable recording assets unless a later explicit save flow is added.
-- edge-tts audio replies use the local Mac command when available; text replies still work without TTS.
+- Tap a sentence to focus it and open sentence actions.
+- Add a note or voice note against the sentence.
+- Mark the whole sentence red without manually adjusting a text range.
+- Tap the red action again to remove the mark.
+- Use the table of contents, search, typography controls, and listening controls from the native reader chrome.
 
-Build boundary:
+## Privacy and release boundary
 
-- This repo contains the Android project scaffold under `apps/android/ClickShell`.
-- A debug APK can be produced after Java, Gradle, and Android SDK are available.
-- The repo does not publish a signed release APK yet.
-- Build with:
+- Real books, notes, recordings, device addresses, access tokens, signing keys, and release artifacts are not committed.
+- Release signing values come only from `CLICK_ANDROID_RELEASE_*` environment variables.
+- The repository may contain the approved public signing-certificate fingerprint, but never the private key or passwords.
+- Automatic update checks run only when the app enters the foreground and are rate-limited.
+- Downloaded updates must pass descriptor, SHA-256, package, version, and signing-certificate checks before Android's system installer is opened.
+- Default hosts stay empty in public source. Users explicitly enter or discover their own Reader API endpoint.
+
+## Build
+
+Requirements:
+
+- JDK 17
+- Android SDK matching the Gradle configuration
+- An ARM64 device or emulator when testing the optional local TTS runtime
+
+Build the local debug candidate:
 
 ```bash
 scripts/build_android_click_shell.sh
 ```
 
-The build script copies the debug APK and its SHA256 file to the desktop Quark backup folder root for phone testing. It does not create nested backup folders.
+Or import `apps/android/ClickShell` into Android Studio and run the `app` configuration.
 
-P1.1 icon boundary:
-
-- The Android launcher icon is a self-drawn dark local-workspace icon with a book, click point, and light audio cue.
-- The workspace entry icons are separate local resources for Click reading, recording, and Hermes.
-- The local recording entry can use a Voice Memos-style microphone/waveform cue for private builds, but the resource is replaceable before public distribution.
-
-Or import `apps/android/ClickShell` into Android Studio and run the `app` configuration. Android Studio can also generate a Gradle wrapper later if we want this project to build with `./gradlew`.
+The public source includes Readium integration and the optional sherpa-onnx bridge, but it does not vendor native runtime binaries or voice-model weights. Supply those build-time assets separately and follow the licenses recorded in `THIRD_PARTY_NOTICES.md` and `app/src/main/assets/licenses/`. Without them, the core reader still builds and local TTS reports that the optional runtime is unavailable.

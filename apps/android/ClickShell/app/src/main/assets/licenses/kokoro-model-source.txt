@@ -1,0 +1,15 @@
+Click optional Kokoro local voice package sources
+
+Model weights:
+https://huggingface.co/hexgrad/Kokoro-82M-v1.1-zh
+License: Apache License 2.0
+
+sherpa-onnx conversion and model instructions:
+https://k2-fsa.github.io/sherpa/onnx/tts/pretrained_models/kokoro.html
+
+eSpeak NG language and pronunciation data:
+https://github.com/espeak-ng/espeak-ng
+License: GNU General Public License v3.0 or later
+
+The model archive is an optional user-imported local asset. It is not embedded in
+the Click base APK and is not committed to the Click Git repository.
